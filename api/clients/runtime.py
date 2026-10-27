@@ -2523,6 +2523,16 @@ class RuntimeClient:
         try:
             resp = await client.post(path, json=json)
             resp.raise_for_status()
+            if path == "/v2/runtime/evidence-terminal/evaluate":
+                def unique_members(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise ValueError("evidence_terminal_duplicate_member")
+                        result[key] = value
+                    return result
+
+                return resp.json(object_pairs_hook=unique_members)
             return resp.json()
         except httpx.PoolTimeout:
             # Waiting for capacity does not make the shared transport unhealthy.
@@ -2785,7 +2795,7 @@ class RuntimeClient:
             raise RuntimeError("evidence_terminal_request_invalid") from exc
         # No compatibility downgrade or retry: sufficiency may already be durable.
         response = await self._post(
-            "/v1/runtime/evidence-terminal/evaluate", json=request.model_dump(mode="json"),
+            "/v2/runtime/evidence-terminal/evaluate", json=request.model_dump(mode="json"),
         )
         try:
             return validate_evidence_terminal_response(response, request).model_dump(mode="json")

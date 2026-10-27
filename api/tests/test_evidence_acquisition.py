@@ -12770,8 +12770,32 @@ class TerminalProducerRuntime:
         if self.failure is not None:
             raise self.failure
         sufficiency = await self._sufficiency(kwargs)
-        response = {"schema_version": "evidence-terminal.v1", "sufficiency": sufficiency,
+        response = {"sufficiency": sufficiency,
                     "next_step": self._selection(kwargs, sufficiency)}
+        event_scope = {key: kwargs[key] for key in (
+            "request_id", "runtime_session_id", "runtime_turn_id",
+            "evidence_plan_id", "acquisition_manifest_id",
+        )}
+        event_scope["evaluation_id"] = sufficiency["result"]["evaluation_id"]
+        current = {**event_scope, "event_id": "event-sufficiency-current",
+                   "event_type": "evidence_sufficiency_evaluated",
+                   "policy_version": "evidence-sufficiency-policy.v1"}
+        response.update(
+            schema_version="evidence-terminal.v2",
+            sufficiency_provenance={
+                "computation_policy_version": "evidence-sufficiency-policy.v1",
+                "persistence": "committed", "persisted_event": current,
+            },
+            next_step_provenance={
+                "computation_policy_version": "evidence-next-step-policy.v1",
+                "persistence": "committed",
+                "persisted_event": {**event_scope, "event_id": "event-selection-current",
+                                    "event_type": "evidence_next_step_selected",
+                                    "selection_id": response["next_step"]["result"]["selection_id"],
+                                    "policy_version": "evidence-next-step-policy.v1"},
+                "consulted_sufficiency_event": dict(current),
+            },
+        )
         if self.corrupt is not None:
             self.corrupt(response)
         return response
@@ -12810,13 +12834,19 @@ async def test_aggregate_terminal_exact_sequential_parity(outcome, status, step,
     assert composite.next_step.selected_next_step == step
     assert composite.next_step.provider_disposition == ("allowed" if allowed else "blocked")
     assert provider_allowed(composite) is False  # Aggregates are server-rendered.
+    provenance = composite.terminal_provenance
+    assert provenance is not None
+    assert sequential.terminal_provenance is None
+    composite.terminal_provenance = None
     assert composite == sequential
+    composite.terminal_provenance = provenance
     assert build_current_acquisition_premise(composite) == before_premise
     assert len(composite.next_step_history) == 1
     assert composite.next_step_history[0]["additional_acquisition_executed"] is False
-    assert build_manifest_trace(state=composite, **{k: v for k, v in common.items()
-                                                 if k not in SCOPE}) == build_manifest_trace(
-        state=sequential, **{k: v for k, v in common.items() if k not in SCOPE})
+    trace_args = {k: v for k, v in common.items() if k not in SCOPE}
+    composite_trace = build_manifest_trace(state=composite, **trace_args)
+    assert composite_trace.pop("terminal_provenance") == provenance.model_dump(mode="json")
+    assert composite_trace == build_manifest_trace(state=sequential, **trace_args)
 
 
 @pytest.mark.asyncio
@@ -12885,3 +12915,87 @@ async def test_terminal_failure_keeps_no_success_history_or_permission(failure):
     assert not state.next_step_history
     assert not provider_allowed(state)
     assert state.forced_answer == NEXT_STEP_DEPENDENCY_ANSWER
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("corruption", [
+    "missing", "extra", "scope", "selection", "duplicate", "policy", "persistence", "grant",
+])
+async def test_terminal_provenance_failure_clears_prior_success_and_selection_history(corruption):
+    state = await _terminal_aggregate_state()
+
+    def corrupt(response):
+        provenance = response["next_step_provenance"]
+        if corruption == "missing":
+            response.pop("sufficiency_provenance")
+        elif corruption == "extra":
+            provenance["private_payload"] = {"secret": "must-not-persist"}
+        elif corruption == "scope":
+            provenance["persisted_event"]["runtime_turn_id"] = "other-turn"
+        elif corruption == "selection":
+            provenance["persisted_event"]["selection_id"] = "other-selection"
+        elif corruption == "duplicate":
+            provenance["persisted_event"]["event_id"] = (
+                response["sufficiency_provenance"]["persisted_event"]["event_id"]
+            )
+        elif corruption == "policy":
+            provenance["computation_policy_version"] = "evidence-next-step-policy.v2"
+        elif corruption == "persistence":
+            provenance["persistence"] = "unknown"
+        else:
+            provenance["provider_disposition"] = "allowed"
+
+    common = dict(context_pack=None, dsa_trace={"called": True, "status": "success"},
+                  retained_source_refs=set(), terminal_decision=True, **SCOPE)
+    await evaluate_acquisition_sufficiency(
+        state=state, runtime=TerminalProducerRuntime(state), **common,
+    )
+    assert state.terminal_provenance is not None and len(state.next_step_history) == 1
+    # Clear the decisions as a new acquisition would; leave old audit metadata
+    # to prove that a failed terminal request cannot publish stale successes.
+    state.sufficiency = state.next_step = None
+    await evaluate_acquisition_sufficiency(
+        state=state, runtime=TerminalProducerRuntime(state, corrupt=corrupt), **common,
+    )
+    assert state.sufficiency is state.next_step is state.terminal_provenance is None
+    assert not state.next_step_history
+    assert state.forced_answer == NEXT_STEP_DEPENDENCY_ANSWER
+    assert not provider_allowed(state)
+    trace = build_manifest_trace(
+        state=state, context_pack=None, dsa_trace={}, retained_source_refs=set(),
+    )
+    assert "terminal_provenance" not in trace
+    assert trace["next_steps"]["selection_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_trace_preserves_reused_selection_and_unknown_historical_policy():
+    state = await _terminal_aggregate_state()
+
+    def historical(response):
+        provenance = response["next_step_provenance"]
+        provenance["persistence"] = "reused"
+        provenance["persisted_event"]["policy_version"] = "UNKNOWN"
+        provenance["consulted_sufficiency_event"].update(
+            event_id="event-sufficiency-historical", policy_version="UNKNOWN",
+        )
+
+    await evaluate_acquisition_sufficiency(
+        state=state, runtime=TerminalProducerRuntime(state, corrupt=historical),
+        terminal_decision=True, context_pack=None, dsa_trace={"called": True, "status": "success"},
+        retained_source_refs=set(), **SCOPE,
+    )
+    trace = build_manifest_trace(
+        state=state, context_pack=None, dsa_trace={}, retained_source_refs=set(),
+    )
+    provenance = trace["terminal_provenance"]
+    assert provenance == state.terminal_provenance.model_dump(mode="json")
+    current = provenance["sufficiency_provenance"]["persisted_event"]
+    next_provenance = provenance["next_step_provenance"]
+    assert next_provenance["persistence"] == "reused"
+    assert next_provenance["persisted_event"]["policy_version"] == "UNKNOWN"
+    consulted = next_provenance["consulted_sufficiency_event"]
+    assert consulted["event_id"] != current["event_id"]
+    assert consulted["evaluation_id"] == current["evaluation_id"]
+    assert consulted["policy_version"] == "UNKNOWN"
+    assert len(state.next_step_history) == 1

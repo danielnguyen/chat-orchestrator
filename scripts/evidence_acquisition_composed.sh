@@ -222,7 +222,8 @@ evidence_terminal_http_counts() {
   docker compose -f "$COMPOSE" logs --no-color runtime | python3 -c '
 import json, re, sys
 text = sys.stdin.read()
-paths = {"terminal": "/v1/runtime/evidence-terminal/evaluate",
+paths = {"v2": "/v2/runtime/evidence-terminal/evaluate",
+         "v1": "/v1/runtime/evidence-terminal/evaluate",
          "sufficiency": "/v1/runtime/evidence-sufficiency/evaluate",
          "next_step": "/v1/runtime/evidence-next-steps/select"}
 print(json.dumps({key: len(re.findall(r"\"POST " + re.escape(path) + r" HTTP/", text))
@@ -230,16 +231,17 @@ print(json.dumps({key: len(re.findall(r"\"POST " + re.escape(path) + r" HTTP/", 
 }
 
 assert_evidence_terminal_http_delta() {
-  local before="$1" terminal="$2" sufficiency="$3" next_step="$4" after
+  local before="$1" v2="$2" v1="$3" sufficiency="$4" next_step="$5" after
   after="$(evidence_terminal_http_counts)"
-  jq -e --argjson before "$before" --argjson terminal "$terminal" \
+  jq -e --argjson before "$before" --argjson v2 "$v2" --argjson v1 "$v1" \
     --argjson sufficiency "$sufficiency" --argjson next_step "$next_step" '
-    .terminal - $before.terminal == $terminal
+    .v2 - $before.v2 == $v2
+    and .v1 - $before.v1 == $v1
     and .sufficiency - $before.sufficiency == $sufficiency
     and .next_step - $before.next_step == $next_step
   ' <<<"$after" >/dev/null
-  printf 'Evidence terminal HTTP requests: composite=%s sufficiency=%s next_step=%s\n' \
-    "$terminal" "$sufficiency" "$next_step"
+  printf 'Evidence terminal HTTP requests: v2=%s v1=%s sufficiency=%s next_step=%s\n' \
+    "$v2" "$v1" "$sufficiency" "$next_step"
 }
 
 run_evidence_chat() {
@@ -1973,7 +1975,7 @@ run_evidence_changed_premise_scenarios() {
   conversation_id="$(resolve_conversation "$owner" "$client" "evidence-followup")"
   terminal_http_before="$(evidence_terminal_http_counts)"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external" "chat_voice_openai")"
-  assert_evidence_terminal_http_delta "$terminal_http_before" 0 2 2
+  assert_evidence_terminal_http_delta "$terminal_http_before" 0 0 2 2
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
@@ -6199,7 +6201,7 @@ run_evidence_aggregate_scenario() {
     }')"
   terminal_http_before="$(evidence_terminal_http_counts)"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
-  assert_evidence_terminal_http_delta "$terminal_http_before" 1 0 0
+  assert_evidence_terminal_http_delta "$terminal_http_before" 1 0 0 0
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -6238,6 +6240,38 @@ run_evidence_aggregate_scenario() {
     and .acquisition.aggregate_execution.numeric_value_count == 4
     and .acquisition.aggregate_execution.invalid_numeric_count == 0
   '
+  # Join CO's persisted trace to exact authoritative CR event occurrences.
+  # No event payload is added to the CO trace or the bounded report.
+  assert_jq "aggregate.terminal_provenance" "$manifest" '
+    .terminal_provenance as $p
+    | $p.schema_version == "evidence-terminal.v2"
+    and $p.sufficiency_provenance.computation_policy_version == "evidence-sufficiency-policy.v1"
+    and $p.sufficiency_provenance.persistence == "committed"
+    and $p.next_step_provenance.computation_policy_version == "evidence-next-step-policy.v1"
+    and $p.next_step_provenance.persistence == "committed"
+    and ($p.sufficiency_provenance.persisted_event.evaluation_id == .sufficiency.evaluation_id)
+    and ($p.next_step_provenance.persisted_event.selection_id == .next_steps.selections[-1].selection_id)
+    and ([ $p.sufficiency_provenance.persisted_event,
+           $p.next_step_provenance.persisted_event,
+           $p.next_step_provenance.consulted_sufficiency_event ] | all(
+      . as $ref
+      | [$diagnostics.events[] | select(.event_id == $ref.event_id)] as $matches
+      | ($matches | length) == 1
+      and ($matches[0] as $event
+        | $event.event_payload_json as $payload
+        | $ref == ({
+            event_id:$event.event_id, event_type:$event.event_type,
+            request_id:$payload.request_id,
+            runtime_session_id:$event.runtime_session_id, runtime_turn_id:$event.runtime_turn_id,
+            evidence_plan_id:$payload.evidence_plan_id,
+            acquisition_manifest_id:$payload.acquisition_manifest_id,
+            evaluation_id:$payload.evaluation_id,
+            policy_version:($payload.policy_version // "UNKNOWN")
+          } + if $event.event_type == "evidence_next_step_selected"
+              then {selection_id:$payload.selection_id} else {} end))
+    ))
+  ' --argjson diagnostics "$diagnostics"
+  printf 'Evidence terminal persisted trace: %s\n' "$(jq -c '.terminal_provenance' <<<"$manifest")"
   assert_jq "aggregate.semantic_trace" "$trace" '
     .prompt.semantic_interpreter == {
       called:true,
