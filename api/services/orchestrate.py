@@ -11190,6 +11190,7 @@ async def orchestrate_chat(
             )
         compound_verification_requested = bool(
             claim_explanation.handled
+            and claim_explanation.status == "ok"
             and claim_explanation.new_verification_requested
         )
         if compound_verification_requested:

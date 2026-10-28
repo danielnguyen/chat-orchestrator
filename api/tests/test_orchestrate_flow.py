@@ -28284,8 +28284,10 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
+@pytest.mark.parametrize("history_enabled", [False, True])
 async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_check(
-    tmp_path,
+    tmp_path, exact_refs, history_enabled,
 ):
     memory_store = ClaimExplanationMemoryStore()
     first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
@@ -28301,11 +28303,17 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
     provider = FakeLiteLLM(
         content=_evidence_candidate(
             (
-                "vehicle_log_primary:record_1",
-                "The maintenance record lists 2025-07-12.",
+                "neutral_connector:vehicle_log_primary:record_1"
+                if exact_refs else "vehicle_log_primary:record_1",
+                "The exact maintenance item lists 2025-07-12."
+                if exact_refs else "The maintenance record lists 2025-07-12.",
             )
         )
     )
+    dsa = FakeDSA(
+        response=_governed_context_pack(task_text), fetch_responses=[_exact_fetch_response()],
+    )
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
     rules, models = _write_default_route_files(tmp_path)
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -28316,11 +28324,12 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
                 {"role": "user", "content": question},
             ],
             external_context_enabled=True,
+            **({"external_context": _exact_external_context()} if exact_refs else {}),
         ),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
-        dsa=FakeDSA(response=_governed_context_pack(task_text)),
+        dsa=dsa,
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
@@ -28328,10 +28337,16 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
         model_registry_path=str(models),
         allow_manual_override=True,
         claim_record_capture_enabled=True,
+        history_followup_enabled=history_enabled,
         request_id="request-quoted-compound",
     )
     assert "Original acquisition:\n" in result["answer"]
     assert "\n\nNew verification:\n" in result["answer"]
+    assert result["status"] == "ok"
+    assert len(provider.calls) == len(dsa.list_calls) == 1
+    assert len(dsa.fetch_calls) == int(exact_refs)
+    assert len(dsa.calls) == int(not exact_refs)
+    assert len(memory_store.acquisition_history_calls) == 1
     assert runtime.evidence_shape_calls[-1]["task_text"] == task_text
     assert memory_store.acquisition_history_calls[-1]["target_mode"] == (
         "quoted_first_paragraph"
@@ -37561,6 +37576,125 @@ async def test_failed_history_with_exact_refs_keeps_bounded_response(
     assert trace["dsa"]["called"] is False
     assert "PRIVATE-" not in json.dumps((result, trace))
     assert "private-source:record-1" not in json.dumps((result, trace))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
+@pytest.mark.parametrize("failure", [
+    "unavailable", "malformed", "missing", "ambiguous", "wrong_scope",
+])
+async def test_failed_quoted_acquisition_cannot_authorize_new_verification(
+    tmp_path, monkeypatch, failure, exact_refs
+):
+    target = "The earlier answer used the retained document."
+    text = f'What did you check for the statement "{target}"? Check again.'
+    task = f'Verify this prior statement with a new evidence check: "{target}"'
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    dsa = FakeDSA(
+        response=_governed_context_pack(task), fetch_responses=[_exact_fetch_response()],
+    )
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
+    provider = FakeLiteLLM(content=_evidence_candidate((
+        "neutral_connector:vehicle_log_primary:record_1"
+        if exact_refs else "vehicle_log_primary:record_1",
+        "The exact maintenance item lists 2025-07-12."
+        if exact_refs else "The maintenance record lists 2025-07-12.",
+    )))
+    lookups, alternatives, dispatch, events = [], [], [], []
+
+    async def resolve_history(**kwargs):
+        lookups.append(copy.deepcopy(kwargs))
+        if failure == "unavailable":
+            raise RuntimeError("PRIVATE-HISTORY-FAILURE")
+        if failure == "malformed":
+            return {"record": "PRIVATE-MALFORMED-HISTORY"}
+        response = _history_resolution_response(
+            kwargs, status="ambiguous" if failure == "ambiguous" else "no_record",
+            count=2 if failure == "ambiguous" else 0,
+            reason="quoted_response_ambiguous"
+            if failure == "ambiguous" else "quoted_response_not_found",
+        )
+        if failure == "wrong_scope":
+            response["owner_id"] = "PRIVATE-OTHER-OWNER"
+        return response
+
+    async def alternative_lookup(**kwargs):
+        alternatives.append(kwargs)
+        raise AssertionError("failed quoted history cannot substitute another lookup")
+
+    async def execute(**kwargs):
+        dispatch.append(kwargs)
+        raise AssertionError("failed quoted history cannot execute actions")
+
+    monkeypatch.setattr(memory, "resolve_acquisition_history", resolve_history, raising=False)
+    monkeypatch.setattr(memory, "list_claim_records", alternative_lookup, raising=False)
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", execute)
+    for obj, method, label in (
+        (memory, "add_message", "message"), (runtime, "complete_turn", "completion"),
+        (memory, "create_trace", "trace"),
+    ):
+        original = getattr(obj, method)
+
+        async def observe(_call=original, _label=label, **kwargs):
+            response = await _call(**kwargs)
+            events.append(kwargs["role"] if _label == "message" else _label)
+            return response
+
+        monkeypatch.setattr(obj, method, observe)
+
+    result, _, _, _ = await _run_history_followup(
+        tmp_path, text=text, memory_store_override=memory, runtime_override=runtime,
+        litellm_override=provider,
+        payload_overrides={"external_context": _exact_external_context()} if exact_refs else {},
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+            "restraint_enabled": True, "capability_registry_enabled": True,
+        },
+    )
+
+    assert dsa.list_calls == dsa.fetch_calls == dsa.calls == dsa.context_calls == [], (
+        result["status"], len(dsa.list_calls), len(dsa.fetch_calls), len(provider.calls),
+    )
+    assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+    assert provider.calls == alternatives == dispatch == memory.immediate_history_calls == []
+    assert runtime.capability_match_calls == runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == memory.retrieve_calls == []
+    assert lookups == [{
+        "request_id": result["request_id"], "owner_id": "owner", "conversation_id": "conv-1",
+        "surface": "node_red", "target_mode": "quoted_first_paragraph",
+        "normalized_first_paragraph": target, "response_digest": None,
+    }]
+    expected = {
+        "missing": "I couldn’t resolve a retained acquisition record for the specified response.",
+        "ambiguous": (
+            "More than one exact prior response matched, so I did not select an acquisition record."
+        ),
+    }.get(
+        failure,
+        "I couldn’t safely access the retained acquisition record for the specified response.",
+    )
+    expected += " I did not perform a new verification for this explanation."
+    assert result["status"] == "degraded" and result["selected_model"] == "not_called"
+    assert result["answer"] == memory.added_messages[-1]["content"] == expected
+    assert events == ["user", "assistant", "completion", "trace"]
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == memory.work["state"] == "completed"
+    assert "history_root_lineage" not in memory.added_messages[-1]
+    trace = memory.trace_calls[0]["payload"]
+    assert trace["status"] == "degraded" and trace["model_calls"] == []
+    assert trace["owner_id"] == "owner" and trace["conversation_id"] == "conv-1"
+    assert trace["surface"] == "node_red" and trace["request_id"] == result["request_id"]
+    assert trace["fallback"]["triggered"] is False and trace["dsa"]["called"] is False
+    explanation = trace["prompt"]["claim_explanation"]
+    assert explanation["resolution_status"] == {
+        "missing": "no_record", "ambiguous": "ambiguous",
+    }.get(failure, "unavailable")
+    assert explanation["compound_mode"] is True  # Requested intent is not execution authority.
+    assert target not in json.dumps((result, trace))
+    assert "PRIVATE-" not in json.dumps((result, trace))
 
 
 @pytest.mark.asyncio
