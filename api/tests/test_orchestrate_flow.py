@@ -41571,7 +41571,7 @@ async def test_strict_relationship_binding_failure_prevents_all_consumers(tmp_pa
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["governance", "identity", "containment", "relationship"])
-@pytest.mark.parametrize("kind", ["timeout", "conflict", "malformed"])
+@pytest.mark.parametrize("kind", ["timeout", "transport", "conflict", "malformed"])
 async def test_strict_relationship_dependency_failure_has_no_legacy_escape(tmp_path, stage, kind):
     runtime = StrictRelationshipRuntime()
     if kind == "malformed":
@@ -41581,7 +41581,9 @@ async def test_strict_relationship_dependency_failure_has_no_legacy_escape(tmp_p
             runtime.mutation = (stage, ("result",) if stage == "governance"
                                 else ("selection_contract",), None)
     else:
-        error = httpx.ReadTimeout("PRIVATE-ERROR") if kind == "timeout" else _http_status_error(409)
+        error = {"timeout": httpx.ReadTimeout("PRIVATE-ERROR"),
+                 "transport": httpx.ConnectError("PRIVATE-ERROR"),
+                 "conflict": _http_status_error(409)}[kind]
         if stage == "relationship":
             runtime.relationship_error = error
         else:
@@ -41836,6 +41838,7 @@ async def test_strict_world_state_proposals_and_surface_restrictions(tmp_path, s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure,mutation", [
     (httpx.ReadTimeout("PRIVATE"), None),
+    (httpx.ConnectError("PRIVATE"), None),
     (httpx.HTTPStatusError("PRIVATE", request=httpx.Request("POST", "http://runtime"),
                            response=httpx.Response(409)), None),
     (None, (("selection_contract",), "legacy_unbound")),
@@ -42037,6 +42040,163 @@ async def test_strict_world_state_unavailable_bound_persona_stops_before_protect
     assert out["status"] == "failed" and provider.calls == memory.retrieve_calls == []
     assert runtime.world_state_calls == runtime.relationship_calls == []
     assert memory.work["state"] == "failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [
+    "governance", "identity", "containment", "relationship", "world",
+])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_strict_context_pending_decision_blocks_downstream_and_preserves_cancellation(
+    tmp_path, monkeypatch, stage, cancel,
+):
+    runtime = StrictWorldStateRuntime()
+    memory = RelationshipPolicyMemory(runtime)
+    provider = FakeLiteLLM()
+    entered, release = asyncio.Event(), asyncio.Event()
+    methods = {
+        "governance": "evaluate_interaction_governance",
+        "identity": "resolve_identity",
+        "containment": "evaluate_persona_containment",
+        "relationship": "relationship_select",
+        "world": "world_state_resolve",
+    }
+    decisions = list(methods)
+
+    def hold_response(decision, method):
+        async def wrapped(**kwargs):
+            response = await method(**kwargs)
+            if decision == stage:
+                entered.set()
+                await release.wait()
+            runtime.call_order.append(f"returned:{decision}")
+            return response
+        return wrapped
+
+    for decision, name in methods.items():
+        monkeypatch.setattr(runtime, name, hold_response(decision, getattr(runtime, name)))
+
+    original_trace, original_transition = memory.create_trace, memory.transition_work
+
+    async def persist_trace(**kwargs):
+        result = await original_trace(**kwargs)
+        runtime.call_order.append("trace_persisted")
+        return result
+
+    async def transition(**kwargs):
+        result = await original_transition(**kwargs)
+        runtime.call_order.append(f"work:{kwargs['state']}")
+        return result
+
+    monkeypatch.setattr(memory, "create_trace", persist_trace)
+    monkeypatch.setattr(memory, "transition_work", transition)
+    dispatch = []
+
+    async def forbidden_dispatch(*args, **kwargs):
+        dispatch.append(True)
+        pytest.fail("unselected action dispatch crossed a pending context decision")
+
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", forbidden_dispatch)
+    task = asyncio.create_task(_run_world_state_turn(
+        tmp_path, runtime=runtime, memory=memory, provider=provider,
+        strict_relationship_retrieval_enabled=True, capability_registry_enabled=True,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        counts = [len(calls) for calls in (
+            runtime.interaction_governance_calls, runtime.identity_calls,
+            runtime.persona_containment_calls, runtime.relationship_calls,
+            runtime.world_state_calls,
+        )]
+        assert counts == [
+            int(index <= decisions.index(stage)) for index in range(len(decisions))
+        ]
+        # Contained BMS retrieval precedes the optional world-state pass today.
+        assert len(memory.retrieve_calls) == (1 if stage == "world" else 0)
+        assert provider.calls == []
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+        assert runtime.capability_authorization_calls == dispatch == []
+        assert runtime.turn_complete_calls == memory.trace_calls == []
+        assert not any(message["role"] == "assistant" for message in memory.added_messages)
+        assert f"returned:{stage}" not in runtime.call_order
+        assert not task.done()
+
+        if cancel:
+            before = list(runtime.call_order)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            # Cancellation propagates; it is neither optional omission nor permission.
+            assert runtime.call_order == before + ["work:failed"]
+            assert memory.work["state"] == "failed"
+            assert runtime.turn_complete_calls == memory.trace_calls == provider.calls == []
+            assert not any(message["role"] == "assistant" for message in memory.added_messages)
+        else:
+            release.set()
+            out, _, _, _ = await task
+            assert out["status"] == "ok" and len(provider.calls) == 1
+            order = runtime.call_order
+            chain = ["start_turn", "returned:governance", "strict_selection",
+                     "returned:identity", "strict_containment", "returned:containment",
+                     "strict_relationship", "returned:relationship", "contained_retrieval",
+                     "strict_world_state", "returned:world", "answer_generation",
+                     "assistant_persistence", "complete_turn:completed", "trace_persisted",
+                     "work:completed"]
+            positions = [order.index(step) for step in chain]
+            assert positions == sorted(set(positions))
+            assert len(runtime.identity_calls) == len(runtime.persona_containment_calls) == 1
+            assert len(runtime.relationship_calls) == len(runtime.world_state_calls) == 1
+            assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+            assert memory.work["state"] == "completed"
+            assert memory.added_messages[-1]["content"] == out["answer"]
+            _assert_bms_trace_create_shape(memory.trace_calls[0]["payload"])
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == dispatch == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["answer_now", "yield_to_user", "close_turn"])
+async def test_strict_context_history_response_skips_later_world_state(tmp_path, policy):
+    runtime = StrictWorldStateRuntime(world_failure=AssertionError("unnecessary world-state call"))
+    out, runtime, provider, memory = await _run_world_state_turn(
+        tmp_path, runtime=runtime, policy=policy, strict_relationship_retrieval_enabled=True,
+        claim_record_capture_enabled=True,
+        payload=_base_payload(conversation_id="conv-1", surface="dev", messages=[
+            {"role": "user", "content": "How are you sure?"},
+        ]),
+    )
+    assert out["selected_model"] == "not_called" and provider.calls == []
+    assert len(runtime.identity_calls) == len(runtime.persona_containment_calls) == 1
+    assert len(runtime.relationship_calls) == len(runtime.timing_calls) == 1
+    assert runtime.world_state_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    failed = policy == "close_turn"
+    assert runtime.turn_complete_calls[0]["turn_status"] == ("abandoned" if failed else "completed")
+    assert memory.work["state"] == ("failed" if failed else "completed")
+    assert [m["role"] for m in memory.added_messages] == (
+        ["user"] if failed else ["user", "assistant"]
+    )
+    if not failed:
+        assert memory.added_messages[-1]["content"] == out["answer"]
+    order = runtime.call_order
+    positions = [order.index(step) for step in (
+        "start_turn", "interaction_governance", "strict_selection", "strict_containment",
+        "strict_relationship", "timing",
+        "complete_turn:abandoned" if failed else "complete_turn:completed",
+    )]
+    assert positions == sorted(set(positions))
+    trace = memory.trace_calls[0]["payload"]
+    _assert_bms_trace_create_shape(trace)
+    assert trace["model_calls"] == []
 
 
 def _processing_feedback_runtime(*, restricted_privacy=False):
