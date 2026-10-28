@@ -11236,7 +11236,8 @@ async def orchestrate_chat(
         if (
             claim_explanation.handled
             and not compound_verification_requested
-            and not exact_reference_request
+            # Exact source selectors cannot override a handled history failure.
+            and (not exact_reference_request or claim_explanation.status != "ok")
         ):
             timing_stop = await evaluate_admitted_timing(
                 ["history_followup"] if history_followup_trace.get("cr_policy_status") == "accepted"
