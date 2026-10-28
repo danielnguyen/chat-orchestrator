@@ -8556,7 +8556,16 @@ async def _resolve_history_policy(
         scope["runtime_session_id"] = runtime_session_id
     if runtime_turn_id is not None:
         scope["runtime_turn_id"] = runtime_turn_id
-    return validate_history_followup_policy_response(response, scope=scope)
+    policy = validate_history_followup_policy_response(response, scope=scope)
+    expected_candidate = {
+        "intent": candidate["intent"],
+        "candidate_source": candidate["source"],
+        "target_mode": candidate["target_mode"],
+        "new_verification_requested": candidate["new_verification_requested"],
+    }
+    if any(policy[field] != value for field, value in expected_candidate.items()):
+        raise RuntimeError("history_followup_policy_candidate_mismatch")
+    return policy
 
 
 def _latency_rank(bucket: str) -> int:
@@ -11181,6 +11190,7 @@ async def orchestrate_chat(
             )
         compound_verification_requested = bool(
             claim_explanation.handled
+            and claim_explanation.status == "ok"
             and claim_explanation.new_verification_requested
         )
         if compound_verification_requested:
@@ -11227,7 +11237,8 @@ async def orchestrate_chat(
         if (
             claim_explanation.handled
             and not compound_verification_requested
-            and not exact_reference_request
+            # Exact source selectors cannot override a handled history failure.
+            and (not exact_reference_request or claim_explanation.status != "ok")
         ):
             timing_stop = await evaluate_admitted_timing(
                 ["history_followup"] if history_followup_trace.get("cr_policy_status") == "accepted"

@@ -25273,8 +25273,9 @@ async def test_step13_retrieval_limit_advisory_does_not_claim_source_absence_or_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("history_enabled", [False, True])
 async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_manifest(
-    tmp_path,
+    tmp_path, history_enabled,
 ):
     rules, models = _write_default_route_files(tmp_path)
     request_id = "rid-exact-evidence-success"
@@ -25310,6 +25311,7 @@ async def test_evidence_acquisition_exact_fetch_composes_plan_sufficiency_and_ma
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
+        history_followup_enabled=history_enabled,
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
@@ -28282,8 +28284,10 @@ async def test_orchestrate_compound_acquisition_recheck_is_new_governed_verifica
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
+@pytest.mark.parametrize("history_enabled", [False, True])
 async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_check(
-    tmp_path,
+    tmp_path, exact_refs, history_enabled,
 ):
     memory_store = ClaimExplanationMemoryStore()
     first, _, runtime, _, _ = await _run_evidence_claim_capture_chat(
@@ -28299,11 +28303,17 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
     provider = FakeLiteLLM(
         content=_evidence_candidate(
             (
-                "vehicle_log_primary:record_1",
-                "The maintenance record lists 2025-07-12.",
+                "neutral_connector:vehicle_log_primary:record_1"
+                if exact_refs else "vehicle_log_primary:record_1",
+                "The exact maintenance item lists 2025-07-12."
+                if exact_refs else "The maintenance record lists 2025-07-12.",
             )
         )
     )
+    dsa = FakeDSA(
+        response=_governed_context_pack(task_text), fetch_responses=[_exact_fetch_response()],
+    )
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
     rules, models = _write_default_route_files(tmp_path)
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
@@ -28314,11 +28324,12 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
                 {"role": "user", "content": question},
             ],
             external_context_enabled=True,
+            **({"external_context": _exact_external_context()} if exact_refs else {}),
         ),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
-        dsa=FakeDSA(response=_governed_context_pack(task_text)),
+        dsa=dsa,
         dsa_enabled=True,
         evidence_acquisition_enabled=True,
         interaction_governance_enabled=True,
@@ -28326,10 +28337,16 @@ async def test_orchestrate_quoted_compound_uses_exact_target_and_labels_new_chec
         model_registry_path=str(models),
         allow_manual_override=True,
         claim_record_capture_enabled=True,
+        history_followup_enabled=history_enabled,
         request_id="request-quoted-compound",
     )
     assert "Original acquisition:\n" in result["answer"]
     assert "\n\nNew verification:\n" in result["answer"]
+    assert result["status"] == "ok"
+    assert len(provider.calls) == len(dsa.list_calls) == 1
+    assert len(dsa.fetch_calls) == int(exact_refs)
+    assert len(dsa.calls) == int(not exact_refs)
+    assert len(memory_store.acquisition_history_calls) == 1
     assert runtime.evidence_shape_calls[-1]["task_text"] == task_text
     assert memory_store.acquisition_history_calls[-1]["target_mode"] == (
         "quoted_first_paragraph"
@@ -28697,7 +28714,10 @@ async def test_claim_explanation_trace_omits_prior_id_without_mutating_runtime_s
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_path):
+@pytest.mark.parametrize("history_enabled", [False, True])
+async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(
+    tmp_path, history_enabled
+):
     first, second, memory_store, runtime = await _capture_two_explanation_claims(
         tmp_path
     )
@@ -28740,6 +28760,7 @@ async def test_orchestrate_three_turn_quoted_older_claim_is_provider_free(tmp_pa
         model_registry_path=str(models),
         allow_manual_override=True,
         claim_record_capture_enabled=True,
+        history_followup_enabled=history_enabled,
         dsa=dsa,
         dsa_enabled=True,
         request_id="request-quoted-older-claim",
@@ -28812,9 +28833,11 @@ async def test_orchestrate_generic_follow_up_still_resolves_only_latest_claim(tm
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ambiguous", [False, True])
+@pytest.mark.parametrize("exact_refs", [False, True])
 async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
     tmp_path,
     ambiguous,
+    exact_refs,
 ):
     first, second, memory_store, runtime = await _capture_two_explanation_claims(
         tmp_path
@@ -28831,9 +28854,11 @@ async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
 
     rules, models = _write_router_files(tmp_path)
     provider = FailingLiteLLM()
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
     result = await orchestrate_chat(
         payload=_base_payload(
             conversation_id="conv-1",
+            **({"external_context": _exact_external_context()} if exact_refs else {}),
             messages=[
                 {"role": "assistant", "content": second["answer"]},
                 {
@@ -28849,11 +28874,16 @@ async def test_orchestrate_quoted_missing_or_ambiguous_claim_is_provider_free(
         model_registry_path=str(models),
         allow_manual_override=True,
         claim_record_capture_enabled=True,
+        history_followup_enabled=True,
+        evidence_acquisition_enabled=True,
+        dsa=dsa,
+        dsa_enabled=True,
         request_id=f"request-quoted-fallback-{ambiguous}",
     )
     assert result["status"] == "degraded"
     assert result["selected_model"] == "not_called"
     assert provider.calls == []
+    assert dsa.list_calls == dsa.fetch_calls == dsa.calls == []
     assert len(memory_store.claim_record_list_calls) == 1
     trace = memory_store.trace_calls[-1]["payload"]
     assert trace["prompt"]["claim_explanation"]["reason_code"] == expected_reason
@@ -36467,6 +36497,8 @@ async def _run_history_followup(
     routing_policy=None,
     litellm_override=None,
     memory_store_override=None,
+    runtime_override=None,
+    orchestration_options=None,
     intent_classifier_timeout_ms=3000,
     evidence_interpreter_timeout_ms=5000,
 ):
@@ -36478,7 +36510,7 @@ async def _run_history_followup(
     memory_store = memory_store_override or ImmediateHistoryMemoryStore(
         routing_policy=routing_policy
     )
-    runtime = HistoryPolicyRuntime(policy_status=policy_status)
+    runtime = runtime_override or HistoryPolicyRuntime(policy_status=policy_status)
     litellm = litellm_override or FakeLiteLLM(completion=completion)
     payload = _first_party_chat_payload(
         text,
@@ -36500,6 +36532,7 @@ async def _run_history_followup(
         intent_classifier_timeout_ms=intent_classifier_timeout_ms,
         evidence_interpreter_timeout_ms=evidence_interpreter_timeout_ms,
         request_id="request-history-followup",
+        **(orchestration_options or {}),
     )
     return result, memory_store, runtime, litellm
 
@@ -37136,6 +37169,588 @@ async def test_malformed_cr_history_policy_is_bounded_and_provider_free(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed_field", ["intent", "source", "target_mode", "new_verification_requested"]
+)
+async def test_history_policy_must_authorize_the_submitted_candidate(
+    tmp_path, monkeypatch, changed_field
+):
+    evaluate = HistoryPolicyRuntime.evaluate_interaction_governance
+
+    async def substituted_policy(self, **kwargs):
+        response = await evaluate(self, **kwargs)
+        candidate = kwargs.get("history_followup_candidate")
+        if candidate is not None:
+            other = copy.deepcopy(candidate)
+            other[changed_field] = {
+                "intent": "acquisition_checked",
+                "source": "deterministic",
+                "target_mode": "immediate_previous",
+                "new_verification_requested": True,
+            }[changed_field]
+            response["result"]["history_followup_policy"] = _history_policy_for(other)
+            # The reply is internally valid and correctly scoped, but belongs to
+            # a different candidate. Exercise CO's request/reply binding check.
+            scope = {key: kwargs[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )}
+            assert orchestrate_service.validate_history_followup_policy_response(
+                response, scope=scope,
+            )["status"] == "accepted"
+        return response
+
+    monkeypatch.setattr(
+        HistoryPolicyRuntime, "evaluate_interaction_governance", substituted_policy,
+    )
+    result, memory, runtime, provider = await _run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?",
+        completion=_classifier_completion(
+            "support_explanation",
+            target="explicit_reference" if changed_field == "target_mode" else "immediate_previous",
+        ),
+    )
+
+    assert memory.immediate_history_calls == []
+    assert memory.retrieve_calls == []
+    assert result["answer"] == orchestrate_service._HISTORY_POLICY_UNAVAILABLE
+    assert result["selected_model"] == "not_called"
+    assert len(provider.calls) == 1  # Classifier only; no answer or fallback.
+    assert len(runtime.interaction_governance_calls) == 2
+    trace = memory.trace_calls[-1]["payload"]
+    assert trace["prompt"]["history_followup"]["cr_policy_status"] == "unavailable"
+    assert trace["model_calls"] == []
+    assert trace["fallback"]["triggered"] is False
+    assert all("history_root_lineage" not in message for message in memory.added_messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("classified", [False, True])
+@pytest.mark.parametrize("held", ["policy", "history"])
+@pytest.mark.parametrize(("cancel", "exact_refs"), [(False, False), (True, False), (True, True)])
+async def test_history_dependencies_wait_and_cancel_without_speculative_work(
+    tmp_path, monkeypatch, classified, held, cancel, exact_refs
+):
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    provider = FakeLiteLLM(completion=_classifier_completion("support_explanation"))
+    events = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    # Observe service boundaries, leaving orchestration, validation, target
+    # resolution, rendering, and persistence logic under test unchanged.
+    for obj, method, label in (
+        (runtime, "evaluate_interaction_governance", "policy"),
+        (memory, "resolve_immediate_history", "history"),
+        (provider, "chat", "classifier"),
+        (memory, "add_message", "message"),
+        (runtime, "complete_turn", "completion"),
+        (memory, "create_trace", "trace"),
+    ):
+        original = getattr(obj, method)
+
+        async def observe(_call=original, _label=label, **kwargs):
+            name = _label
+            if name == "policy" and kwargs.get("history_followup_candidate") is None:
+                name = "governance"
+            if name == "message":
+                name = kwargs["role"]
+            events.append(f"{name}:start")
+            if name == held:
+                entered.set()
+                await release.wait()
+            result = await _call(**kwargs)
+            events.append(f"{name}:done")
+            return result
+
+        monkeypatch.setattr(obj, method, observe)
+
+    task = asyncio.create_task(_run_history_followup(
+        tmp_path,
+        text="Where did that conclusion come from?" if classified else "How are you sure?",
+        memory_store_override=memory, runtime_override=runtime, litellm_override=provider,
+        payload_overrides={"external_context": _exact_external_context()} if exact_refs else {},
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+        },
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        assert not task.done()
+        assert events[-1] == f"{held}:start"
+        assert memory.immediate_history_calls == memory.retrieve_calls == []
+        assert memory.trace_calls == runtime.turn_complete_calls == []
+        assert [message["role"] for message in memory.added_messages] == ["user"]
+        assert len(provider.calls) == int(classified)
+        assert runtime.world_state_calls == runtime.capability_match_calls == []
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+        if cancel:
+            before = list(events)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release.set()
+            assert events == before
+            assert memory.work["state"] == "failed"
+            assert memory.immediate_history_calls == memory.retrieve_calls == []
+            assert memory.trace_calls == runtime.turn_complete_calls == []
+            assert [message["role"] for message in memory.added_messages] == ["user"]
+        else:
+            release.set()
+            result, _, _, _ = await task
+            assert events == [
+                "governance:start", "governance:done", "user:start", "user:done",
+                *(["classifier:start", "classifier:done"] if classified else []),
+                "policy:start", "policy:done", "history:start", "history:done",
+                "assistant:start", "assistant:done", "completion:start", "completion:done",
+                "trace:start", "trace:done",
+            ]
+            assert result["status"] == "ok"
+            assert len(memory.immediate_history_calls) == 1
+            assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+            assert memory.work["state"] == "completed"
+            assistant = memory.added_messages[-1]
+            assert assistant["content"] == result["answer"]
+            assert assistant["owner_id"] == "owner" and assistant["conversation_id"] == "conv-1"
+            assert assistant["history_root_lineage"]["root_assistant_message_id"] == (
+                HISTORY_ROOT_MESSAGE_ID
+            )
+            trace = memory.trace_calls[-1]["payload"]
+            assert trace["owner_id"] == "owner" and trace["conversation_id"] == "conv-1"
+            assert trace["surface"] == "node_red"
+            assert trace["model_calls"] == [] and trace["fallback"]["triggered"] is False
+            assert "private-source:record-1" not in json.dumps(trace)
+            assert "PRIVATE RAW SUMMARY" not in json.dumps(trace)
+        assert len(provider.calls) == int(classified)
+        assert runtime.world_state_calls == runtime.capability_match_calls == []
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+        assert dsa.list_calls == dsa.fetch_calls == dsa.calls == []
+        assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+        assert memory.claim_record_calls == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "missing", "malformed", "inconsistent", "unavailable", "timeout",
+    "request_id", "owner_id", "conversation_id", "surface",
+    "runtime_session_id", "runtime_turn_id",
+])
+async def test_failed_history_policy_cannot_fall_through_to_another_history_lookup(
+    tmp_path, monkeypatch, failure
+):
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    evaluate = runtime.evaluate_interaction_governance
+    alternative_calls = []
+
+    async def alternative_lookup(**kwargs):
+        alternative_calls.append(kwargs)
+        raise AssertionError("no alternative history lookup is authorized")
+
+    monkeypatch.setattr(memory, "list_claim_records", alternative_lookup, raising=False)
+    monkeypatch.setattr(memory, "resolve_acquisition_history", alternative_lookup, raising=False)
+
+    async def failed_policy(**kwargs):
+        response = await evaluate(**kwargs)
+        if kwargs.get("history_followup_candidate") is not None:
+            if failure in {"unavailable", "timeout"}:
+                error = TimeoutError if failure == "timeout" else RuntimeError
+                raise error("PRIVATE-POLICY-FAILURE")
+            if failure == "missing":
+                response["result"].pop("history_followup_policy")
+            elif failure == "malformed":
+                response["result"]["history_followup_policy"] = []
+            elif failure == "inconsistent":
+                response["result"]["history_followup_policy"]["history_lookup_allowed"] = False
+            else:
+                response[failure] = "PRIVATE-OTHER-CONTEXT"
+        return response
+
+    monkeypatch.setattr(runtime, "evaluate_interaction_governance", failed_policy)
+    result, _, _, provider = await _run_history_followup(
+        tmp_path, text="How are you sure?", memory_store_override=memory,
+        runtime_override=runtime,
+    )
+    assert result["answer"] == orchestrate_service._HISTORY_POLICY_UNAVAILABLE
+    assert result["selected_model"] == "not_called"
+    assert len(runtime.interaction_governance_calls) == 2
+    assert memory.immediate_history_calls == alternative_calls == memory.retrieve_calls == []
+    assert provider.calls == runtime.world_state_calls == runtime.capability_match_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(memory.trace_calls) == len(runtime.turn_complete_calls) == 1
+    assert all("history_root_lineage" not in message for message in memory.added_messages)
+    assert "PRIVATE-" not in json.dumps((result, memory.trace_calls))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    "unavailable", "timeout", "malformed", "no_record",
+    "owner_id", "conversation_id", "surface", "request_id",
+    "support_owner", "support_conversation", "support_surface", "support_message",
+])
+async def test_failed_history_resolution_cannot_substitute_or_start_new_verification(
+    tmp_path, monkeypatch, failure
+):
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    dsa = FakeDSA()
+    resolve = memory.resolve_immediate_history
+    alternatives = []
+
+    async def failed_resolution(**kwargs):
+        response = await resolve(**kwargs)
+        if failure in {"unavailable", "timeout"}:
+            error = TimeoutError if failure == "timeout" else RuntimeError
+            raise error("PRIVATE-HISTORY-FAILURE")
+        if failure == "malformed":
+            return {"record": "PRIVATE-MALFORMED-RECORD"}
+        if failure == "no_record":
+            response.update(
+                resolution_status="no_record", resolution_source="none", match_count=0,
+                reason_code="direct_record_absent_lineage_absent", record=None,
+                history_root_lineage=None,
+            )
+        elif failure.startswith("support_"):
+            field = {
+                "support_owner": "owner_id", "support_conversation": "conversation_id",
+                "support_surface": "surface", "support_message": "assistant_message_id",
+            }[failure]
+            response["record"]["support_record"][field] = "PRIVATE-OTHER-CONTEXT"
+        else:
+            response[failure] = "PRIVATE-OTHER-CONTEXT"
+        return response
+
+    async def alternative_lookup(**kwargs):
+        alternatives.append(kwargs)
+        raise AssertionError("failed immediate resolution cannot substitute another lookup")
+
+    monkeypatch.setattr(memory, "resolve_immediate_history", failed_resolution)
+    monkeypatch.setattr(memory, "list_claim_records", alternative_lookup, raising=False)
+    monkeypatch.setattr(memory, "resolve_acquisition_history", alternative_lookup, raising=False)
+    result, _, _, provider = await _run_history_followup(
+        tmp_path, text="Can you verify that again now?",
+        completion=_classifier_completion("new_verification_request", verify=True),
+        memory_store_override=memory, runtime_override=runtime,
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+            "restraint_enabled": True,
+        },
+    )
+    assert result["status"] == "degraded" and result["selected_model"] == "not_called"
+    assert len(runtime.interaction_governance_calls) == 2
+    assert len(memory.immediate_history_calls) == 1
+    assert alternatives == memory.retrieve_calls == []
+    assert dsa.calls == dsa.list_calls == dsa.fetch_calls == dsa.context_calls == []
+    assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert len(provider.calls) == 1  # Classifier only.
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert all("history_root_lineage" not in message for message in memory.added_messages)
+    trace = memory.trace_calls[-1]["payload"]
+    assert trace["model_calls"] == [] and trace["fallback"]["triggered"] is False
+    assert "PRIVATE-" not in json.dumps((result, trace))
+    assert "private-source:record-1" not in json.dumps((result, trace))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
+@pytest.mark.parametrize("verify", [False, True])
+@pytest.mark.parametrize("failure", [
+    "candidate_mismatch", "policy_unavailable", "policy_missing", "policy_malformed",
+    "history_unavailable", "history_malformed", "history_missing",
+])
+async def test_failed_history_with_exact_refs_keeps_bounded_response(
+    tmp_path, monkeypatch, failure, verify, exact_refs
+):
+    memory = ImmediateHistoryMemoryStore(resolve_support=failure != "history_missing")
+    runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
+    provider = SequenceLiteLLM([
+        *([_classifier_completion("new_verification_request", verify=True)] if verify else []),
+        _provider_completion(_evidence_candidate((
+            "neutral_connector:vehicle_log_primary:record_1",
+            "The exact maintenance item lists 2025-07-12.",
+        ))),
+    ])
+    evaluate = runtime.evaluate_interaction_governance
+    resolve = memory.resolve_immediate_history
+    alternatives, dispatch = [], []
+
+    async def evaluate_policy(**kwargs):
+        response = await evaluate(**kwargs)
+        candidate = kwargs.get("history_followup_candidate")
+        if candidate is not None:
+            if failure == "candidate_mismatch":
+                other = {**candidate, "source": "deterministic" if verify else "classifier"}
+                response["result"]["history_followup_policy"] = _history_policy_for(other)
+            elif failure == "policy_unavailable":
+                raise RuntimeError("PRIVATE-POLICY-FAILURE")
+            elif failure == "policy_missing":
+                response["result"].pop("history_followup_policy")
+            elif failure == "policy_malformed":
+                response["result"]["history_followup_policy"] = []
+        return response
+
+    async def resolve_history(**kwargs):
+        response = await resolve(**kwargs)
+        if failure == "history_unavailable":
+            raise RuntimeError("PRIVATE-HISTORY-FAILURE")
+        if failure == "history_malformed":
+            return {"record": "PRIVATE-MALFORMED-RECORD"}
+        return response
+
+    async def alternative_lookup(**kwargs):
+        alternatives.append(kwargs)
+        raise AssertionError("failed history cannot substitute another lookup")
+
+    async def execute(**kwargs):
+        dispatch.append(kwargs)
+        raise AssertionError("failed history cannot execute an action")
+
+    monkeypatch.setattr(runtime, "evaluate_interaction_governance", evaluate_policy)
+    monkeypatch.setattr(memory, "resolve_immediate_history", resolve_history)
+    monkeypatch.setattr(memory, "list_claim_records", alternative_lookup, raising=False)
+    monkeypatch.setattr(memory, "resolve_acquisition_history", alternative_lookup, raising=False)
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", execute)
+    result, _, _, _ = await _run_history_followup(
+        tmp_path, text="Can you verify that again now?" if verify else "How are you sure?",
+        memory_store_override=memory, runtime_override=runtime, litellm_override=provider,
+        payload_overrides={"external_context": _exact_external_context()} if exact_refs else {},
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+            "restraint_enabled": True, "capability_registry_enabled": True,
+        },
+    )
+
+    # Report the actual escaped work when this regression is run before the fix.
+    assert dsa.list_calls == dsa.fetch_calls == dsa.calls == dsa.context_calls == [], (
+        result["status"], result["selected_model"],
+        len(dsa.list_calls), len(dsa.fetch_calls), len(provider.calls),
+    )
+    assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+    assert runtime.capability_match_calls == runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == dispatch == alternatives == memory.retrieve_calls == []
+    assert len(provider.calls) == int(verify)  # At most the requested intent classification.
+    assert len(runtime.interaction_governance_calls) == 2
+    assert len(memory.immediate_history_calls) == int(failure.startswith("history_"))
+    expected = orchestrate_service._HISTORY_POLICY_UNAVAILABLE
+    if failure == "history_missing":
+        expected = (
+            "I don’t have a retained evidence record for that immediately previous answer, "
+            "so I can’t honestly say what supported it. I did not perform a new verification."
+        )
+    elif failure.startswith("history_"):
+        expected = (
+            "I couldn’t access the retained evidence record for that earlier answer. I can’t "
+            "honestly reconstruct its support from memory, and I did not perform a new "
+            "verification."
+        )
+    assert result["answer"] == expected
+    assert result["status"] == "degraded" and result["selected_model"] == "not_called"
+    assert [message["role"] for message in memory.added_messages] == ["user", "assistant"]
+    assistant = memory.added_messages[-1]
+    assert assistant["content"] == expected
+    assert assistant["owner_id"] == "owner" and assistant["conversation_id"] == "conv-1"
+    assert "history_root_lineage" not in assistant
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == memory.work["state"] == "completed"
+    trace = memory.trace_calls[0]["payload"]
+    assert trace["status"] == "degraded" and trace["model_calls"] == []
+    assert trace["fallback"]["triggered"] is False
+    assert trace["owner_id"] == "owner" and trace["conversation_id"] == "conv-1"
+    assert trace["surface"] == "node_red" and trace["request_id"] == result["request_id"]
+    assert trace["dsa"]["called"] is False
+    assert "PRIVATE-" not in json.dumps((result, trace))
+    assert "private-source:record-1" not in json.dumps((result, trace))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
+@pytest.mark.parametrize("failure", [
+    "unavailable", "malformed", "missing", "ambiguous", "wrong_scope",
+])
+async def test_failed_quoted_acquisition_cannot_authorize_new_verification(
+    tmp_path, monkeypatch, failure, exact_refs
+):
+    target = "The earlier answer used the retained document."
+    text = f'What did you check for the statement "{target}"? Check again.'
+    task = f'Verify this prior statement with a new evidence check: "{target}"'
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    dsa = FakeDSA(
+        response=_governed_context_pack(task), fetch_responses=[_exact_fetch_response()],
+    )
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
+    provider = FakeLiteLLM(content=_evidence_candidate((
+        "neutral_connector:vehicle_log_primary:record_1"
+        if exact_refs else "vehicle_log_primary:record_1",
+        "The exact maintenance item lists 2025-07-12."
+        if exact_refs else "The maintenance record lists 2025-07-12.",
+    )))
+    lookups, alternatives, dispatch, events = [], [], [], []
+
+    async def resolve_history(**kwargs):
+        lookups.append(copy.deepcopy(kwargs))
+        if failure == "unavailable":
+            raise RuntimeError("PRIVATE-HISTORY-FAILURE")
+        if failure == "malformed":
+            return {"record": "PRIVATE-MALFORMED-HISTORY"}
+        response = _history_resolution_response(
+            kwargs, status="ambiguous" if failure == "ambiguous" else "no_record",
+            count=2 if failure == "ambiguous" else 0,
+            reason="quoted_response_ambiguous"
+            if failure == "ambiguous" else "quoted_response_not_found",
+        )
+        if failure == "wrong_scope":
+            response["owner_id"] = "PRIVATE-OTHER-OWNER"
+        return response
+
+    async def alternative_lookup(**kwargs):
+        alternatives.append(kwargs)
+        raise AssertionError("failed quoted history cannot substitute another lookup")
+
+    async def execute(**kwargs):
+        dispatch.append(kwargs)
+        raise AssertionError("failed quoted history cannot execute actions")
+
+    monkeypatch.setattr(memory, "resolve_acquisition_history", resolve_history, raising=False)
+    monkeypatch.setattr(memory, "list_claim_records", alternative_lookup, raising=False)
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", execute)
+    for obj, method, label in (
+        (memory, "add_message", "message"), (runtime, "complete_turn", "completion"),
+        (memory, "create_trace", "trace"),
+    ):
+        original = getattr(obj, method)
+
+        async def observe(_call=original, _label=label, **kwargs):
+            response = await _call(**kwargs)
+            events.append(kwargs["role"] if _label == "message" else _label)
+            return response
+
+        monkeypatch.setattr(obj, method, observe)
+
+    result, _, _, _ = await _run_history_followup(
+        tmp_path, text=text, memory_store_override=memory, runtime_override=runtime,
+        litellm_override=provider,
+        payload_overrides={"external_context": _exact_external_context()} if exact_refs else {},
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+            "restraint_enabled": True, "capability_registry_enabled": True,
+        },
+    )
+
+    assert dsa.list_calls == dsa.fetch_calls == dsa.calls == dsa.context_calls == [], (
+        result["status"], len(dsa.list_calls), len(dsa.fetch_calls), len(provider.calls),
+    )
+    assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+    assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+    assert provider.calls == alternatives == dispatch == memory.immediate_history_calls == []
+    assert runtime.capability_match_calls == runtime.capability_authority_calls == []
+    assert runtime.capability_flow_calls == memory.retrieve_calls == []
+    assert lookups == [{
+        "request_id": result["request_id"], "owner_id": "owner", "conversation_id": "conv-1",
+        "surface": "node_red", "target_mode": "quoted_first_paragraph",
+        "normalized_first_paragraph": target, "response_digest": None,
+    }]
+    expected = {
+        "missing": "I couldn’t resolve a retained acquisition record for the specified response.",
+        "ambiguous": (
+            "More than one exact prior response matched, so I did not select an acquisition record."
+        ),
+    }.get(
+        failure,
+        "I couldn’t safely access the retained acquisition record for the specified response.",
+    )
+    expected += " I did not perform a new verification for this explanation."
+    assert result["status"] == "degraded" and result["selected_model"] == "not_called"
+    assert result["answer"] == memory.added_messages[-1]["content"] == expected
+    assert events == ["user", "assistant", "completion", "trace"]
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert runtime.turn_complete_calls[0]["turn_status"] == memory.work["state"] == "completed"
+    assert "history_root_lineage" not in memory.added_messages[-1]
+    trace = memory.trace_calls[0]["payload"]
+    assert trace["status"] == "degraded" and trace["model_calls"] == []
+    assert trace["owner_id"] == "owner" and trace["conversation_id"] == "conv-1"
+    assert trace["surface"] == "node_red" and trace["request_id"] == result["request_id"]
+    assert trace["fallback"]["triggered"] is False and trace["dsa"]["called"] is False
+    explanation = trace["prompt"]["claim_explanation"]
+    assert explanation["resolution_status"] == {
+        "missing": "no_record", "ambiguous": "ambiguous",
+    }.get(failure, "unavailable")
+    assert explanation["compound_mode"] is True  # Requested intent is not execution authority.
+    assert target not in json.dumps((result, trace))
+    assert "PRIVATE-" not in json.dumps((result, trace))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("quoted", [False, True])
+async def test_resolved_history_with_exact_refs_preserves_existing_evidence_path(
+    tmp_path, monkeypatch, quoted
+):
+    memory = ImmediateHistoryMemoryStore()
+    runtime = HistoryPolicyRuntime()
+    runtime.restraint_response["result"]["retrieval_suppressed"] = False
+    record = _history_support_record()
+    listed = []
+
+    async def list_records(**kwargs):
+        listed.append(kwargs)
+        return {"records": [copy.deepcopy(record)]}
+
+    monkeypatch.setattr(memory, "list_claim_records", list_records, raising=False)
+    dsa = FakeDSA(fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
+    provider = FakeLiteLLM(content=_evidence_candidate((
+        "neutral_connector:vehicle_log_primary:record_1",
+        "The exact maintenance item lists 2025-07-12.",
+    )))
+    text = (
+        f'What supports the statement "{record["claim_anchor"]}"?'
+        if quoted else "How are you sure?"
+    )
+    result, _, _, _ = await _run_history_followup(
+        tmp_path, text=text, memory_store_override=memory, runtime_override=runtime,
+        litellm_override=provider,
+        payload_overrides={"external_context": _exact_external_context()},
+        orchestration_options={
+            "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
+            "restraint_enabled": True,
+        },
+    )
+    assert result["status"] == "ok"
+    assert result["answer"] == _rendered_evidence_answer(
+        "The exact maintenance item lists 2025-07-12.",
+    )
+    assert len(memory.immediate_history_calls) == int(not quoted)
+    assert listed == ([{"owner_id": "owner", "conversation_id": "conv-1", "limit": 20}]
+                      if quoted else [])
+    assert len(runtime.interaction_governance_calls) == (1 if quoted else 2)
+    assert len(dsa.list_calls) == len(dsa.fetch_calls) == len(provider.calls) == 1
+    assert dsa.calls == dsa.context_calls == []
+    assert dsa.fetch_calls[0]["source_ref"] == "neutral_connector:vehicle_log_primary:record_1"
+    assert memory.added_messages[-1]["content"] == result["answer"]
+    trace = memory.trace_calls[-1]["payload"]
+    assert trace["prompt"]["history_followup"]["classifier_call_count"] == 0
+    assert "private-source:record-1" not in json.dumps((result, trace))
+    assert "PRIVATE RAW SUMMARY" not in json.dumps((result, trace))
+
+
+@pytest.mark.asyncio
 async def test_quoted_exact_target_remains_classifier_free_and_uses_legacy_path(tmp_path):
     text = 'What supports the statement "An earlier exact statement"?'
     result, memory_store, runtime, litellm = await _run_history_followup(
@@ -37179,7 +37794,10 @@ async def test_feature_disabled_preserves_existing_history_behavior(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_support_reverification_enters_existing_governed_path_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("exact_refs", [False, True])
+async def test_support_reverification_enters_existing_governed_path_once(
+    tmp_path, monkeypatch, exact_refs
+):
     selector = orchestrate_service._select_timing_latency_class
     selected_branches = []
 
@@ -37194,7 +37812,10 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
     runtime.restraint_response["result"]["retrieval_suppressed"] = False
     target = _history_support_record()["claim_anchor"]
     task_text = f'Verify this prior statement with a new evidence check: "{target}"'
-    dsa = FakeDSA(response=_governed_context_pack(task_text))
+    dsa = FakeDSA(
+        response=_governed_context_pack(task_text), fetch_responses=[_exact_fetch_response()],
+    )
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
     classifier = _classifier_completion(
         "new_verification_request",
         verify=True,
@@ -37208,8 +37829,10 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
                         "message": {
                             "content": _evidence_candidate(
                                 (
-                                    "vehicle_log_primary:record_1",
-                                    "The maintenance record lists 2025-07-12.",
+                                    "neutral_connector:vehicle_log_primary:record_1"
+                                    if exact_refs else "vehicle_log_primary:record_1",
+                                    "The exact maintenance item lists 2025-07-12."
+                                    if exact_refs else "The maintenance record lists 2025-07-12.",
                                 )
                             )
                         }
@@ -37218,10 +37841,39 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
             },
         ]
     )
+    dependency_order = []
+    for obj, method, label in (
+        (runtime, "evaluate_interaction_governance", "history_policy"),
+        (memory_store, "resolve_immediate_history", "history_resolution"),
+        (runtime, "derive_evidence_shape", "shape"),
+        (dsa, "list_sources", "catalog"),
+        (runtime, "compile_evidence_plan", "plan"),
+        (dsa, "context_pack", "acquisition"),
+        (dsa, "fetch_source", "acquisition"),
+        (runtime, "evaluate_evidence_sufficiency", "sufficiency"),
+        (runtime, "select_evidence_next_step", "next_step"),
+        (provider, "chat", "provider"),
+    ):
+        original = getattr(obj, method)
+
+        async def observe(_call=original, _label=label, **kwargs):
+            label = _label
+            if label == "history_policy" and kwargs.get("history_followup_candidate") is None:
+                label = "initial_governance"
+            if label == "provider":
+                label = "classifier" if not provider.calls else "evidence_provider"
+            dependency_order.append(f"{label}:start")
+            response = await _call(**kwargs)
+            dependency_order.append(f"{label}:done")
+            return response
+
+        monkeypatch.setattr(obj, method, observe)
+
     result = await orchestrate_chat(
         payload=_first_party_chat_payload(
             "Can you verify that again now?",
             conversation_id="conv-1",
+            **({"external_context": _exact_external_context()} if exact_refs else {}),
             messages=[
                 {"role": "user", "content": "Can you verify that again now?"}
             ],
@@ -37250,9 +37902,19 @@ async def test_support_reverification_enters_existing_governed_path_once(tmp_pat
     assert len(provider.calls) == 2
     assert provider.calls[0]["model"] == "gpt-5-mini"
     assert len(memory_store.immediate_history_calls) == 1
-    assert len(dsa.calls) == 1
+    assert len(dsa.calls) == int(not exact_refs)
+    assert len(dsa.fetch_calls) == int(exact_refs)
     assert len(runtime.evidence_shape_calls) == 1
     assert len(runtime.evidence_plan_calls) == 1
+    assert dependency_order == [
+        f"{label}:{edge}"
+        for label in (
+            "initial_governance", "classifier", "history_policy", "history_resolution",
+            "catalog", "shape", "plan", "acquisition", "sufficiency", "next_step",
+            "evidence_provider",
+        )
+        for edge in ("start", "done")
+    ]
     trace = memory_store.trace_calls[-1]["payload"]
     history = trace["prompt"]["history_followup"]
     assert history["classifier_call_count"] == 1
@@ -37514,8 +38176,9 @@ async def test_support_compound_structured_inline_prose_remains_allowed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exact_refs", [False, True])
 async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_retrieval(
-    tmp_path,
+    tmp_path, exact_refs,
 ):
     result, memory_store, runtime, litellm = await _run_history_followup(
         tmp_path,
@@ -37524,6 +38187,7 @@ async def test_unavailable_fresh_path_keeps_history_and_calls_no_provider_or_ret
             "new_verification_request",
             verify=True,
         ),
+        payload_overrides={"external_context": _exact_external_context()} if exact_refs else {},
     )
     assert result["answer"].startswith("Original support:\n")
     assert "\n\nNew verification unavailable:\n" in result["answer"]
