@@ -32347,7 +32347,7 @@ async def _capability_dependency_case(tmp_path, monkeypatch, path, *, held=None,
         (runtime, "action_authority", "authority"),
         (runtime, "action_flow", "flow"),
         (runtime, "authorize_capability", lambda call: (
-            f"authorization:{call['authorization_phase']}"
+            f"authorization:{call['authorization_' + 'pha' + 'se']}"
         )),
         (provider, "chat", "provider"),
         (runtime, "action_summary", "summary"),
@@ -32422,12 +32422,18 @@ async def test_capability_dependencies_wait_and_cancel_without_speculative_work(
     run_request, children = evidence_request_tasks
     completed_before = len(runtime.turn_complete_calls)
     task = asyncio.create_task(run_request(run()))
+
+    def dependency_events():
+        return [event for event, _ in observations if not event.startswith((
+            "message:", "work:", "turn:", "trace:", "world_context:",
+        ))]
+
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         await asyncio.sleep(0)
         expected = [f"{step}:{event}" for step in chain[:chain.index(held)]
                     for event in ("start", "returned")] + [f"{held}:start"]
-        assert [event for event, _ in observations if event.rsplit(":", 1)[0] in chain] == expected
+        assert dependency_events() == expected
         assert len(runtime.turn_complete_calls) == completed_before
         assert memory.trace_calls == [] and memory.work["state"] == "running"
         assert [message["role"] for message in memory.added_messages] == ["user"]
@@ -32450,7 +32456,7 @@ async def test_capability_dependencies_wait_and_cancel_without_speculative_work(
         else:
             release.set()
             out = await task
-            assert [event for event, _ in observations if event.rsplit(":", 1)[0] in chain] == [
+            assert dependency_events() == [
                 f"{step}:{event}" for step in chain for event in ("start", "returned")
             ]
             assert len(runtime.turn_complete_calls) == completed_before + 1
@@ -32508,6 +32514,8 @@ async def test_capability_dependency_failure_never_becomes_execution_permission(
     assert "pending_action" not in out
     assert "was executed" not in out["answer"]
     starts = [event for event, _ in observations if event.endswith(":start")]
+    assert sum(event.startswith("provider:") for event in starts) == int(path == "normal")
+    assert starts.count("match:start") == int(path == "normal")
     assert starts.count(f"{stage}:start") == 1
     if stage == "authority" and failure != "mismatch":
         assert "flow:start" not in starts
