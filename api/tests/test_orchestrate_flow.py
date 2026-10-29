@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import re
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from time import monotonic_ns
@@ -17211,6 +17212,70 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in public_response
 
 
+@pytest.fixture
+async def evidence_request_tasks():
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    request_context = ContextVar("evidence_test_request", default=False)
+    children = set()
+
+    def create_task(loop, coro, context=None):
+        if previous_factory is None:
+            child = asyncio.Task(coro, loop=loop, context=context)
+        else:
+            child = (previous_factory(loop, coro) if context is None
+                     else previous_factory(loop, coro, context=context))
+        # Track creation in this request, not a global all_tasks() difference.
+        if (request_context.get() or asyncio.current_task(loop=loop) in children
+                or (context is not None and context.get(request_context, False))):
+            children.add(child)
+        return child
+
+    async def run_request(coro):
+        token = request_context.set(True)
+        try:
+            return await coro
+        finally:
+            request_context.reset(token)
+
+    loop.set_task_factory(create_task)
+    unrelated = asyncio.create_task(asyncio.Event().wait())
+    try:
+        assert unrelated not in children
+        yield run_request, children
+    finally:
+        try:
+            deadline = loop.time() + 1
+            while pending := {child for child in children if not child.done()}:
+                for child in pending:
+                    child.cancel()
+                await asyncio.wait(pending, timeout=max(0, deadline - loop.time()))
+                assert loop.time() < deadline or all(child.done() for child in children), (
+                    "request-owned children did not stop during test cleanup"
+                )
+            # Retrieve exceptions as well as awaiting deliberately injected children.
+            await asyncio.gather(*children, return_exceptions=True)
+            assert unrelated not in children and not unrelated.done()
+        finally:
+            loop.set_task_factory(previous_factory)
+            unrelated.cancel()
+            await asyncio.gather(unrelated, return_exceptions=True)
+
+
+async def _settle_cancelled_evidence_request(children, release):
+    survivors = {child for child in children if not child.done() and not child.cancelling()}
+    release.set()
+    # Ready callbacks may create further descendants. Yield before collecting,
+    # then wait for request-owned work only; a pending sleeper is also a failure.
+    for _ in range(2):
+        await asyncio.sleep(0)
+    if children:
+        await asyncio.wait(tuple(children), timeout=0.1)
+    assert not survivors and all(child.done() for child in children), (
+        "request-owned child survived parent cancellation"
+    )
+
+
 def _observe_evidence_dependencies(monkeypatch, runtime, dsa, provider, memory, *, held=None):
     observations = []
     entered, release = asyncio.Event(), asyncio.Event()
@@ -17298,7 +17363,7 @@ def _assert_evidence_finalization(out, runtime, memory, observations):
 ])
 @pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
 async def test_evidence_dependencies_wait_and_cancel_without_speculative_work(
-    tmp_path, monkeypatch, held, cancel,
+    tmp_path, monkeypatch, held, cancel, evidence_request_tasks,
 ):
     rules, models = _write_default_route_files(tmp_path)
     question = "Verify the maintenance record."
@@ -17317,7 +17382,8 @@ async def test_evidence_dependencies_wait_and_cancel_without_speculative_work(
     )
     chain = ["catalog", "shape", "plan", "exact_acquisition" if exact else "acquisition",
              "sufficiency", "next_step"]
-    task = asyncio.create_task(orchestrate_chat(
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(orchestrate_chat(
         payload=_first_party_chat_payload(
             question, external_context_enabled=True,
             external_context=(_exact_external_context() if exact else {
@@ -17329,7 +17395,7 @@ async def test_evidence_dependencies_wait_and_cancel_without_speculative_work(
         capability_registry_enabled=True,
         rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
         request_id="rid-evidence-barrier",
-    ))
+    )))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         # Let any incorrectly spawned consumer run while the predecessor is held.
@@ -17351,7 +17417,7 @@ async def test_evidence_dependencies_wait_and_cancel_without_speculative_work(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            release.set()
+            await _settle_cancelled_evidence_request(children, release)
             assert observations[:len(before)] == before
             assert [step for step, _ in observations[len(before):]] == [
                 "work:failed:start", "work:failed:returned",
@@ -44616,7 +44682,7 @@ async def test_invalid_voice_projection_clarifies_without_provider(tmp_path, pro
 @pytest.mark.parametrize("held", ["refined_shape", "terminal"])
 @pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
 async def test_evidence_terminal_waits_for_acquisition_and_blocks_finalization(
-    tmp_path, monkeypatch, held, cancel,
+    tmp_path, monkeypatch, held, cancel, evidence_request_tasks,
 ):
     memory = ClaimCaptureMemoryStore()
     entered, release = asyncio.Event(), asyncio.Event()
@@ -44670,11 +44736,12 @@ async def test_evidence_terminal_waits_for_acquisition_and_blocks_finalization(
     monkeypatch.setattr(FakeRuntime, "derive_evidence_shape", shape)
     monkeypatch.setattr(SequenceLiteLLM, "chat", interpret)
     monkeypatch.setattr(FakeRuntime, "evaluate_evidence_terminal", terminal)
-    task = asyncio.create_task(_run_step13_aggregate_failure(
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_step13_aggregate_failure(
         tmp_path=tmp_path, response=_aggregate_structured_response(),
         diagnostic_completion=_diagnostic_completion(), request_id="rid-terminal-barrier",
         memory_store=memory,
-    ))
+    )))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         await asyncio.sleep(0)
@@ -44695,12 +44762,15 @@ async def test_evidence_terminal_waits_for_acquisition_and_blocks_finalization(
         assert [message["role"] for message in memory.added_messages] == ["user"]
         assert memory.work["state"] == "running" and not task.done()
         if cancel:
+            before = list(observations)
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            release.set()
+            await _settle_cancelled_evidence_request(children, release)
+            assert observations == before
             assert not any(step == f"{held}:returned" for step, _ in observations)
             assert memory.work["state"] == "failed"
+            assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
             assert memory.work["assistant_message_id"] is None
             assert runtime.turn_complete_calls == memory.trace_calls == []
             assert [message["role"] for message in memory.added_messages] == ["user"]
