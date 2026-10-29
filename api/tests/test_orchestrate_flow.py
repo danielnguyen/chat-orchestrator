@@ -6,12 +6,15 @@ import inspect
 import json
 import logging
 import re
+from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from time import monotonic_ns
 from urllib.parse import quote
 
 import httpx
 import pytest
+import pytest_asyncio
 import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
 from clients.data_source_aggregator import (
@@ -17210,6 +17213,338 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in public_response
 
 
+@pytest_asyncio.fixture
+async def evidence_request_tasks():
+    loop = asyncio.get_running_loop()
+    previous_factory = loop.get_task_factory()
+    request_context = ContextVar("evidence_test_request", default=False)
+    children = set()
+
+    def create_task(loop, coro, context=None):
+        if previous_factory is None:
+            child = asyncio.Task(coro, loop=loop, context=context)
+        else:
+            child = (previous_factory(loop, coro) if context is None
+                     else previous_factory(loop, coro, context=context))
+        # Track creation in this request, not a global all_tasks() difference.
+        if (request_context.get() or asyncio.current_task(loop=loop) in children
+                or (context is not None and context.get(request_context, False))):
+            children.add(child)
+        return child
+
+    async def run_request(coro):
+        token = request_context.set(True)
+        try:
+            return await coro
+        finally:
+            request_context.reset(token)
+
+    loop.set_task_factory(create_task)
+    unrelated = asyncio.create_task(asyncio.Event().wait())
+    try:
+        assert unrelated not in children
+        yield run_request, children
+    finally:
+        try:
+            deadline = loop.time() + 1
+            while pending := {child for child in children if not child.done()}:
+                for child in pending:
+                    child.cancel()
+                await asyncio.wait(pending, timeout=max(0, deadline - loop.time()))
+                assert loop.time() < deadline or all(child.done() for child in children), (
+                    "request-owned children did not stop during test cleanup"
+                )
+            # Retrieve exceptions as well as awaiting deliberately injected children.
+            await asyncio.gather(*children, return_exceptions=True)
+            assert unrelated not in children and not unrelated.done()
+        finally:
+            loop.set_task_factory(previous_factory)
+            unrelated.cancel()
+            await asyncio.gather(unrelated, return_exceptions=True)
+
+
+async def _settle_cancelled_evidence_request(children, release):
+    survivors = {child for child in children if not child.done() and not child.cancelling()}
+    release.set()
+    # Ready callbacks may create further descendants. Yield before collecting,
+    # then wait for request-owned work only; a pending sleeper is also a failure.
+    for _ in range(2):
+        await asyncio.sleep(0)
+    if children:
+        await asyncio.wait(tuple(children), timeout=0.1)
+    assert not survivors and all(child.done() for child in children), (
+        "request-owned child survived parent cancellation"
+    )
+
+
+def _observe_evidence_dependencies(monkeypatch, runtime, dsa, provider, memory, *, held=None):
+    observations = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    def observe(target, name, label):
+        original = getattr(target, name)
+
+        async def wrapped(**kwargs):
+            step = label(kwargs) if callable(label) else label
+            observations.append((f"{step}:start", monotonic_ns()))
+            response = await original(**kwargs)
+            if step == held:
+                entered.set()
+                await release.wait()
+            observations.append((f"{step}:returned", monotonic_ns()))
+            return response
+
+        monkeypatch.setattr(target, name, wrapped)
+
+    for target, name, label in (
+        (runtime, "start_turn", "admission"),
+        (runtime, "evaluate_interaction_governance", "governance"),
+        (dsa, "list_sources", "catalog"),
+        (runtime, "derive_evidence_shape", "shape"),
+        (runtime, "compile_evidence_plan", "plan"),
+        (dsa, "context_pack", "acquisition"),
+        (dsa, "fetch_source", "exact_acquisition"),
+        (dsa, "context_source", "expansion"),
+        (runtime, "evaluate_evidence_sufficiency", "sufficiency"),
+        (runtime, "select_evidence_next_step", "next_step"),
+        (runtime, "evaluate_evidence_terminal", "terminal"),
+        (provider, "chat", "provider"),
+        (memory, "add_message", lambda call: f"message:{call['role']}"),
+        (runtime, "complete_turn", lambda call: f"turn:{call['turn_status']}"),
+        (memory, "create_trace", "trace"),
+        (memory, "transition_work", lambda call: f"work:{call['state']}"),
+    ):
+        observe(target, name, label)
+
+    async def forbidden_dispatch(*args, **kwargs):
+        pytest.fail("evidence processing must not dispatch an action")
+
+    monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", forbidden_dispatch)
+    return observations, entered, release
+
+
+def _assert_evidence_finalization(out, runtime, memory, observations):
+    steps = [step for step, _ in observations]
+    assert steps[-8:] == [
+        "message:assistant:start", "message:assistant:returned",
+        "turn:completed:start", "turn:completed:returned",
+        "trace:start", "trace:returned", "work:completed:start", "work:completed:returned",
+    ]
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert [message["role"] for message in memory.added_messages] == ["user", "assistant"]
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    assert memory.work["state"] == "completed"
+    assert [state for state, _ in memory.work_calls] == ["create", "running", "completed"]
+    assistant_id = "00000000-0000-4000-8000-000000000002"
+    assert memory.work["assistant_message_id"] == assistant_id
+    assert runtime.turn_complete_calls[0]["assistant_message_id"] == assistant_id
+    assert memory.work["request_id"] == memory.trace_calls[0]["request_id"] == out["request_id"]
+    assert runtime.turn_complete_calls[0]["request_id"] == out["request_id"]
+    trace = memory.trace_calls[0]["payload"]
+    for key in ("owner_id", "conversation_id", "client_id", "surface"):
+        assert trace[key] == memory.work[key]
+    assert trace["conversation_id"] == out["conversation_id"]
+    manifest = trace["prompt"]["evidence_acquisition"]
+    assert manifest["assistant_message_id"] == assistant_id
+    assert manifest["response_digest"] == (
+        f"sha256:{hashlib.sha256(out['answer'].encode()).hexdigest()}"
+    )
+    assert memory.claim_record_calls == []
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    _assert_bms_trace_create_shape(memory.trace_calls[0]["payload"])
+    # Real monotonic observations at test seams, not invented production spans
+    # or a latency/actual-service acceptance claim.
+    stamps = [stamp for _, stamp in observations]
+    assert stamps == sorted(stamps) and stamps[-1] > stamps[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", [
+    "catalog", "shape", "plan", "acquisition", "exact_acquisition", "sufficiency", "next_step",
+])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_evidence_dependencies_wait_and_cancel_without_speculative_work(
+    tmp_path, monkeypatch, held, cancel, evidence_request_tasks,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime, memory = FakeRuntime(), ClaimCaptureMemoryStore()
+    exact = held == "exact_acquisition"
+    source_ref = ("neutral_connector:vehicle_log_primary:record_1" if exact
+                  else "vehicle_log_primary:record_1")
+    dsa = FakeDSA(response=_governed_context_pack(question),
+                  fetch_responses=[_exact_fetch_response()])
+    dsa.source_response["sources"][0]["capabilities"].append("fetch")
+    statement = ("The exact maintenance item lists 2025-07-12." if exact
+                 else "The maintenance record lists 2025-07-12.")
+    provider = FakeLiteLLM(content=_evidence_candidate((source_ref, statement)))
+    observations, entered, release = _observe_evidence_dependencies(
+        monkeypatch, runtime, dsa, provider, memory, held=held,
+    )
+    chain = ["catalog", "shape", "plan", "exact_acquisition" if exact else "acquisition",
+             "sufficiency", "next_step"]
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question, external_context_enabled=True,
+            external_context=(_exact_external_context() if exact else {
+                "enabled": True, "source_ids": ["vehicle_log_primary"],
+            }),
+        ),
+        memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True, interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-evidence-barrier",
+    )))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        # Let any incorrectly spawned consumer run while the predecessor is held.
+        await asyncio.sleep(0)
+        prefix = chain[:chain.index(held)]
+        expected = [f"{step}:{event}" for step in prefix for event in ("start", "returned")]
+        expected.append(f"{held}:start")
+        assert [step for step, _ in observations if step.split(":")[0] in chain] == expected
+        assert provider.calls == runtime.turn_complete_calls == memory.trace_calls == []
+        assert runtime.evidence_terminal_calls == []
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+        assert [message["role"] for message in memory.added_messages] == ["user"]
+        assert memory.work["state"] == "running" and not task.done()
+        assert dsa.context_calls == []
+        assert len(dsa.fetch_calls) == (1 if exact else 0)
+
+        if cancel:
+            before = list(observations)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_cancelled_evidence_request(children, release)
+            assert observations[:len(before)] == before
+            assert [step for step, _ in observations[len(before):]] == [
+                "work:failed:start", "work:failed:returned",
+            ]
+            assert memory.work["state"] == "failed"
+            assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
+            assert memory.work["assistant_message_id"] is None
+            assert provider.calls == runtime.turn_complete_calls == memory.trace_calls == []
+            assert [message["role"] for message in memory.added_messages] == ["user"]
+        else:
+            release.set()
+            out = await task
+            assert out["status"] == "ok"
+            assert out["answer"] == _rendered_evidence_answer(statement)
+            assert len(provider.calls) == 1
+            evidence_steps = [step for step, _ in observations if step.split(":")[0] in chain]
+            assert evidence_steps == [
+                f"{step}:{event}" for step in chain for event in ("start", "returned")
+            ]
+            steps = [step for step, _ in observations]
+            assert steps.index("admission:returned") < steps.index("governance:start")
+            assert steps.index("governance:returned") < steps.index("catalog:start")
+            assert steps.index("next_step:returned") < steps.index("provider:start")
+            assert steps.index("provider:returned") < steps.index("message:assistant:start")
+            assert provider.calls[0]["tools"] == []
+            discovery = runtime.evidence_shape_calls[0]["task_context"]["source_discovery"]
+            assert [source["source_id"] for source in discovery["sources"]] == [
+                "vehicle_log_primary",
+            ]
+            scope = runtime.evidence_plan_calls[0]["declared_scope"]
+            if exact:
+                assert scope["exact_source_refs"] == [{
+                    "source_id": "vehicle_log_primary", "source_ref": source_ref,
+                }]
+            else:
+                assert scope["source_ids"] == ["vehicle_log_primary"]
+            assert len(runtime.evidence_shape_calls) == len(runtime.evidence_plan_calls) == 1
+            assert len(runtime.evidence_sufficiency_calls) == 1
+            assert len(runtime.evidence_next_step_calls) == 1
+            assert len(dsa.list_calls) == len(dsa.calls) + len(dsa.fetch_calls) == 1
+            assert dsa.list_request_ids == dsa.operation_request_ids == [out["request_id"]]
+            _assert_evidence_finalization(out, runtime, memory, observations)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("stage", "failure"), [
+    (stage, failure)
+    for stage in ("shape", "plan", "sufficiency", "next_step")
+    for failure in ("malformed", "unavailable", "mismatch")
+] + [("shape", "source_match")])
+async def test_evidence_policy_failure_cannot_authorize_later_consumers(
+    tmp_path, monkeypatch, stage, failure,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    question = "Verify the maintenance record."
+    runtime, memory = FakeRuntime(), ClaimCaptureMemoryStore()
+    dsa = FakeDSA(response=_governed_context_pack(question))
+    provider = FakeLiteLLM(content="PRIVATE-UNAUTHORIZED-ANSWER")
+    methods = {"shape": "derive_evidence_shape", "plan": "compile_evidence_plan",
+               "sufficiency": "evaluate_evidence_sufficiency",
+               "next_step": "select_evidence_next_step"}
+    original = getattr(runtime, methods[stage])
+
+    async def fail_response(**kwargs):
+        response = copy.deepcopy(await original(**kwargs))
+        if failure == "unavailable":
+            raise httpx.ConnectError("PRIVATE-EVIDENCE-DEPENDENCY")
+        if failure == "malformed":
+            return {"result": {"private": "PRIVATE-EVIDENCE-DEPENDENCY"}}
+        if failure == "source_match":
+            response["result"]["source_match"]["matched_source_ids"] = ["unconfigured_source"]
+            return response
+        response["runtime_turn_id"] = "other-turn"
+        return response
+
+    monkeypatch.setattr(runtime, methods[stage], fail_response)
+    observations, _, _ = _observe_evidence_dependencies(monkeypatch, runtime, dsa, provider, memory)
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True,
+            external_context={"enabled": True, "source_ids": ["vehicle_log_primary"]}),
+        memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True, interaction_governance_enabled=True,
+        capability_registry_enabled=True,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-evidence-policy-failure",
+    )
+    assert out["status"] == "degraded"
+    assert all("vehicle_log_primary" not in str(source) for source in out["sources"])
+    assert provider.calls == runtime.evidence_terminal_calls == []
+    assert len(dsa.list_calls) == len(runtime.evidence_shape_calls) == 1
+    assert len(runtime.evidence_plan_calls) == int(stage != "shape")
+    assert len(dsa.calls) == len(runtime.evidence_sufficiency_calls) == int(
+        stage in {"sufficiency", "next_step"}
+    )
+    assert len(runtime.evidence_next_step_calls) == int(stage == "next_step")
+    assert dsa.fetch_calls == dsa.context_calls == []
+    chain = ["catalog", "shape", "plan", "acquisition", "sufficiency", "next_step"]
+    starts = [step for step, _ in observations
+              if step.endswith(":start") and step.split(":")[0] in chain]
+    assert starts == [f"{step}:start" for step in chain[:chain.index(stage) + 1]]
+    manifest = memory.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
+    assert manifest["status"] == f"{stage}_dependency_failed"
+    assert manifest["next_steps"]["selection_count"] == 0
+    assert manifest["next_steps"]["additional_acquisition_count"] == 0
+    if stage in {"shape", "plan"}:
+        assert out["answer"] == (
+            "I can’t safely complete that evidence request with the currently "
+            "available source capabilities."
+        )
+    else:
+        assert out["answer"] == (WITHHELD_ANSWER if stage == "sufficiency"
+                                 else NEXT_STEP_DEPENDENCY_ANSWER)
+    serialized = json.dumps((out, memory.trace_calls), sort_keys=True)
+    assert "PRIVATE-EVIDENCE-DEPENDENCY" not in serialized
+    assert "PRIVATE-UNAUTHORIZED-ANSWER" not in serialized
+    _assert_evidence_finalization(out, runtime, memory, observations)
+
+
 def _authority_comparison_result(
     disposition,
     *,
@@ -22697,15 +23032,21 @@ async def test_not_applicable_uses_inventory_only_and_preserves_provider_path(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("ordinary", [True, False])
+@pytest.mark.parametrize("failure", ["unavailable", "malformed"])
 async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
     tmp_path,
     ordinary,
+    failure,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime(
         evidence_shape_response=(_not_applicable_shape_response if ordinary else None)
     )
-    dsa = FakeDSA(source_error=RuntimeError("PRIVATE-INVENTORY-FAILURE"))
+    dsa = FakeDSA(source_error=(
+        RuntimeError("PRIVATE-INVENTORY-FAILURE") if failure == "unavailable" else None
+    ))
+    if failure == "malformed":
+        dsa.source_response = {"sources": "PRIVATE-INVENTORY-FAILURE"}
     provider = FakeLiteLLM(content="Ordinary answer.")
     memory_store = FakeMemoryStore()
 
@@ -22739,13 +23080,12 @@ async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
     trace = memory_store.trace_calls[-1]["payload"]
     assert trace["dsa"]["called"] is True
     assert trace["dsa"]["status"] == "inventory_failure"
-    assert trace["dsa"]["inventory_discovery"]["outcome"] == ("dependency_failure")
+    expected_failure = "dependency_failure" if failure == "unavailable" else "malformed_response"
+    assert trace["dsa"]["inventory_discovery"]["outcome"] == expected_failure
     manifest = trace["prompt"]["evidence_acquisition"]
     if ordinary:
         assert manifest["acquisition"]["dsa_outcome"] == "not_called"
-        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == (
-            "dependency_failure"
-        )
+        assert manifest["acquisition"]["inventory_discovery"]["outcome"] == expected_failure
         assert manifest["acquisition"]["source_summaries"] == []
         assert manifest["acquisition"]["unavailable_source_ids"] == []
     assert "PRIVATE-INVENTORY-FAILURE" not in json.dumps(trace, sort_keys=True)
@@ -44337,6 +44677,144 @@ async def test_invalid_voice_projection_clarifies_without_provider(tmp_path, pro
     assert [m["content"] for m in memory.added_messages if m["role"] == "assistant"] == [
         out["answer"]
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held", ["refined_shape", "terminal"])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_evidence_terminal_waits_for_acquisition_and_blocks_finalization(
+    tmp_path, monkeypatch, held, cancel, evidence_request_tasks,
+):
+    memory = ClaimCaptureMemoryStore()
+    entered, release = asyncio.Event(), asyncio.Event()
+    observations, seen = [], {}
+    original_terminal = FakeRuntime.evaluate_evidence_terminal
+    original_acquisition = FakeDSA.context_source
+    original_chat = SequenceLiteLLM.chat
+    original_shape = FakeRuntime.derive_evidence_shape
+
+    async def shape(self, **kwargs):
+        seen["runtime"] = self
+        response = await original_shape(self, **kwargs)
+        if kwargs["task_context"].get("semantic_advisory"):
+            observations.append(("refined_shape:pending", monotonic_ns()))
+            if held == "refined_shape":
+                entered.set()
+                await release.wait()
+            observations.append(("refined_shape:returned", monotonic_ns()))
+        return response
+
+    async def acquire(self, **kwargs):
+        seen["dsa"] = self
+        response = await original_acquisition(self, **kwargs)
+        observations.append(("acquisition:returned", monotonic_ns()))
+        return response
+
+    async def interpret(self, **kwargs):
+        seen["provider"] = self
+        return await original_chat(self, **kwargs)
+
+    async def terminal(self, **kwargs):
+        seen["runtime"] = self
+        assert [step for step, _ in observations] == [
+            "refined_shape:pending", "refined_shape:returned", "acquisition:returned",
+        ]
+        assert len(self.evidence_plan_calls) == 1
+        assert kwargs["evidence_plan_id"] == "evidence_plan_1"
+        assert all(fact["outcome"] == "satisfied" for fact in kwargs["acquisition_facts"])
+        response = await original_terminal(self, **kwargs)
+        seen["finalization"], _, _ = _observe_evidence_dependencies(
+            monkeypatch, self, seen["dsa"], seen["provider"], memory,
+        )
+        observations.append(("terminal:pending", monotonic_ns()))
+        if held == "terminal":
+            entered.set()
+            await release.wait()
+        observations.append(("terminal:returned", monotonic_ns()))
+        return response
+
+    monkeypatch.setattr(FakeDSA, "context_source", acquire)
+    monkeypatch.setattr(FakeRuntime, "derive_evidence_shape", shape)
+    monkeypatch.setattr(SequenceLiteLLM, "chat", interpret)
+    monkeypatch.setattr(FakeRuntime, "evaluate_evidence_terminal", terminal)
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_step13_aggregate_failure(
+        tmp_path=tmp_path, response=_aggregate_structured_response(),
+        diagnostic_completion=_diagnostic_completion(), request_id="rid-terminal-barrier",
+        memory_store=memory,
+    )))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        runtime, provider = seen["runtime"], seen["provider"]
+        assert len(provider.calls) == 1  # Authorized interpretation, not answer generation.
+        assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+        assert len(runtime.evidence_shape_calls) == 2
+        assert len(runtime.evidence_terminal_calls) == int(held == "terminal")
+        assert len(runtime.evidence_plan_calls) == int(held == "terminal")
+        assert [step for step, _ in observations] == (
+            ["refined_shape:pending"] if held == "refined_shape" else [
+                "refined_shape:pending", "refined_shape:returned",
+                "acquisition:returned", "terminal:pending",
+            ]
+        )
+        assert runtime.turn_complete_calls == memory.trace_calls == []
+        assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+        assert [message["role"] for message in memory.added_messages] == ["user"]
+        assert memory.work["state"] == "running" and not task.done()
+        if cancel:
+            before = list(observations)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_cancelled_evidence_request(children, release)
+            assert observations == before
+            assert not any(step == f"{held}:returned" for step, _ in observations)
+            assert memory.work["state"] == "failed"
+            assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
+            assert memory.work["assistant_message_id"] is None
+            assert runtime.turn_complete_calls == memory.trace_calls == []
+            assert [message["role"] for message in memory.added_messages] == ["user"]
+            if held == "terminal":
+                assert [step for step, _ in seen["finalization"]] == [
+                    "work:failed:start", "work:failed:returned",
+                ]
+        else:
+            release.set()
+            out, _, dsa, _, _ = await task
+            assert out["status"] == "ok"
+            assert out["answer"] == (
+                'Median for "Reading": 27.875 (4 non-empty values across 5 records).'
+            )
+            assert len(dsa.context_calls) == 1 and dsa.calls == dsa.fetch_calls == []
+            assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+            manifest = memory.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
+            assert manifest["terminal_provenance"]["schema_version"] == "evidence-terminal.v2"
+            assert manifest["next_steps"]["selection_count"] == 1
+            assert manifest["next_steps"]["additional_acquisition_count"] == 0
+            assert memory.added_messages[-1]["content"] == out["answer"]
+            assert memory.work["state"] == "completed"
+            _assert_evidence_finalization(out, runtime, memory, seen["finalization"])
+            assert observations[-1][1] <= seen["finalization"][0][1]
+            assert [step for step, _ in observations] == [
+                "refined_shape:pending", "refined_shape:returned", "acquisition:returned",
+                "terminal:pending", "terminal:returned",
+            ]
+        assert len(provider.calls) == 1
+        assert len(runtime.evidence_terminal_calls) == int(not cancel or held == "terminal")
+        assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+        stamps = [stamp for _, stamp in observations]
+        assert stamps == sorted(stamps)
+        if len(stamps) > 1:
+            assert stamps[-1] > stamps[0]
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
