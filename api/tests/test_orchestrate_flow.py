@@ -32268,6 +32268,262 @@ async def test_orchestrate_display_setting_uses_shared_pending_accept_and_replay
     assert replay_trace["execution"]["failure_reason_code"] == "challenge_consumed"
 
 
+async def _capability_dependency_case(tmp_path, monkeypatch, path, *, held=None, failure=None):
+    rules, models = _write_router_files(tmp_path)
+    memory = ClaimCaptureMemoryStore()
+    if path == "normal":
+        runtime = _world_state_registry_runtime(verification_required=False)
+        provider = SequenceLiteLLM([
+            _tool_completion("runtime_world_state_read", {"output_mode": "summary"}),
+            _text_completion("The bounded read finished."),
+        ])
+        payload = _base_payload(messages=[{"role": "user", "content": "Read runtime world state."}])
+        connector = None
+        connectors = ActionConnectorRegistry(())
+        chain = ["match", "authority", "flow", "authorization:exposure", "provider:1",
+                 "authorization:selection", "authorization:dispatch", "execute", "provider:2",
+                 "summary"]
+    else:
+        _install_display_capability(monkeypatch)
+        runtime = DisplaySettingRuntime()
+        connector = DisplaySettingConnector(DisplaySettingOperations())
+        connectors = ActionConnectorRegistry((connector,))
+        provider = SequenceLiteLLM([_tool_completion(
+            "fixture_display_setting_apply", {"target": "fixture:display", "level": 3},
+        )])
+        first = await orchestrate_chat(
+            payload=_display_chat_payload("Apply display level 3."),
+            memory_store=memory, runtime=runtime, litellm=provider,
+            rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+            request_id="rid-capability-pending-setup", capability_registry_enabled=True,
+            action_connector_registry=connectors,
+        )
+        assert "pending_action" in first and connector.operations.apply_inputs == []
+        payload = _display_chat_payload("yes", capability_confirmation={
+            "pending_action": first["pending_action"], "confirmed": True,
+        })
+        # Observe only the new request; CR retains the challenge from the real setup turn.
+        memory = ClaimCaptureMemoryStore()
+        chain = ["authority", "flow", "authorization:exposure", "authorization:selection",
+                 "confirm", "authorization:dispatch", "execute", "summary"]
+
+    observations = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    provider_count = 0
+
+    def observe(target, name, label):
+        original = getattr(target, name)
+
+        async def wrapped(*args, **kwargs):
+            nonlocal provider_count
+            step = label(kwargs) if callable(label) else label
+            if step == "provider":
+                provider_count += 1
+                step = f"provider:{provider_count}"
+            observations.append((f"{step}:start", monotonic_ns()))
+            if step == "summary" and kwargs["execution_status"] == "executed":
+                assert any(event == "execute:returned" for event, _ in observations)
+            response = await original(*args, **kwargs)
+            if failure is not None and step == held:
+                if failure == "unavailable":
+                    raise httpx.ConnectError("PRIVATE-CAPABILITY-DEPENDENCY")
+                response = copy.deepcopy(response)
+                if failure == "malformed":
+                    response = {"result": {"allowed": "true", "action_taken": True}}
+                elif step == "confirm":
+                    response["runtime_turn_id"] = "other-turn"
+                else:
+                    response["result"]["capability_id"] = "other.capability"
+            elif step == held:
+                entered.set()
+                await release.wait()
+            observations.append((f"{step}:returned", monotonic_ns()))
+            return response
+
+        monkeypatch.setattr(target, name, wrapped)
+
+    for target, name, label in (
+        (runtime, "match_capability", "match"),
+        (runtime, "action_authority", "authority"),
+        (runtime, "action_flow", "flow"),
+        (runtime, "authorize_capability", lambda call: (
+            f"authorization:{call['authorization_phase']}"
+        )),
+        (provider, "chat", "provider"),
+        (runtime, "action_summary", "summary"),
+        (memory, "add_message", lambda call: f"message:{call['role']}"),
+        (runtime, "complete_turn", lambda call: f"turn:{call['turn_status']}"),
+        (memory, "create_trace", "trace"),
+        (memory, "transition_work", lambda call: f"work:{call['state']}"),
+    ):
+        observe(target, name, label)
+    if connector is not None:
+        observe(runtime, "confirm_capability", "confirm")
+        observe(connector, "execute", "execute")
+    else:
+        observe(runtime, "world_state_resolve", lambda call: (
+            "execute" if call["request_id"].endswith(":execute") else "world_context"
+        ))
+
+    async def run():
+        return await orchestrate_chat(
+            payload=payload, memory_store=memory, runtime=runtime, litellm=provider,
+            rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+            request_id="rid-capability-barrier", capability_registry_enabled=True,
+            action_connector_registry=connectors,
+        )
+
+    def execution_count():
+        if connector is not None:
+            return len(connector.operations.apply_inputs)
+        return sum(call["request_id"].endswith(":execute") for call in runtime.world_state_calls)
+
+    return run, runtime, memory, observations, entered, release, chain, execution_count
+
+
+def _assert_capability_finalization(out, runtime, memory, observations):
+    assert [event for event, _ in observations][-8:] == [
+        "message:assistant:start", "message:assistant:returned",
+        "turn:completed:start", "turn:completed:returned",
+        "trace:start", "trace:returned", "work:completed:start", "work:completed:returned",
+    ]
+    assert [message["role"] for message in memory.added_messages] == ["user", "assistant"]
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    assert [state for state, _ in memory.work_calls] == ["create", "running", "completed"]
+    assert len(memory.trace_calls) == 1
+    completion = runtime.turn_complete_calls[-1]
+    assert completion["request_id"] == out["request_id"]
+    assert completion["assistant_message_id"] == memory.work["assistant_message_id"]
+    trace = memory.trace_calls[0]["payload"]
+    for key in ("owner_id", "conversation_id", "surface", "client_id", "request_id"):
+        assert trace[key] == memory.work[key]
+    assert trace["fallback"] == {"triggered": False, "reason": None}
+    _assert_bms_trace_create_shape(trace)
+    stamps = [stamp for _, stamp in observations]
+    assert stamps == sorted(stamps) and stamps[-1] > stamps[0]
+    return trace["retrieval"]["prompt_assembly"]["capabilities"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "held"), [
+    (path, held) for path in ("normal", "pending") for held in (
+        ("match", "authority", "flow", "authorization:selection", "authorization:dispatch",
+         "execute", "summary") if path == "normal" else
+        ("authority", "flow", "authorization:selection", "confirm", "authorization:dispatch",
+         "execute", "summary")
+    )
+])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_capability_dependencies_wait_and_cancel_without_speculative_work(
+    tmp_path, monkeypatch, path, held, cancel, evidence_request_tasks,
+):
+    (run, runtime, memory, observations, entered, release, chain,
+     execution_count) = await _capability_dependency_case(tmp_path, monkeypatch, path, held=held)
+    run_request, children = evidence_request_tasks
+    completed_before = len(runtime.turn_complete_calls)
+    task = asyncio.create_task(run_request(run()))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        expected = [f"{step}:{event}" for step in chain[:chain.index(held)]
+                    for event in ("start", "returned")] + [f"{held}:start"]
+        assert [event for event, _ in observations if event.rsplit(":", 1)[0] in chain] == expected
+        assert len(runtime.turn_complete_calls) == completed_before
+        assert memory.trace_calls == [] and memory.work["state"] == "running"
+        assert [message["role"] for message in memory.added_messages] == ["user"]
+        assert not task.done()
+        if cancel:
+            before = list(observations)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_cancelled_evidence_request(children, release)
+            assert observations[:len(before)] == before
+            assert [event for event, _ in observations[len(before):]] == [
+                "work:failed:start", "work:failed:returned",
+            ]
+            assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
+            assert memory.work["assistant_message_id"] is None
+            assert len(runtime.turn_complete_calls) == completed_before
+            assert memory.trace_calls == []
+            assert [message["role"] for message in memory.added_messages] == ["user"]
+        else:
+            release.set()
+            out = await task
+            assert [event for event, _ in observations if event.rsplit(":", 1)[0] in chain] == [
+                f"{step}:{event}" for step in chain for event in ("start", "returned")
+            ]
+            assert len(runtime.turn_complete_calls) == completed_before + 1
+            trace = _assert_capability_finalization(out, runtime, memory, observations)
+            assert trace["executor_call_count"] == trace["execution"]["executor_call_count"] == 1
+            assert trace["dispatch_completed"] is True
+            assert trace["action_summary_call_count"] == 1
+            assert trace["provider_call_count"] == (1 if path == "normal" else 0)
+            assert trace["follow_up"]["call_count"] == (1 if path == "normal" else 0)
+            assert runtime.action_summary_calls[-1]["execution_status"] == "executed"
+            capability = ("runtime.world_state.read" if path == "normal"
+                          else DISPLAY_CAPABILITY.capability_id)
+            verification = ("Verification was not required." if path == "normal"
+                            else "Verification is not supported.")
+            assert out["answer"] == f"Action {capability} was executed. {verification}"
+            assert "pending_action" not in out
+        # An already attempted action at execute/summary is not rolled back by cancellation.
+        assert sum(event == "execute:start" for event, _ in observations) == int(
+            not cancel or held in {"execute", "summary"}
+        )
+        assert execution_count() == int(not cancel or held in {"execute", "summary"})
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("path", "stage", "failure"), [
+    ("pending", stage, failure)
+    for stage in ("authority", "flow", "authorization:selection", "confirm",
+                  "authorization:dispatch")
+    for failure in ("malformed", "unavailable")
+] + [(path, stage, "mismatch") for path in ("normal", "pending") for stage in ("authority", "flow")]
+  + [("pending", "confirm", "mismatch")])
+async def test_capability_dependency_failure_never_becomes_execution_permission(
+    tmp_path, monkeypatch, path, stage, failure,
+):
+    (run, runtime, memory, observations, _, _, _,
+     execution_count) = await _capability_dependency_case(
+         tmp_path, monkeypatch, path, held=stage, failure=failure,
+     )
+    out = await run()
+    trace = _assert_capability_finalization(out, runtime, memory, observations)
+    assert trace["executor_call_count"] == 0
+    assert trace["dispatch_completed"] is False
+    assert trace["follow_up"]["call_count"] == 0
+    assert execution_count() == 0
+    assert not any(event.startswith("execute:") for event, _ in observations)
+    assert trace["provider_call_count"] == (1 if path == "normal" else 0)
+    assert "pending_action" not in out
+    assert "was executed" not in out["answer"]
+    starts = [event for event, _ in observations if event.endswith(":start")]
+    assert starts.count(f"{stage}:start") == 1
+    if stage == "authority" and failure != "mismatch":
+        assert "flow:start" not in starts
+    if stage in {"authority", "flow"}:
+        assert "authorization:selection:start" not in starts
+        assert "confirm:start" not in starts
+        assert "summary:start" not in starts
+    else:
+        if stage == "authorization:selection":
+            assert "confirm:start" not in starts
+        if stage != "authorization:dispatch":
+            assert "authorization:dispatch:start" not in starts
+        assert runtime.action_summary_calls[-1]["execution_status"] != "executed"
+    assert "PRIVATE-CAPABILITY-DEPENDENCY" not in json.dumps((out, memory.trace_calls))
+
+
 @pytest.mark.asyncio
 async def test_orchestrate_display_setting_rejects_without_dispatch(
     tmp_path,
