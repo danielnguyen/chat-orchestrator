@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import httpx
 import pytest
+import pytest_asyncio
 import services.capabilities as capability_service
 import services.orchestrate as orchestrate_service
 from clients.data_source_aggregator import (
@@ -17212,7 +17213,7 @@ async def test_evidence_acquisition_targeted_path_orders_policy_and_persists_man
         assert prohibited not in public_response
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def evidence_request_tasks():
     loop = asyncio.get_running_loop()
     previous_factory = loop.get_task_factory()
