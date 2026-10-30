@@ -5846,7 +5846,8 @@ import sys
 import time
 
 owner, conversation = sys.argv[1:]
-sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+# ETH_P_ALL receives both inbound requests and outbound service responses.
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
 sock.bind(("eth0", 0))
 sock.settimeout(.2)
 streams = {}
@@ -5863,6 +5864,8 @@ while not finished and time.monotonic() < deadline:
         packet = sock.recv(262144)
         packet_count += 1
     except socket.timeout:
+        continue
+    if packet[12:14] != b"\x08\x00":
         continue
     ip = packet[14:]
     if len(ip) < 40 or ip[9] != 6:
@@ -5915,7 +5918,7 @@ while not finished and time.monotonic() < deadline:
                 assert len(observations) < 128, "observer operation bound"
                 scope_keys = ("request_id", "owner_id", "conversation_id", "surface",
                               "runtime_session_id", "runtime_turn_id", "active_persona_id",
-                              "capability_id", "requested_domains",
+                              "capability_id", "requested_domains", "argument_digest",
                               "persona_selection_mode")
                 observation = {"path": path, "order": len(observations),
                                "association": "owner_conversation" if explicit else "session",
@@ -6014,7 +6017,7 @@ run_world_state_read_case() (
   trap 'echo "World-state read assertion failed: case=$tag line=$LINENO" >&2' ERR
   local owner="world-read-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   local conversation fixture before after response request trace calls records work result observer_pid
-  local text="Read current runtime world state. Reference $owner."
+  local text="Show runtime world state for this conversation ($owner)."
   local observation="$COMPOSED_SMOKE_TMP/world-read-$tag.jsonl"
   conversation="$(create_conversation "$owner" world-read-client)"
   configure_surface_permission "$owner" "$surface" true true false
@@ -6107,6 +6110,8 @@ authorizations = [e for e in events if e["event_type"] == "capability_authorizat
 summaries = [e for e in events if e["event_type"] == "action_summary_recorded"]
 assert len(authorizations) == 3 * expected
 if expected:
+    assert capabilities["validation"]["validation_status"] == "ok"
+    assert capabilities["validation"]["reason_code"] == "validated"
     assert match["result"]["capability_matched"] is True
     assert match["result"]["capability"]["domain"] == "software_architecture"
     authority, = at("/v1/capabilities/authority")
@@ -6124,6 +6129,8 @@ if expected:
     assert all(e["event_payload_json"]["capability_id"] == "runtime.world_state.read"
                and e["event_payload_json"]["decision_code"] == "allowed" for e in authorizations)
     assert selection["result"]["allowed"] is True and dispatch["result"]["allowed"] is True
+    digest = capabilities["validation"]["argument_digest"]
+    assert selection["request"]["argument_digest"] == dispatch["request"]["argument_digest"] == digest
     execution, = executions
     assert execution["request"]["requested_domains"] == ["active_project"]
     assert execution["read"]["matching_fixture_claims"] == 1
@@ -6144,7 +6151,12 @@ if expected:
     assert summary_event["event_payload_json"]["conversation_id"] == conversation
     verification = capabilities["execution"]["post_execution_verification"]
     assert verification["status"] == "verified" and verification["matching_claim_count"] == 1
-    ordered = [match, authority, flow, exposure, selection, dispatch, execution, summary]
+    admission, = at("/v1/runtime/turns/start")
+    governance, = at("/v1/runtime/interaction-governance/evaluate")
+    identity, = at("/v1/runtime/identity/resolve")
+    completed, = at("/v1/runtime/turns/complete")
+    ordered = [admission, governance, identity, context_reads[0], match, authority, flow,
+               exposure, selection, dispatch, execution, summary, completed]
     assert [o["order"] for o in ordered] == sorted(o["order"] for o in ordered)
 else:
     assert not at("/v1/capabilities/authority") and not at("/v1/capabilities/flow")
