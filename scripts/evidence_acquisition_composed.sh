@@ -607,6 +607,70 @@ assert_evidence_runtime_events() {
     ' <<<"$diagnostics" >/dev/null
 }
 
+# Validate one CO collector, never order timestamps from separate services.
+assert_evidence_dependency_timings() {
+  local record="$1" request_id="$2"
+  python3 - "$request_id" "$record" <<'PYTHON'
+import json
+import sys
+
+request_id, raw = sys.argv[1:]
+assert len(raw) <= 65536, "oversized dependency timing record"
+record = json.loads(raw)
+assert record["schema_version"] == 1 and record["request_id"] == request_id
+assert record["clock"] == "perf_counter_ns" and record["boundary"] == "request_finished"
+assert record["client_boundary"] == "acquisition_http_status_decode_cleanup"
+assert record["request_outcome"] == "returned"
+for flag in ("truncated", "invalid_clock", "invalid_association", "diagnostic_error"):
+    assert record[flag] is False, "unqualified dependency timing record"
+assert type(record["in_flight"]) is int and record["in_flight"] == 0
+assert type(record["dropped_spans"]) is int and record["dropped_spans"] == 0
+assert type(record["elapsed_ns"]) is int and record["elapsed_ns"] >= 0
+expected = [
+    ("dsa", "GET /v1/sources"),
+    ("runtime", "POST /v1/runtime/evidence-shapes/derive"),
+    ("dsa", "POST /v1/context-pack"),
+    ("runtime", "POST /v1/runtime/evidence-sufficiency/evaluate"),
+    ("runtime", "POST /v1/runtime/evidence-next-steps/select"),
+]
+spans = record["spans"]
+assert [(s["dependency"], s["operation"]) for s in spans] == expected, (
+    "missing, duplicate or unrelated dependency interval"
+)
+for span in spans:
+    assert span["outcome"] == "success", "unsuccessful dependency interval"
+    assert type(span["start_ns"]) is int and type(span["end_ns"]) is int
+    assert 0 <= span["start_ns"] <= span["end_ns"] <= record["elapsed_ns"]
+assert spans[1]["source_aware"] is True, "shape request lacks source discovery"
+assert spans[0]["end_ns"] <= spans[1]["start_ns"], "catalog response not complete before shape"
+assert spans[2]["end_ns"] <= spans[3]["start_ns"], "acquisition not complete before sufficiency"
+assert spans[2]["end_ns"] <= spans[4]["start_ns"], "acquisition not complete before next step"
+print("Evidence dependency joins: catalog_completed_before_source_aware_shape=1 "
+      "acquisition_completed_before_sufficiency_and_next_step=1 clock=CO_perf_counter_ns")
+PYTHON
+}
+
+assert_targeted_dependency_timings() {
+  local request_id="$1" record
+  record="$(docker compose -f "$COMPOSE" logs --no-color orchestrator | python3 -c '
+import json, sys
+request_id = sys.argv[1]
+records = []
+for line in sys.stdin:
+    if "dependency_timings " not in line:
+        continue
+    raw = line.split("dependency_timings ", 1)[1].strip()
+    item = json.loads(raw)
+    if item.get("request_id") == request_id:
+        assert len(raw) <= 65536, "oversized dependency timing record"
+        records.append(item)
+assert len(records) == 1, "missing or duplicate request timing record"
+print(json.dumps(records[0], separators=(",", ":")))
+' "$request_id")"
+  assert_evidence_dependency_timings "$record" "$request_id"
+  printf 'Evidence dependency timing record: %s\n' "$record"
+}
+
 assert_claim_calibration_events() {
   local diagnostics="$1" request_id="$2" expected="$3"
   jq -e \
@@ -1383,6 +1447,7 @@ run_evidence_targeted_scenario() {
     return 1
   fi
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 1 1 1
+  assert_targeted_dependency_timings "$request_id"
   assert_persisted_answer_matches "$conversation_id" "$request_id" "$answer"
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   echo "Evidence targeted: cr_shape=1 cr_plan=1 dsa_context_pack=1 retained_items=2 cr_sufficiency=1 cr_next_step=1 provider_chat=1 assistant_persistence=1 trace_persistence=1"

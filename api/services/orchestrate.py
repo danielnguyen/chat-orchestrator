@@ -29,6 +29,7 @@ from clients.memory_store import (
 from clients.runtime import (
     RUNTIME_TIMING_BUDGET_MS,
     canonical_assistant_message_id,
+    observe_request_timings,
     validate_companion_policy_response,
     validate_completion_message_response,
     validate_history_followup_policy_response,
@@ -9735,6 +9736,7 @@ async def _finish_strict_capability_information(
     }
 
 
+@observe_request_timings
 async def orchestrate_chat(
     *,
     payload: dict[str, Any],
@@ -9750,6 +9752,7 @@ async def orchestrate_chat(
     non_executing_conversation: bool = False,
     runtime: Any | None = None,
     enable_runtime_overlays: bool = False,
+    detailed_dependency_timing_enabled: bool = False,
     companion_policy_enabled: bool = False,
     interaction_governance_enabled: bool = False,
     persona_containment_enabled: bool = False,

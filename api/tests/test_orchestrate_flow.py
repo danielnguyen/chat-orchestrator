@@ -45461,3 +45461,34 @@ async def test_failed_aggregate_terminal_cannot_enter_diagnostic_or_reasoning_pr
     assert manifest["next_steps"]["selection_count"] == 0
     assert manifest["next_steps"]["additional_acquisition_count"] == 0
     assert trace["prompt"]["general_evidence_reasoning"]["attempted"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_dependency_timing_diagnostics_do_not_change_ordinary_turn_or_trace(
+    tmp_path, monkeypatch, caplog, enabled,
+):
+    from unittest.mock import Mock
+
+    import clients.runtime as timing
+
+    allocation = Mock(wraps=timing._RequestTimings)
+    monkeypatch.setattr(timing, "_RequestTimings", allocation)
+    payload = _base_payload(conversation_id="conv-1")
+    payload["detailed_dependency_timing_enabled"] = not enabled
+    with caplog.at_level("INFO"):
+        out, runtime, provider, memory = await _run_timing_turn(
+            tmp_path, payload=payload, detailed_dependency_timing_enabled=enabled,
+        )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert memory.work["state"] == "completed"
+    assert len(runtime.turn_complete_calls) == len(memory.trace_calls) == 1
+    assert "dependency_timings" not in json.dumps(memory.trace_calls)
+    assert "detailed_dependency_timing" not in json.dumps(provider.calls)
+    records = [json.loads(r.message.split("dependency_timings ", 1)[1])
+               for r in caplog.records if "dependency_timings " in r.message]
+    assert len(records) == allocation.call_count == int(enabled)
+    if enabled:
+        assert records[0]["request_id"] == out["request_id"]
+        assert records[0]["request_outcome"] == "returned"
+    assert timing._request_timings.get() is None

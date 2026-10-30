@@ -21,6 +21,9 @@ class Settings(BaseSettings):
         ge=100,
         le=30000,
     )
+    detailed_dependency_timing_enabled: bool = Field(
+        default=False, alias="DETAILED_DEPENDENCY_TIMING_ENABLED",
+    )
     enable_runtime_overlays: bool = Field(default=False, alias="ENABLE_RUNTIME_OVERLAYS")
     progressive_feedback_enabled: bool = Field(
         default=False, alias="PROGRESSIVE_FEEDBACK_ENABLED",
