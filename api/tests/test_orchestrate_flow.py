@@ -39442,6 +39442,284 @@ async def _run_timing_turn(tmp_path, *, policy="answer_now", error=None, payload
     return out, runtime, provider, memory
 
 
+def _observe_turn_joins(monkeypatch, runtime, provider, memory, *, held=None):
+    events = []
+    entered, release = asyncio.Event(), asyncio.Event()
+    ordinals = {"provider": 0, "trace": 0}
+
+    def observe(target, name, label):
+        original = getattr(target, name)
+
+        async def wrapped(**kwargs):
+            step = label(kwargs) if callable(label) else label
+            if step in ordinals:
+                ordinals[step] += 1
+                step = ("primary" if ordinals[step] == 1 else "fallback") if (
+                    step == "provider"
+                ) else f"trace:{ordinals[step]}"
+            events.append(f"{step}:start")
+            if step == held:
+                entered.set()
+                await release.wait()
+            try:
+                response = await original(**kwargs)
+            except Exception:
+                events.append(f"{step}:raised")
+                raise
+            events.append(f"{step}:returned")
+            return response
+
+        monkeypatch.setattr(target, name, wrapped)
+
+    for target, name, label in (
+        (runtime, "evaluate_restraint", "restraint"),
+        (runtime, "evaluate_timing", "timing"),
+        (provider, "chat", "provider"),
+        (runtime, "evaluate_claim_calibration", "calibration"),
+        (memory, "add_message", lambda call: call["role"]),
+        (runtime, "complete_turn", lambda call: f"completion:{call['turn_status']}"),
+        (memory, "create_trace", "trace"),
+        (memory, "create_claim_record", "claim"),
+        (memory, "transition_work", lambda call: f"work:{call['state']}"),
+    ):
+        observe(target, name, label)
+
+    def observe_review(name):
+        original = getattr(orchestrate_service, name)
+
+        def review(*args, **kwargs):
+            events.append(f"{name}:start")
+            result = original(*args, **kwargs)
+            events.append(f"{name}:returned")
+            return result
+
+        monkeypatch.setattr(orchestrate_service, name, review)
+
+    for name in ("review_response", "apply_response_action"):
+        observe_review(name)
+    return events, entered, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held,policy", [
+    ("restraint", "answer_now"), ("timing", "answer_now"), ("timing", "pause_or_wait"),
+])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_mandatory_policy_joins_wait_before_eligible_action(
+    tmp_path, monkeypatch, evidence_request_tasks, held, policy, cancel,
+):
+    runtime = _world_state_registry_runtime(verification_required=False)
+    memory = ClaimCaptureMemoryStore()
+    provider = SequenceLiteLLM([
+        _tool_completion("runtime_world_state_read", {"output_mode": "summary"}),
+        _text_completion("The read completed."),
+    ])
+    events, entered, release = _observe_turn_joins(
+        monkeypatch, runtime, provider, memory, held=held,
+    )
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_timing_turn(
+        tmp_path, runtime=runtime, provider=provider, memory=memory, policy=policy,
+        capability_registry_enabled=True,
+        payload=_first_party_chat_payload("Read current repository state.",
+                                         conversation_id="conv-1"),
+    )))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        prefix = [] if held == "restraint" else ["restraint", "user", "work:running"]
+        expected = [f"{step}:{event}" for step in prefix
+                    for event in ("start", "returned")] + [f"{held}:start"]
+        assert events == expected and not task.done()
+        assert provider.calls == runtime.capability_authority_calls == []
+        assert runtime.capability_flow_calls == runtime.capability_authorization_calls == []
+        assert not any(call["request_id"].endswith(":execute")
+                       for call in runtime.world_state_calls)
+        assert memory.trace_calls == runtime.turn_complete_calls == []
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_cancelled_evidence_request(children, release)
+            assert events == expected + ["work:failed:start", "work:failed:returned"]
+            assert provider.calls == runtime.capability_authority_calls == []
+            assert runtime.capability_flow_calls == runtime.capability_authorization_calls == []
+            assert memory.trace_calls == runtime.turn_complete_calls == []
+            assert not any(call["request_id"].endswith(":execute")
+                           for call in runtime.world_state_calls)
+            assert not any(message["role"] == "assistant" for message in memory.added_messages)
+            assert memory.work["state"] == "failed"
+            assert memory.work["assistant_message_id"] is None
+            assert [state for state, _ in memory.work_calls] == [
+                "create", *(["running"] if held == "timing" else []), "failed",
+            ]
+        else:
+            release.set()
+            out, _, _, _ = await task
+            executed = policy == "answer_now"
+            assert len(provider.calls) == 2 * int(executed)  # Proposal and permitted follow-up.
+            assert len(runtime.capability_authority_calls) == int(executed)
+            assert len(runtime.capability_flow_calls) == int(executed)
+            assert sum(call["request_id"].endswith(":execute")
+                       for call in runtime.world_state_calls) == int(executed)
+            assert len(runtime.timing_calls) == 1
+            assert memory.added_messages[-1]["content"] == out["answer"]
+            assert memory.work["state"] == "completed"
+            if not executed:
+                assert out["answer"] == "I’ll wait before continuing."
+                assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("held,fallback", [
+    ("primary", False), ("primary", True), ("fallback", True),
+    *[(step, False) for step in (
+        "calibration", "assistant", "completion:completed", "trace:1", "claim",
+        "trace:2", "work:completed",
+    )],
+])
+@pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
+async def test_response_finalization_joins_wait_for_required_predecessors(
+    tmp_path, monkeypatch, evidence_request_tasks, held, fallback, cancel,
+):
+    runtime, memory = FakeRuntime(), ClaimCaptureMemoryStore()
+    runtime.restraint_response["result"].update(
+        restraint_policy="answer_normally", retrieval_suppressed=False,
+        personalization_suppressed=False, brevity_preferred=False,
+    )
+    provider = FakeLiteLLM(fail_first=fallback,
+                          content="The retained file reports that the setting is active.")
+    events, entered, release = _observe_turn_joins(
+        monkeypatch, runtime, provider, memory, held=held,
+    )
+    chain = ["restraint", "user", "work:running", "timing", "primary",
+             *(["fallback"] if fallback else []), "review_response", "apply_response_action",
+             "calibration", "assistant", "completion:completed", "trace:1", "claim",
+             "trace:2", "work:completed"]
+    expected = [f"{step}:{event}" for step in chain for event in (
+        "start", "raised" if step == "primary" and fallback else "returned",
+    )]
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_timing_turn(
+        tmp_path, runtime=runtime, provider=provider, memory=memory,
+        configured_fallback=True, claim_record_capture_enabled=True,
+    )))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        await asyncio.sleep(0)
+        prefix = expected[:expected.index(f"{held}:start") + 1]
+        assert events == prefix and not task.done()
+        committed = (list(memory.added_messages), list(runtime.turn_complete_calls),
+                     list(memory.trace_calls), list(memory.claim_record_calls),
+                     list(provider.calls), list(runtime.claim_calibration_calls))
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            await _settle_cancelled_evidence_request(children, release)
+            # A completion request with an unknown result must not be replayed
+            # or overwritten by a competing failed-work transition.
+            finalizing = held == "work:completed"
+            assert events == prefix + ([] if finalizing else [
+                "work:failed:start", "work:failed:returned",
+            ])
+            assert (memory.added_messages, runtime.turn_complete_calls,
+                    memory.trace_calls, memory.claim_record_calls,
+                    provider.calls, runtime.claim_calibration_calls) == committed
+            assert memory.work["state"] == ("running" if finalizing else "failed")
+            assert memory.work["assistant_message_id"] is None
+            assert [state for state, _ in memory.work_calls] == [
+                "create", "running", *([] if finalizing else ["failed"]),
+            ]
+        else:
+            release.set()
+            out, _, _, _ = await task
+            assert events == expected
+            assert out["status"] == ("degraded" if fallback else "ok")
+            assert len(provider.calls) == 1 + int(fallback)
+            assert len(runtime.claim_calibration_calls) == len(memory.claim_record_calls) == 1
+            assert len(runtime.timing_calls) == len(runtime.turn_complete_calls) == 1
+            assert len(memory.trace_calls) == 2
+            assert memory.added_messages[-1]["content"] == out["answer"]
+            assert memory.work["assistant_message_id"] == (
+                runtime.turn_complete_calls[0]["assistant_message_id"]
+            ) == memory.claim_record_calls[0]["payload"]["assistant_message_id"]
+            assert memory.work["state"] == "completed"
+            trace = memory.trace_calls[-1]["payload"]
+            assert [attempt["status"] for attempt in trace["model_calls"]] == (
+                ["failed", "ok"] if fallback else ["ok"]
+            )
+            assert trace["fallback"] == {
+                "triggered": fallback, "reason": "provider_error" if fallback else None,
+            }
+            assert trace["prompt"]["claim_capture"]["persistence_status"] == "persisted"
+            _assert_bms_trace_create_shape(trace)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary,fault", [
+    ("calibration", "mismatch"), ("completion", "mismatch"), ("completion", "unavailable"),
+])
+async def test_post_response_join_failure_preserves_only_confirmed_provenance(
+    tmp_path, monkeypatch, boundary, fault,
+):
+    runtime, memory = FakeRuntime(), ClaimCaptureMemoryStore()
+    runtime.restraint_response["result"].update(
+        restraint_policy="answer_normally", retrieval_suppressed=False,
+        personalization_suppressed=False, brevity_preferred=False,
+    )
+    method = "evaluate_claim_calibration" if boundary == "calibration" else "complete_turn"
+    original = getattr(runtime, method)
+
+    async def faulty(**kwargs):
+        if fault == "unavailable":
+            raise httpx.ReadTimeout("PRIVATE-JOIN-FAILURE")
+        response = copy.deepcopy(await original(**kwargs))
+        if boundary == "calibration":
+            response["runtime_turn_id"] = "other-turn"
+        else:
+            response["event"]["event_payload_json"]["assistant_message_id"] = "other-message"
+        return response
+
+    monkeypatch.setattr(runtime, method, faulty)
+    provider = FakeLiteLLM(content="The retained file reports that the setting is active.")
+    events, _, _ = _observe_turn_joins(monkeypatch, runtime, provider, memory)
+    out, _, _, _ = await _run_timing_turn(
+        tmp_path, runtime=runtime, provider=provider, memory=memory,
+        claim_record_capture_enabled=True,
+    )
+    assert out["status"] == "ok" and len(provider.calls) == 1
+    assert memory.added_messages[-1]["content"] == out["answer"]
+    assert memory.work["state"] == "completed"
+    assert events.count("completion:completed:start") == 1
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    if boundary == "calibration":
+        assert trace["claim_capture"]["calibration_status"] == "failed"
+        assert memory.claim_record_calls == [] and len(memory.trace_calls) == 1
+    else:
+        assert trace["turn_state"].get("completed") is not True
+        assert trace["turn_state"]["turn_status"] == "responding"
+        assert trace["turn_state"]["assistant_message_association"] == "unconfirmed"
+        assert len(memory.claim_record_calls) == 1 and len(memory.trace_calls) == 2
+    assert "PRIVATE-JOIN-FAILURE" not in json.dumps(memory.trace_calls)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("policy,answer,failed", [
     ("ask_clarifying_question", "Could you clarify what you want me to do?", False),
