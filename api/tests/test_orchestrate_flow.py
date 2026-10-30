@@ -37834,7 +37834,7 @@ async def test_history_policy_must_authorize_the_submitted_candidate(
 @pytest.mark.parametrize("held", ["policy", "history"])
 @pytest.mark.parametrize(("cancel", "exact_refs"), [(False, False), (True, False), (True, True)])
 async def test_history_dependencies_wait_and_cancel_without_speculative_work(
-    tmp_path, monkeypatch, classified, held, cancel, exact_refs
+    tmp_path, monkeypatch, classified, held, cancel, exact_refs, evidence_request_tasks,
 ):
     memory = ImmediateHistoryMemoryStore()
     runtime = HistoryPolicyRuntime()
@@ -37871,7 +37871,8 @@ async def test_history_dependencies_wait_and_cancel_without_speculative_work(
 
         monkeypatch.setattr(obj, method, observe)
 
-    task = asyncio.create_task(_run_history_followup(
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_history_followup(
         tmp_path,
         text="Where did that conclusion come from?" if classified else "How are you sure?",
         memory_store_override=memory, runtime_override=runtime, litellm_override=provider,
@@ -37879,7 +37880,7 @@ async def test_history_dependencies_wait_and_cancel_without_speculative_work(
         orchestration_options={
             "dsa": dsa, "dsa_enabled": True, "evidence_acquisition_enabled": True,
         },
-    ))
+    )))
     try:
         await asyncio.wait_for(entered.wait(), timeout=2)
         assert not task.done()
@@ -37895,9 +37896,11 @@ async def test_history_dependencies_wait_and_cancel_without_speculative_work(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            release.set()
+            await _settle_cancelled_evidence_request(children, release)
             assert events == before
             assert memory.work["state"] == "failed"
+            assert [state for state, _ in memory.work_calls] == ["create", "running", "failed"]
+            assert memory.work["assistant_message_id"] is None
             assert memory.immediate_history_calls == memory.retrieve_calls == []
             assert memory.trace_calls == runtime.turn_complete_calls == []
             assert [message["role"] for message in memory.added_messages] == ["user"]
@@ -43316,7 +43319,7 @@ async def test_strict_world_state_unavailable_bound_persona_stops_before_protect
 ])
 @pytest.mark.parametrize("cancel", [False, True], ids=["release", "cancel"])
 async def test_strict_context_pending_decision_blocks_downstream_and_preserves_cancellation(
-    tmp_path, monkeypatch, stage, cancel,
+    tmp_path, monkeypatch, stage, cancel, evidence_request_tasks,
 ):
     runtime = StrictWorldStateRuntime()
     memory = RelationshipPolicyMemory(runtime)
@@ -43365,10 +43368,11 @@ async def test_strict_context_pending_decision_blocks_downstream_and_preserves_c
         pytest.fail("unselected action dispatch crossed a pending context decision")
 
     monkeypatch.setattr(orchestrate_service, "authorize_and_execute_capability", forbidden_dispatch)
-    task = asyncio.create_task(_run_world_state_turn(
+    run_request, children = evidence_request_tasks
+    task = asyncio.create_task(run_request(_run_world_state_turn(
         tmp_path, runtime=runtime, memory=memory, provider=provider,
         strict_relationship_retrieval_enabled=True, capability_registry_enabled=True,
-    ))
+    )))
     try:
         await asyncio.wait_for(entered.wait(), timeout=5)
         counts = [len(calls) for calls in (
@@ -43394,10 +43398,21 @@ async def test_strict_context_pending_decision_blocks_downstream_and_preserves_c
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            release.set()
+            await _settle_cancelled_evidence_request(children, release)
             # Cancellation propagates; it is neither optional omission nor permission.
             assert runtime.call_order == before + ["work:failed"]
+            assert [len(calls) for calls in (
+                runtime.interaction_governance_calls, runtime.identity_calls,
+                runtime.persona_containment_calls, runtime.relationship_calls,
+                runtime.world_state_calls,
+            )] == counts
+            assert len(memory.retrieve_calls) == (1 if stage == "world" else 0)
+            assert runtime.capability_authorization_calls == []
             assert memory.work["state"] == "failed"
+            assert [state for state, _ in memory.work_calls] == [
+                "create", *(["running"] if stage == "world" else []), "failed",
+            ]
+            assert memory.work["assistant_message_id"] is None
             assert runtime.turn_complete_calls == memory.trace_calls == provider.calls == []
             assert not any(message["role"] == "assistant" for message in memory.added_messages)
         else:
