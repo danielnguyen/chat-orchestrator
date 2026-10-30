@@ -145,7 +145,8 @@ def observe_request_timings(function):
             return await function(*args, **kwargs)
         except BaseException as error:
             if current is not None:
-                outcome = _timing_outcome(error)
+                # An orchestration ValueError is not proof of HTTP decoding.
+                outcome = "other_error" if isinstance(error, ValueError) else _timing_outcome(error)
             raise
         finally:
             try:

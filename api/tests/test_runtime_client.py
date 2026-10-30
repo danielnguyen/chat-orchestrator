@@ -6530,7 +6530,7 @@ async def test_evidence_timings_preserve_transport_failure_and_cleanup(caplog, f
     record, = _evidence_timing_records(caplog)
     assert record["spans"][0]["outcome"] == failure
     assert record["spans"][0]["end_ns"] is not None and record["in_flight"] == 0
-    assert record["request_outcome"] == failure
+    assert record["request_outcome"] == ("other_error" if failure == "decode_error" else failure)
     assert "PRIVATE" not in json.dumps(record)
     assert module._request_timings.get() is None
 
@@ -6649,3 +6649,22 @@ async def test_evidence_timings_two_enabled_requests_keep_distinct_collectors(ca
     assert {r["request_id"] for r in records} == set(entered)
     assert len(records) == 2 and all(len(r["spans"]) == 1 for r in records)
     assert module._request_timings.get() is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_request_value_error_does_not_claim_client_decode_failure(caplog):
+    import clients.runtime as module
+
+    error = ValueError("PRIVATE_POLICY_VALIDATION")
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        raise error
+
+    with caplog.at_level("INFO"), pytest.raises(ValueError) as caught:
+        await run(request_id="local-error", detailed_dependency_timing_enabled=True)
+    assert caught.value is error
+    record, = _evidence_timing_records(caplog)
+    assert record["request_outcome"] == "other_error" and record["spans"] == []
+    assert record["in_flight"] == 0 and module._request_timings.get() is None
+    assert "PRIVATE" not in json.dumps(record)
