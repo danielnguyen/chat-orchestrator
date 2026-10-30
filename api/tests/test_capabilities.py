@@ -354,6 +354,24 @@ def test_production_registry_contains_exact_executor_bound_entries():
     assert all("." not in entry.provider_tool_name for entry in registry)
 
 
+def test_world_state_registry_domain_is_distinct_from_private_runtime_context():
+    entry = capability_service.capability_by_id("runtime.world_state.read")
+
+    assert entry.capability_domain == "software_architecture"
+    assert entry.privacy_classification == "runtime_context"
+    assert entry.supported_surfaces == ("dev", "vscode")
+    assert entry.executor_binding == "cr_world_state_read"
+    assert entry.policy_shape == CapabilityPolicyShape(
+        registry_domain="software_architecture",
+        operation_kind="read_only",
+        risk_level="low_read_only",
+        requires_confirmation=False,
+        reversible=True,
+        dry_run_supported=True,
+        verification_supported=True,
+    )
+
+
 def test_provider_descriptors_are_deterministic_and_fingerprint_stable():
     registry = list(reversed(production_capability_registry()))
 

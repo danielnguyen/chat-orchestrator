@@ -310,7 +310,7 @@ PRODUCTION_CAPABILITIES: tuple[CapabilityEntry, ...] = (
             },
         },
         policy_shape=CapabilityPolicyShape(
-            registry_domain="runtime_context",
+            registry_domain="software_architecture",
             operation_kind="read_only",
             risk_level="low_read_only",
             requires_confirmation=False,
