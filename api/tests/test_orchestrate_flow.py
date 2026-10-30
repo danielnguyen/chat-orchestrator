@@ -6309,8 +6309,10 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
     assert registry["authority"]["allowed"] is True
     assert registry["action_flow"]["execution_allowed"] is True
     assert _registry_allows_exact_capability(registry) is True
-    assert [call["authorization_phase"] for call in runtime.capability_authorization_calls] == [
-        "exposure", "selection", "dispatch",
+    assert [call["request_id"] for call in runtime.capability_authorization_calls] == [
+        "rid-registry-world-state-verified:runtime.world_state.read:exposure",
+        "rid-registry-world-state-verified:runtime.world_state.read:selection",
+        "rid-registry-world-state-verified:runtime.world_state.read:dispatch",
     ]
     assert len(litellm.calls) == 1
     assert [message["content"] for message in memory_store.added_messages
