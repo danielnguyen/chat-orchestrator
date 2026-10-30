@@ -667,3 +667,124 @@ data_source_aggregator._request_logger.info(
 
     assert "CO_CHAT_CORRELATION_VISIBILITY_SENTINEL" in output
     assert "CO_DSA_CORRELATION_VISIBILITY_SENTINEL" in output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["catalog", "targeted", "context", "fetch"])
+@pytest.mark.parametrize("failure", [None, "http_error", "decode_error", "cancelled"])
+async def test_dsa_evidence_timings_include_decoding_and_cleanup(
+    monkeypatch, caplog, operation, failure,
+):
+    import asyncio
+    import json
+
+    import clients.runtime as timing
+
+    clock_at_cleanup = []
+    real_client = httpx.AsyncClient
+    cancellation = asyncio.CancelledError("PRIVATE_EXCEPTION")
+
+    async def handler(request):
+        span = timing._request_timings.get().spans[0]
+        assert span["end_ns"] is None and span["outcome"] == "incomplete"
+        if failure == "cancelled":
+            raise cancellation
+        if failure == "http_error":
+            return httpx.Response(503, json={"error": {"message": "PRIVATE_ERROR"}})
+        if failure == "decode_error":
+            return httpx.Response(200, content=b"PRIVATE_INVALID_JSON")
+        return httpx.Response(200, json={"items": ["PRIVATE_CONTENT"]})
+
+    class Client(real_client):
+        def __init__(self, **kwargs):
+            super().__init__(transport=httpx.MockTransport(handler), **kwargs)
+
+        async def __aexit__(self, *args):
+            await super().__aexit__(*args)
+            current = timing._request_timings.get()
+            assert current.spans[0]["end_ns"] is None
+            clock_at_cleanup.append(timing.perf_counter_ns() - current.started)
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    client = DataSourceAggregatorClient("http://dsa.local", api_key="PRIVATE_TOKEN")
+    path = {"catalog": "/v1/sources", "targeted": "/v1/context-pack",
+            "context": "/v1/sources/context", "fetch": "/v1/sources/fetch"}[operation]
+
+    @timing.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        if operation == "catalog":
+            return await client.list_sources(request_id=request_id)
+        return await client._post(path, json={"source_ids": ["PRIVATE_SOURCE"]},
+                                  request_id=request_id)
+
+    with caplog.at_level("INFO"):
+        if failure is None:
+            assert await run(request_id="dsa-timed", detailed_dependency_timing_enabled=True) == {
+                "items": ["PRIVATE_CONTENT"],
+            }
+        else:
+            expected = {"http_error": DataSourceAggregatorFailure, "decode_error": ValueError,
+                        "cancelled": asyncio.CancelledError}[failure]
+            with pytest.raises(expected) as caught:
+                await run(request_id="dsa-timed", detailed_dependency_timing_enabled=True)
+            if failure == "cancelled":
+                assert caught.value is cancellation
+    record, = [json.loads(r.message.split("dependency_timings ", 1)[1])
+               for r in caplog.records if "dependency_timings " in r.message]
+    span, = record["spans"]
+    assert span["dependency"] == "dsa"
+    assert span["operation"] == ("GET " if operation == "catalog" else "POST ") + path
+    assert 0 <= span["start_ns"] <= clock_at_cleanup[0] <= span["end_ns"] <= record["elapsed_ns"]
+    assert span["outcome"] == (failure or "success") and record["in_flight"] == 0
+    assert "PRIVATE" not in json.dumps(record)
+    assert timing._request_timings.get() is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_clients_share_request_clock_for_catalog_and_acquisition_joins(
+    monkeypatch, caplog,
+):
+    import json
+
+    import clients.runtime as timing
+
+    real_client = httpx.AsyncClient
+    posts = []
+
+    def handler(request):
+        posts.append((request.method, request.url.path))
+        return httpx.Response(200, json={"sources": [], "items": []})
+
+    def factory(**kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    dsa = DataSourceAggregatorClient("http://dsa.local")
+    runtime = timing.RuntimeClient("http://runtime.local", api_key=None, client_factory=factory)
+    await runtime.open()
+
+    @timing.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        inventory = await dsa.list_sources(request_id=request_id)
+        await runtime._post("/v1/runtime/evidence-shapes/derive", json={
+            "request_id": request_id, "task_context": {"source_discovery": inventory},
+        })
+        await dsa._post("/v1/context-pack", request_id=request_id, json={})
+        for path in ("/v1/runtime/evidence-sufficiency/evaluate",
+                     "/v1/runtime/evidence-next-steps/select"):
+            await runtime._post(path, json={"request_id": request_id})
+
+    try:
+        with caplog.at_level("INFO"):
+            await run(request_id="client-joins", detailed_dependency_timing_enabled=True)
+    finally:
+        await runtime.close()
+    record, = [json.loads(r.message.split("dependency_timings ", 1)[1])
+               for r in caplog.records if "dependency_timings " in r.message]
+    spans = record["spans"]
+    assert [s["operation"] for s in spans] == [method + " " + path for method, path in posts]
+    assert len(spans) == 5 and all(s["outcome"] == "success" for s in spans)
+    assert spans[1]["source_aware"] is True
+    assert spans[0]["end_ns"] <= spans[1]["start_ns"]
+    assert spans[2]["end_ns"] <= spans[3]["start_ns"] <= spans[4]["start_ns"]
+    assert record["request_id"] == "client-joins" and record["in_flight"] == 0

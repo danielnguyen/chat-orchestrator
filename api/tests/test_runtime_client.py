@@ -6345,3 +6345,307 @@ async def test_terminal_v2_rejects_duplicate_json_members_without_replay(duplica
     finally:
         await client.close()
     assert calls == ["/v2/runtime/evidence-terminal/evaluate"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [None, False, 0, "true"])
+async def test_evidence_timings_default_off_without_collector(monkeypatch, flag):
+    from unittest.mock import Mock
+
+    import clients.runtime as module
+
+    allocation = Mock(side_effect=AssertionError("unexpected diagnostic allocation"))
+    logging = Mock(side_effect=AssertionError("unexpected diagnostic emission"))
+    monkeypatch.setattr(module, "_RequestTimings", allocation)
+    monkeypatch.setattr(module._timing_logger, "info", logging)
+    clock = Mock(side_effect=AssertionError("unexpected detailed clock"))
+    monkeypatch.setattr(module, "perf_counter_ns", clock)
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json={"unchanged": True})
+
+    client = RuntimeClient("http://runtime.local", api_key=None,
+                           client_factory=lambda **kw: httpx.AsyncClient(
+                               transport=httpx.MockTransport(handler), **kw))
+    await client.open()
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        assert module._request_timings.get() is None
+        return await client._post("/v1/runtime/evidence-shapes/derive",
+                                  json={"request_id": request_id})
+
+    options = {} if flag is None else {"detailed_dependency_timing_enabled": flag}
+    try:
+        assert await run(request_id="disabled", **options) == {"unchanged": True}
+    finally:
+        await client.close()
+    assert len(calls) == 1
+    clock.assert_not_called()
+    allocation.assert_not_called()
+    logging.assert_not_called()
+    assert module._request_timings.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path,source_aware", [
+    ("/v1/runtime/evidence-shapes/derive", False),
+    ("/v1/runtime/evidence-shapes/derive", True),
+    ("/v1/runtime/evidence-sufficiency/evaluate", None),
+    ("/v1/runtime/evidence-next-steps/select", None),
+    ("/v1/runtime/evidence-terminal/evaluate", None),
+    ("/v2/runtime/evidence-terminal/evaluate", None),
+])
+async def test_evidence_timing_transport_boundary_and_attribution(caplog, path, source_aware):
+    import clients.runtime as module
+
+    async def handler(request):
+        span = module._request_timings.get().spans[0]
+        assert span["end_ns"] is None and span["outcome"] == "incomplete"
+        assert request.headers["X-API-Key"] == "PRIVATE_TOKEN"
+        return httpx.Response(200, json={"private_answer": "PRIVATE_CONTENT"})
+
+    client = RuntimeClient("http://runtime.local", api_key="PRIVATE_TOKEN",
+                           client_factory=lambda **kw: httpx.AsyncClient(
+                               transport=httpx.MockTransport(handler), **kw))
+    await client.open()
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        body = {"request_id": request_id, "task_text": "PRIVATE_PROMPT", "task_context": {}}
+        if source_aware:
+            body["task_context"]["source_discovery"] = {"sources": ["PRIVATE_SOURCE"]}
+        return await client._post(path, json=body)
+
+    try:
+        with caplog.at_level("INFO"):
+            assert await run(request_id="measured", detailed_dependency_timing_enabled=True) == {
+                "private_answer": "PRIVATE_CONTENT",
+            }
+    finally:
+        await client.close()
+    record = _evidence_timing_records(caplog)[0]
+    assert record["request_id"] == "measured" and record["in_flight"] == 0
+    assert not any(record[k] for k in (
+        "truncated", "invalid_clock", "invalid_association", "diagnostic_error",
+    ))
+    span, = record["spans"]
+    assert span["operation"] == "POST " + path and span["dependency"] == "runtime"
+    assert 0 <= span["start_ns"] <= span["end_ns"] <= record["elapsed_ns"]
+    assert span["outcome"] == "success"
+    assert span.get("source_aware") is source_aware
+    assert "PRIVATE" not in json.dumps(record)
+    assert module._request_timings.get() is None
+
+
+def _evidence_timing_records(caplog):
+    return [json.loads(r.message.split("dependency_timings ", 1)[1])
+            for r in caplog.records if "dependency_timings " in r.message]
+
+
+@pytest.mark.asyncio
+async def test_evidence_timings_isolate_concurrent_and_late_children(caplog):
+    import clients.runtime as module
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    child = None
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        nonlocal child
+        current = module._request_timings.get()
+        if current is None:
+            await entered.wait()
+            return None
+
+        async def delayed():
+            with current.measure("runtime", "POST /v1/runtime/evidence-shapes/derive"):
+                entered.set()
+                await release.wait()
+            # Inherited collectors are closed; late work cannot rewrite the final event.
+            assert current.closed
+
+        child = asyncio.create_task(delayed())
+        await entered.wait()
+        return current
+
+    try:
+        with caplog.at_level("INFO"):
+            closed, disabled = await asyncio.gather(
+                run(request_id="enabled", detailed_dependency_timing_enabled=True),
+                run(request_id="disabled"),
+            )
+            before = _evidence_timing_records(caplog)
+            release.set()
+            await child
+        record, = before
+        assert disabled is None and record["request_id"] == "enabled"
+        assert record["in_flight"] == 1
+        assert record["spans"][0]["outcome"] == "incomplete"
+        assert record["spans"][0]["end_ns"] is None
+        assert record == _evidence_timing_records(caplog)[0]
+        assert closed.in_flight == 1 and module._request_timings.get() is None
+    finally:
+        if child is not None and not child.done():
+            child.cancel()
+            await asyncio.gather(child, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["timeout", "cancelled", "http_error", "decode_error"])
+async def test_evidence_timings_preserve_transport_failure_and_cleanup(caplog, failure):
+    import clients.runtime as module
+
+    error = {"timeout": httpx.ReadTimeout("PRIVATE_TIMEOUT"),
+             "cancelled": asyncio.CancelledError("PRIVATE_CANCEL")}.get(failure)
+
+    async def handler(request):
+        if error is not None:
+            raise error
+        return httpx.Response(503 if failure == "http_error" else 200,
+                              content=b"PRIVATE_INVALID_JSON")
+
+    client = RuntimeClient("http://runtime.local", api_key=None,
+                           client_factory=lambda **kw: httpx.AsyncClient(
+                               transport=httpx.MockTransport(handler), **kw))
+    await client.open()
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        return await client._post("/v1/runtime/evidence-sufficiency/evaluate",
+                                  json={"request_id": request_id})
+
+    expected = {"timeout": httpx.ReadTimeout, "cancelled": asyncio.CancelledError,
+                "http_error": httpx.HTTPStatusError, "decode_error": ValueError}[failure]
+    try:
+        with caplog.at_level("INFO"), pytest.raises(expected) as caught:
+            await run(request_id="failed", detailed_dependency_timing_enabled=True)
+        if error is not None:
+            assert caught.value is error
+    finally:
+        await client.close()
+    record, = _evidence_timing_records(caplog)
+    assert record["spans"][0]["outcome"] == failure
+    assert record["spans"][0]["end_ns"] is not None and record["in_flight"] == 0
+    assert record["request_outcome"] == failure
+    assert "PRIVATE" not in json.dumps(record)
+    assert module._request_timings.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("log_cap", [False, True])
+async def test_evidence_timings_bound_records_and_reject_mismatched_or_private_paths(
+    caplog, monkeypatch, log_cap,
+):
+    import clients.runtime as module
+
+    if log_cap:
+        monkeypatch.setattr(module, "_TIMING_LOG_LIMIT", 600)
+    client = RuntimeClient("http://runtime.local", api_key=None,
+                           client_factory=lambda **kw: httpx.AsyncClient(
+                               transport=httpx.MockTransport(
+                                   lambda _: httpx.Response(200, json={}),
+                               ),
+                               **kw))
+    await client.open()
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        for path, rid in [("/PRIVATE_PATH?token=PRIVATE", request_id),
+                          ("/v1/runtime/evidence-shapes/derive", "PRIVATE_OTHER_REQUEST")]:
+            await client._post(path, json={"request_id": rid})
+        for _ in range(module._TIMING_LIMIT + 3):
+            await client._post("/v1/runtime/evidence-shapes/derive",
+                               json={"request_id": request_id})
+
+    try:
+        with caplog.at_level("INFO"):
+            await run(request_id="bounded", detailed_dependency_timing_enabled=True)
+    finally:
+        await client.close()
+    record, = _evidence_timing_records(caplog)
+    assert len(record["spans"]) == (0 if log_cap else module._TIMING_LIMIT)
+    assert record["dropped_spans"] == (module._TIMING_LIMIT + 3 if log_cap else 3)
+    assert record["truncated"] and record["diagnostic_error"] is log_cap
+    assert record["invalid_association"] and record["in_flight"] == 0
+    assert "PRIVATE" not in json.dumps(record)
+    assert len(json.dumps(record)) < module._TIMING_LOG_LIMIT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["allocation", "clock", "logger"])
+async def test_evidence_diagnostic_failures_do_not_replace_application_outcomes(
+    monkeypatch, broken,
+):
+    import clients.runtime as module
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("private diagnostic failure")
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False, error=None):
+        if broken == "clock":
+            monkeypatch.setattr(module, "perf_counter_ns", fail)
+        if error is not None:
+            raise error
+        return "unchanged"
+
+    if broken == "allocation":
+        monkeypatch.setattr(module, "_RequestTimings", fail)
+    if broken == "logger":
+        monkeypatch.setattr(module._timing_logger, "info", fail)
+    result = await run(request_id="diagnostic", detailed_dependency_timing_enabled=True)
+    assert result == "unchanged"
+    error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await run(request_id="diagnostic", detailed_dependency_timing_enabled=True, error=error)
+    assert caught.value is error and module._request_timings.get() is None
+
+
+def test_evidence_timings_mark_invalid_monotonic_intervals(monkeypatch):
+    import clients.runtime as module
+
+    times = iter([100, 110, 105, 120])
+    monkeypatch.setattr(module, "perf_counter_ns", lambda: next(times))
+    collector = module._RequestTimings("clock")
+    with collector.measure("dsa", "GET /v1/sources"):
+        pass
+    record = collector.snapshot("returned")
+    assert record["invalid_clock"] and record["spans"][0]["end_ns"] is None
+    assert record["spans"][0]["outcome"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_evidence_timings_two_enabled_requests_keep_distinct_collectors(caplog):
+    import clients.runtime as module
+
+    entered = {rid: asyncio.Event() for rid in ("first", "second")}
+    release = asyncio.Event()
+    collectors = {}
+
+    @module.observe_request_timings
+    async def run(*, request_id, detailed_dependency_timing_enabled=False):
+        current = module._request_timings.get()
+        collectors[request_id] = current
+        with current.measure("dsa", "GET /v1/sources"):
+            entered[request_id].set()
+            await release.wait()
+            assert module._request_timings.get() is current
+            assert current.request_id == request_id
+
+    with caplog.at_level("INFO"):
+        tasks = [asyncio.create_task(run(request_id=rid, detailed_dependency_timing_enabled=True))
+                 for rid in entered]
+        try:
+            await asyncio.gather(*(e.wait() for e in entered.values()))
+            assert collectors["first"] is not collectors["second"]
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+    records = _evidence_timing_records(caplog)
+    assert {r["request_id"] for r in records} == set(entered)
+    assert len(records) == 2 and all(len(r["spans"]) == 1 for r in records)
+    assert module._request_timings.get() is None
