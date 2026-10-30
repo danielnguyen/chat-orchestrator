@@ -6085,10 +6085,15 @@ for operation in operations:
     else:
         assert body["runtime_session_id"] == session
     assert body["request_id"] == request or body["request_id"].startswith(request + ":")
-    for key, value in (("runtime_session_id", session), ("runtime_turn_id", turn),
-                       ("active_persona_id", persona)):
+    for key, value in (("runtime_session_id", session), ("runtime_turn_id", turn)):
         if key in body:
             assert body[key] == value, (operation["path"], key)
+    # Before identity resolution, legacy containment can use an advisory
+    # governance proposal. Every governed read/capability request uses the
+    # subsequently resolved surface-bound identity.
+    if operation["path"].startswith(("/v1/world-state/", "/v1/capabilities/")):
+        assert body["active_persona_id"] == persona, operation["path"]
+assert assembly["runtime_identity"]["active_persona_id"] == persona
 match, = at("/v1/capabilities/match")
 reads = at("/v1/world-state/resolve")
 executions = [r for r in reads if r["request"]["request_id"] == request + ":runtime.world_state.read:execute"]
