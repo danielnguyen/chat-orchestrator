@@ -4680,17 +4680,24 @@ def _world_state_registry_runtime(
     verification_supported: bool = True,
     verification_method: str | None = "capability_verification",
 ) -> CapabilityRuntime:
+    # Registry metadata from CR 01bbfa72a946fe82a86c0e5148dd21e0aaa8ba71.
+    match_response = _capability_match_response(
+        capability_id="runtime.world_state.read",
+        display_name="Read runtime world state",
+        domain="software_architecture",
+        operation_kind="read_only",
+        risk_level="low_read_only",
+        requires_confirmation=False,
+        reversible=True,
+        verification_supported=True,
+    )
+    match_response["result"]["capability"].update(
+        description="Reads bounded runtime world-state claims as structured context.",
+        allowed_surfaces=["dev", "vscode"],
+        audit_required=False,
+    )
     return CapabilityRuntime(
-        capability_match_response=_capability_match_response(
-            capability_id="runtime.world_state.read",
-            display_name="Read runtime world state",
-            domain="runtime_context",
-            operation_kind="read_only",
-            risk_level="low_read_only",
-            requires_confirmation=False,
-            reversible=True,
-            verification_supported=True,
-        ),
+        capability_match_response=match_response,
         capability_authority_response={
             "result": {
                 "capability_id": "runtime.world_state.read",
@@ -6261,7 +6268,10 @@ async def test_orchestrate_action_flow_verification_is_future_required(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies_result(tmp_path):
+@pytest.mark.parametrize("surface", ["dev", "vscode"])
+async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies_result(
+    tmp_path, surface,
+):
     rules, models = _write_router_files(tmp_path)
     runtime = _world_state_registry_runtime()
     memory_store = FakeMemoryStore()
@@ -6271,6 +6281,7 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
 
     out = await orchestrate_chat(
         payload=_base_payload(
+            surface=surface,
             messages=[{"role": "user", "content": "Read current runtime world state."}]
         ),
         memory_store=memory_store,
@@ -6293,6 +6304,17 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
     ]
     assert len(execute_calls) == 1
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    registry = trace["capability_registry"]
+    assert registry["match"]["capability"]["domain"] == "software_architecture"
+    assert registry["authority"]["allowed"] is True
+    assert registry["action_flow"]["execution_allowed"] is True
+    assert _registry_allows_exact_capability(registry) is True
+    assert [call["authorization_phase"] for call in runtime.capability_authorization_calls] == [
+        "exposure", "selection", "dispatch",
+    ]
+    assert len(litellm.calls) == 1
+    assert [message["content"] for message in memory_store.added_messages
+            if message["role"] == "assistant"] == [out["answer"]]
     exposure = trace["capabilities"]["exposure"]
     assert exposure["candidate_capability_ids"] == ["runtime.world_state.read"]
     assert exposure["exposed_capability_ids"] == ["runtime.world_state.read"]
@@ -6315,7 +6337,7 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
             "request_id": "rid-registry-world-state-verified:action-summary",
             "owner_id": "owner",
             "conversation_id": "conv-1",
-            "surface": "vscode",
+            "surface": surface,
             "runtime_session_id": "rtsession_1",
             "runtime_turn_id": "rtturn_1",
             "capability_id": "runtime.world_state.read",
@@ -6351,6 +6373,46 @@ async def test_orchestrate_executes_exact_registry_world_state_read_and_verifies
     assert trace["capabilities"]["executor_call_count"] == 1
     assert trace["capabilities"]["follow_up"]["status"] == "not_attempted"
     assert trace["capabilities"]["follow_up"]["call_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("field", "value"), [
+    ("domain", "runtime_context"),
+    ("capability_id", "unregistered.world_state.read"),
+    ("operation_kind", "state_change"),
+    ("risk_level", "low_reversible"),
+    ("requires_confirmation", True),
+    ("reversible", False),
+    ("dry_run_supported", False),
+    ("verification_supported", False),
+])
+async def test_orchestrate_rejects_world_state_registry_metadata_mismatch(tmp_path, field, value):
+    rules, models = _write_router_files(tmp_path)
+    runtime = _world_state_registry_runtime()
+    runtime.capability_match_response["result"]["capability"][field] = value
+    memory = FakeMemoryStore()
+    provider = FakeLiteLLM(
+        completion=_tool_completion("runtime_world_state_read", {"output_mode": "summary"}),
+    )
+    out = await orchestrate_chat(
+        payload=_base_payload(
+            messages=[{"role": "user", "content": "Read current runtime world state."}],
+        ),
+        memory_store=memory, litellm=provider, runtime=runtime,
+        rules_path=str(rules), model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-world-state-registry-mismatch", capability_registry_enabled=True,
+    )
+    trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
+    assert _registry_allows_exact_capability(trace["capability_registry"]) is False
+    assert trace["capabilities"]["exposure"]["reason"] == "registry_context_only"
+    assert not provider.calls[0].get("tools")
+    assert len(provider.calls) == 1
+    assert runtime.capability_authorization_calls == []
+    assert not any(call["request_id"].endswith(":execute") for call in runtime.world_state_calls)
+    assert trace["capabilities"]["executor_call_count"] == 0
+    assert trace["capabilities"]["dispatch_completed"] is False
+    assert trace["capabilities"]["follow_up"]["call_count"] == 0
+    assert "did not execute" in out["answer"]
 
 
 @pytest.mark.asyncio
