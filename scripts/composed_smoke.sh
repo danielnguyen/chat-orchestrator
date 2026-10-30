@@ -5853,12 +5853,15 @@ streams = {}
 queues = collections.defaultdict(collections.deque)
 observations = []
 known_sessions = set()
+packet_count = 0
+http_requests = 0
 finished = False
 print('{"ready":true}', flush=True)
 deadline = time.monotonic() + 45
 while not finished and time.monotonic() < deadline:
     try:
         packet = sock.recv(262144)
+        packet_count += 1
     except socket.timeout:
         continue
     ip = packet[14:]
@@ -5899,6 +5902,7 @@ while not finished and time.monotonic() < deadline:
         stream[1] = body[size:]
         payload = json.loads(body[:size]) if size else {}
         if incoming:
+            http_requests += 1
             path = lines[0].split()[1]
             scope = (payload["candidates"][0] if path == "/v1/capabilities/exposure-batch"
                      else payload)
@@ -5911,7 +5915,7 @@ while not finished and time.monotonic() < deadline:
                 assert len(observations) < 128, "observer operation bound"
                 scope_keys = ("request_id", "owner_id", "conversation_id", "surface",
                               "runtime_session_id", "runtime_turn_id", "active_persona_id",
-                              "capability_id", "authorization_phase", "requested_domains",
+                              "capability_id", "requested_domains",
                               "persona_selection_mode")
                 observation = {"path": path, "order": len(observations),
                                "association": "owner_conversation" if explicit else "session",
@@ -5948,9 +5952,10 @@ while not finished and time.monotonic() < deadline:
                     observation["result"] = payload["result"]
             if path == "/v1/runtime/turns/complete":
                 finished = True
+print(json.dumps({"operations": observations, "completed": finished,
+                  "packets": packet_count, "http_requests": http_requests}), flush=True)
 assert finished, "observer did not see completed request"
 assert all(o.get("http_status") == 200 for o in observations), "CR operation failed"
-print(json.dumps({"operations": observations}), flush=True)
 PYOBSERVE
 }
 
@@ -6028,7 +6033,8 @@ run_world_state_read_case() (
   response="$(co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
     --arg surface "$surface" --arg text "$text" '{owner_id:$owner,client_id:"world-read-client",
       conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private"}')")"
-  wait "$observer_pid"
+  local observer_status=0
+  wait "$observer_pid" || observer_status=$?
   if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
     mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
     cp "$observation" "$COMPOSED_SMOKE_LOG_DIR/world-state-read-$tag.jsonl"
@@ -6036,6 +6042,16 @@ run_world_state_read_case() (
   request="$(jq -er .request_id <<<"$response")"
   trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
   records="$(world_state_read_records "$owner" "$conversation" "$request")"
+  jq -nc --arg tag "$tag" --argjson response "$response" --argjson trace "$trace" \
+    --argjson records "$records" \
+    --argjson observation "$(tail -1 "$observation")" \
+    '{scenario:$tag,request_id:$response.request_id,status:$response.status,selected_model:$response.selected_model,
+      registry:$trace.retrieval.prompt_assembly.capability_registry,
+      identity:$trace.retrieval.prompt_assembly.runtime_identity,
+      timing:$trace.retrieval.prompt_assembly.runtime_timing,
+      event_counts:($records.events|map(.event_type)|group_by(.)|map({key:.[0],value:length})|from_entries),
+      observation:$observation}'
+  test "$observer_status" = 0
   after="$(jq -c '{claims_digest,claim_count}' <<<"$records")"
   test "$(jq -c . <<<"$before")" = "$after"
   test "$(jq .claim_count <<<"$before")" = 8
@@ -8107,7 +8123,7 @@ if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
 fi
 
 
-if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ]; then
+if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ] || [ "${EVIDENCE_SCENARIO:-}" = world-state-read ]; then
   run_world_state_read_scenario
   exit 0
 fi
