@@ -26,6 +26,13 @@ _delayed_fixture_calls: dict[str, dict[str, Any]] = {}
 _next_semantic_interpretations: list[dict[str, Any]] = []
 _scene_policy_answers: list[dict[str, str]] = []
 _pending_scene_calls: dict[str, dict[str, Any]] = {}
+_world_state_read_fixture: dict[str, str] = {}
+_WORLD_STATE_READ_ARGUMENTS = {
+    "requested_domains": ["active_project"],
+    "entity_id": "fixture-project",
+    "attribute": "state",
+    "output_mode": "summary",
+}
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_.:-]+")
 _FIXTURE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,119}$")
 _SEMANTIC_STATUSES = {"resolved", "ambiguous", "no_match"}
@@ -300,6 +307,11 @@ async def chat_completions(
     model = body.get("model")
     tools = body.get("tools")
     tool_count = len(tools) if isinstance(tools, list) else 0
+    tool_names = [
+        tool["function"]["name"] for tool in (tools if isinstance(tools, list) else [])
+        if isinstance(tool, dict) and isinstance(tool.get("function"), dict)
+        and isinstance(tool["function"].get("name"), str)
+    ]
     response_format = body.get("response_format")
     json_schema = (
         response_format.get("json_schema")
@@ -484,7 +496,28 @@ async def chat_completions(
         raise HTTPException(status_code=503, detail="primary failure fixture")
     governed_candidate = _governed_evidence_candidate(prompt_text)
     answer_source = "derived_fixture"
-    if scene_answer is not None:
+    tool_calls = []
+    read_fixture_selected = (
+        bool(_world_state_read_fixture)
+        and latest_user_text == _world_state_read_fixture["expected_user_text"]
+        and _FIXTURE_IDENTIFIER_RE.fullmatch(request_id) is not None
+        and request_id != "unscoped"
+    )
+    if read_fixture_selected:
+        # A one-shot proposal, never authority. No caller-supplied tool or args.
+        _world_state_read_fixture.clear()
+        answer = "No read capability was exposed. No read was proposed."
+        answer_source = "world_state_read"
+        if tool_names == ["runtime_world_state_read"] and tool_count == 1:
+            tool_calls = [{
+                "id": "call_world_state_read", "type": "function",
+                "function": {"name": "runtime_world_state_read",
+                             "arguments": json.dumps(_WORLD_STATE_READ_ARGUMENTS)},
+            }]
+            answer = ""
+        _fixture_event("read_fixture_consumed", request_id=request_id, call_ref=call_ref,
+                       proposal_count=len(tool_calls))
+    elif scene_answer is not None:
         answer = scene_answer
         answer_source = "scene_policy"
     elif _next_answers:
@@ -526,6 +559,9 @@ async def chat_completions(
             "sentinel_in_user_messages": sentinel_in_user_messages,
             "status": "ok",
             "scene_policy_match": scene_match,
+            "tool_names": tool_names,
+            "read_fixture_selected": read_fixture_selected,
+            "read_proposal_count": len(tool_calls),
         }
     )
     return {
@@ -533,8 +569,9 @@ async def chat_completions(
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop",
+                "message": {"role": "assistant", "content": answer,
+                            **({"tool_calls": tool_calls} if tool_calls else {})},
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11},
@@ -580,6 +617,7 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, Any]:
     _next_primary_delay_ms = 0
     _next_semantic_interpretations.clear()
     _scene_policy_answers.clear()
+    _world_state_read_fixture.clear()
     request_id = (body or {}).get("request_id")
     if isinstance(request_id, str) and request_id:
         _calls.pop(request_id, None)
@@ -635,6 +673,18 @@ async def fixture_sentinels(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/fixture/next-answer")
 async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
+    if "world_state_read" in body:
+        fixture = body["world_state_read"]
+        if (
+            set(body) != {"world_state_read"} or not isinstance(fixture, dict)
+            or set(fixture) != {"expected_user_text"}
+            or not isinstance(fixture.get("expected_user_text"), str)
+            or not 1 <= len(fixture["expected_user_text"]) <= 500
+            or _world_state_read_fixture or _next_answers or _scene_policy_answers
+        ):
+            raise HTTPException(status_code=422, detail="invalid world-state read fixture")
+        _world_state_read_fixture.update(fixture)
+        return {"status": "ok", "queued": 1, "generation": _fixture_generation}
     if "scene_policies" in body:
         policies = body["scene_policies"]
         if (
@@ -704,6 +754,57 @@ class ProviderFixtureTests(unittest.IsolatedAsyncioTestCase):
 
     def answer(self, response):
         return response["choices"][0]["message"]["content"]
+
+    async def test_read_fixture_requires_exact_request_exposure_and_single_consumption(self):
+        from services.capabilities import (
+            parse_provider_capability_request,
+            validate_and_digest_capability_request,
+        )
+
+        await fixture_next_answer({"world_state_read": {"expected_user_text": "read fixture"}})
+        body = {"messages": [{"role": "user", "content": "other request"}],
+                "tools": [{"type": "function", "function": {"name": "runtime_world_state_read"}}]}
+        self.assertIsNone(parse_provider_capability_request(await chat_completions(body, "other")))
+        body["messages"][0]["content"] = "read fixture"
+        unscoped = await chat_completions(body, "unscoped")
+        self.assertIsNone(parse_provider_capability_request(unscoped))
+        response = await chat_completions(body, "intended")
+        parsed = parse_provider_capability_request(response)
+        result = validate_and_digest_capability_request(
+            request=parsed, exposed_capability_ids=["runtime.world_state.read"],
+        )
+        self.assertEqual(result.normalized_arguments, _WORLD_STATE_READ_ARGUMENTS)
+        self.assertIsNone(parse_provider_capability_request(await chat_completions(body, "again")))
+        observations = (await calls("intended"))["calls"]
+        self.assertEqual([c["read_proposal_count"] for c in observations], [1])
+
+    async def test_read_fixture_never_proposes_hidden_or_arbitrary_tools(self):
+        for names in ([], ["arbitrary_tool"], ["runtime_world_state_read", "arbitrary_tool"]):
+            with self.subTest(names=names):
+                await fixture_reset({})
+                await fixture_next_answer({
+                    "world_state_read": {"expected_user_text": "read fixture"},
+                })
+                response = await chat_completions({
+                    "messages": [{"role": "user", "content": "read fixture"}],
+                    "tools": [{"function": {"name": name}} for name in names],
+                }, "denied")
+                self.assertNotIn("tool_calls", response["choices"][0]["message"])
+                self.assertIn("No read was proposed", self.answer(response))
+
+    async def test_read_fixture_rejects_arguments_and_resets_globally_or_by_request(self):
+        for fixture in ({"tool": "arbitrary"}, {"expected_user_text": "read", "arguments": {}},
+                        {"expected_user_text": ""}):
+            with self.assertRaises(HTTPException):
+                await fixture_next_answer({"world_state_read": fixture})
+        for reset in ({}, {"request_id": "read"}):
+            await fixture_next_answer({"world_state_read": {"expected_user_text": "read fixture"}})
+            await fixture_reset(reset)
+            response = await chat_completions({
+                "messages": [{"role": "user", "content": "read fixture"}],
+                "tools": [{"function": {"name": "runtime_world_state_read"}}],
+            }, "read")
+            self.assertNotIn("tool_calls", response["choices"][0]["message"])
 
     async def test_delayed_request_cannot_consume_after_global_or_scoped_reset(self):
         for reset in ({}, {"request_id": "old"}):

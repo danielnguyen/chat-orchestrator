@@ -5833,6 +5833,366 @@ with sqlite3.connect('/data/runtime_state.sqlite3') as db:
 PYCODE
 }
 
+# Passive observation of the existing CR container's HTTP boundary. This is not
+# a proxy, replacement endpoint, policy hook or executor. Only the disposable
+# owner/conversation is retained; raw claims/prompts never leave this process.
+world_state_read_observer() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" <<'PYOBSERVE'
+import collections
+import json
+import socket
+import struct
+import sys
+import time
+
+owner, conversation = sys.argv[1:]
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+sock.bind(("eth0", 0))
+sock.settimeout(.2)
+streams = {}
+queues = collections.defaultdict(collections.deque)
+observations = []
+known_sessions = set()
+finished = False
+print('{"ready":true}', flush=True)
+deadline = time.monotonic() + 45
+while not finished and time.monotonic() < deadline:
+    try:
+        packet = sock.recv(262144)
+    except socket.timeout:
+        continue
+    ip = packet[14:]
+    if len(ip) < 40 or ip[9] != 6:
+        continue
+    ihl = (ip[0] & 15) * 4
+    tcp = ip[ihl:struct.unpack("!H", ip[2:4])[0]]
+    source, destination, sequence = struct.unpack("!HHI", tcp[:8])
+    if 8000 not in (source, destination):
+        continue
+    data = tcp[(tcp[12] >> 4) * 4:]
+    if not data:
+        continue
+    incoming = destination == 8000
+    connection = ((ip[12:16], source, ip[16:20], destination) if incoming
+                  else (ip[16:20], destination, ip[12:16], source))
+    key = (connection, incoming)
+    if key not in streams:
+        if not data.startswith((b"POST ", b"GET ", b"HTTP/")):
+            continue
+        streams[key] = [sequence, b""]
+    stream = streams[key]
+    if sequence < stream[0]:
+        data = data[stream[0] - sequence:]
+    elif sequence > stream[0]:
+        raise AssertionError("observer TCP gap; execution evidence unavailable")
+    stream[0] += len(data)
+    stream[1] += data
+    assert len(stream[1]) < 2_000_000, "observer response bound"
+    while b"\r\n\r\n" in stream[1]:
+        headers, body = stream[1].split(b"\r\n\r\n", 1)
+        lines = headers.decode("latin1").split("\r\n")
+        fields = dict(line.lower().split(": ", 1) for line in lines[1:] if ": " in line)
+        assert "transfer-encoding" not in fields, "observer needs content-length framing"
+        size = int(fields.get("content-length", 0))
+        if len(body) < size:
+            break
+        stream[1] = body[size:]
+        payload = json.loads(body[:size]) if size else {}
+        if incoming:
+            path = lines[0].split()[1]
+            scope = (payload["candidates"][0] if path == "/v1/capabilities/exposure-batch"
+                     else payload)
+            explicit = scope.get("owner_id") == owner and scope.get("conversation_id") == conversation
+            selected = explicit or scope.get("runtime_session_id") in known_sessions
+            if explicit and scope.get("runtime_session_id"):
+                known_sessions.add(scope["runtime_session_id"])
+            observation = None
+            if selected:
+                assert len(observations) < 128, "observer operation bound"
+                scope_keys = ("request_id", "owner_id", "conversation_id", "surface",
+                              "runtime_session_id", "runtime_turn_id", "active_persona_id",
+                              "capability_id", "authorization_phase", "requested_domains",
+                              "persona_selection_mode")
+                observation = {"path": path, "order": len(observations),
+                               "association": "owner_conversation" if explicit else "session",
+                               "request": {k: scope[k] for k in scope_keys if k in scope}}
+                if path == "/v1/capabilities/exposure-batch":
+                    observation["candidate_ids"] = [c["capability_id"] for c in payload["candidates"]]
+                observations.append(observation)
+            queues[connection].append(observation)
+        else:
+            assert queues[connection], "observer missed request"
+            observation = queues[connection].popleft()
+            if observation is None:
+                continue
+            observation["http_status"] = int(lines[0].split()[1])
+            path = observation["path"]
+            if path == "/v1/world-state/resolve":
+                claims = payload["included_claims"]
+                observation["read"] = {
+                    "selection_contract": payload["selection_contract"],
+                    "trace": payload["trace"],
+                    "matching_fixture_claims": sum(
+                        c["entity_id"] == "fixture-project" and c["attribute"] == "state"
+                        and c["value_json"] == "WORLD_FIXTURE_project" for c in claims),
+                    "restricted_values_absent": all(
+                        sentinel not in json.dumps(payload) for sentinel in (
+                            "WORLD_FIXTURE_secret", "WORLD_FIXTURE_expired", "WORLD_FIXTURE_health",
+                            "WORLD_FIXTURE_conflict_a", "WORLD_FIXTURE_conflict_b")),
+                }
+            elif path.startswith("/v1/capabilities/"):
+                if path.endswith("exposure-batch"):
+                    observation["decisions"] = [d["authorization"]["result"]
+                                                for d in payload["decisions"]]
+                else:
+                    observation["result"] = payload["result"]
+            if path == "/v1/runtime/turns/complete":
+                finished = True
+assert finished, "observer did not see completed request"
+assert all(o.get("http_status") == 200 for o in observations), "CR operation failed"
+print(json.dumps({"operations": observations}), flush=True)
+PYOBSERVE
+}
+
+# Actual durable CR authority and immutable source rows, independently of CO.
+world_state_read_records() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" "$3" <<'PYRECORDS'
+import hashlib
+import json
+import sqlite3
+import sys
+
+owner, conversation, request = sys.argv[1:]
+with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db:
+    db.row_factory = sqlite3.Row
+    claims = [dict(r) for r in db.execute(
+        "SELECT * FROM runtime_world_state_claims WHERE owner_id=? ORDER BY world_state_claim_id",
+        (owner,))]
+    report = {"claims_digest": hashlib.sha256(json.dumps(claims, sort_keys=True).encode()).hexdigest(),
+              "claim_count": len(claims)}
+    if request:
+        sessions = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_sessions WHERE owner_id=? AND conversation_id=?",
+            (owner, conversation))]
+        assert len(sessions) == 1
+        session = sessions[0]
+        turns = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_turns WHERE runtime_session_id=?",
+            (session["runtime_session_id"],))]
+        assert len(turns) == 1 and turns[0]["turn_status"] == "completed"
+        turn = turns[0]
+        events = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id=? ORDER BY id",
+            (turn["runtime_turn_id"],))]
+        for event in events:
+            event["event_payload_json"] = json.loads(event["event_payload_json"])
+        assert all(e["runtime_session_id"] == session["runtime_session_id"] for e in events)
+        def items(kind):
+            return [e for e in events if e["event_type"] == kind]
+        for kind in ("turn_started", "interaction_governance_evaluated", "turn_completed"):
+            event, = items(kind)
+            assert event["event_payload_json"]["request_id"] == request
+        assert not items("confirmation_challenge_evaluated")
+        assert db.execute("SELECT count(*) FROM capability_confirmation_challenges "
+                          "WHERE owner_id=? AND conversation_id=?", (owner, conversation)).fetchone()[0] == 0
+        thread = db.execute("SELECT * FROM conversation_runtime_threads WHERE owner_id=? "
+                            "AND conversation_id=?", (owner, conversation)).fetchone()
+        assert thread["state"] == "idle" and thread["active_runtime_turn_id"] is None
+        report.update(session=session, turn=turn, events=events, challenges=0)
+print(json.dumps(report))
+PYRECORDS
+}
+
+run_world_state_read_case() (
+  set -Eeuo pipefail
+  local tag="$1" surface="$2" expected="$3" persona="$4"
+  trap 'echo "World-state read assertion failed: case=$tag line=$LINENO" >&2' ERR
+  local owner="world-read-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  local conversation fixture before after response request trace calls records work result observer_pid
+  local text="Read current runtime world state. Reference $owner."
+  local observation="$COMPOSED_SMOKE_TMP/world-read-$tag.jsonl"
+  conversation="$(create_conversation "$owner" world-read-client)"
+  configure_surface_permission "$owner" "$surface" true true false
+  fixture="$(strict_world_state_seed "$owner" "$conversation")"
+  before="$(world_state_read_records "$owner" "$conversation" '')"
+  provider_post /fixture/reset '{}'
+  provider_post /fixture/next-answer "$(jq -nc --arg text "$text" '{world_state_read:{expected_user_text:$text}}')"
+  world_state_read_observer "$owner" "$conversation" >"$observation" &
+  observer_pid=$!
+  for _ in $(seq 1 100); do
+    if head -1 "$observation" | jq -e '.ready==true' >/dev/null 2>&1; then break; fi
+    kill -0 "$observer_pid"
+    sleep .1
+  done
+  head -1 "$observation" | jq -e '.ready==true' >/dev/null
+  response="$(co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg text "$text" '{owner_id:$owner,client_id:"world-read-client",
+      conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private"}')")"
+  wait "$observer_pid"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    cp "$observation" "$COMPOSED_SMOKE_LOG_DIR/world-state-read-$tag.jsonl"
+  fi
+  request="$(jq -er .request_id <<<"$response")"
+  trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
+  records="$(world_state_read_records "$owner" "$conversation" "$request")"
+  after="$(jq -c '{claims_digest,claim_count}' <<<"$records")"
+  test "$(jq -c . <<<"$before")" = "$after"
+  test "$(jq .claim_count <<<"$before")" = 8
+  # Only bounded neutral fixtures enter this local assertion process. No raw
+  # network bodies are saved: the observer emits just associations and results.
+  python3 - "$tag" "$expected" "$persona" "$owner" "$conversation" "$request" \
+    "$response" "$trace" "$calls" "$records" "$(tail -1 "$observation")" <<'PYCHECKREAD'
+import json
+import sys
+
+tag, expected, persona, owner, conversation, request = sys.argv[1:7]
+response, trace, calls, records, observed = map(json.loads, sys.argv[7:])
+expected = int(expected)
+assert response["status"] in {"ok", "degraded"}
+assembly = trace["retrieval"]["prompt_assembly"]
+capabilities = assembly["capabilities"]
+session, turn = records["session"]["runtime_session_id"], records["turn"]["runtime_turn_id"]
+assert assembly["runtime_session"]["runtime_session_id"] == session
+assert assembly["turn_state"]["runtime_turn_id"] == turn
+assert records["session"]["surface"] == ("web" if tag == "denied" else "dev")
+operations = observed["operations"]
+def at(path):
+    return [o for o in operations if o["path"] == path]
+for operation in operations:
+    body = operation["request"]
+    if operation["association"] == "owner_conversation":
+        assert body["owner_id"] == owner and body["conversation_id"] == conversation
+    else:
+        assert body["runtime_session_id"] == session
+    assert body["request_id"] == request or body["request_id"].startswith(request + ":")
+    for key, value in (("runtime_session_id", session), ("runtime_turn_id", turn),
+                       ("active_persona_id", persona)):
+        if key in body:
+            assert body[key] == value, (operation["path"], key)
+match, = at("/v1/capabilities/match")
+reads = at("/v1/world-state/resolve")
+executions = [r for r in reads if r["request"]["request_id"] == request + ":runtime.world_state.read:execute"]
+context_reads = [r for r in reads if r not in executions]
+assert len(executions) == expected and len(context_reads) == 1
+assert all(r["read"]["restricted_values_absent"] for r in reads)
+assert not at("/v1/capabilities/confirm")
+assert not any(o["path"].endswith(("/upsert", "/verify")) for o in operations)
+chat, = [c for c in calls["calls"] if c["kind"] == "chat"]
+assert chat["request_id"] == request and chat["read_fixture_selected"] is True
+assert chat["read_proposal_count"] == expected
+assert chat["tool_names"] == (["runtime_world_state_read"] if expected else [])
+assert all(c["kind"] in {"chat", "semantic_interpreter"} for c in calls["calls"])
+assert capabilities["executor_call_count"] == expected
+assert capabilities["dispatch_completed"] is bool(expected)
+assert capabilities["follow_up"]["call_count"] == 0
+events = records["events"]
+authorizations = [e for e in events if e["event_type"] == "capability_authorization_evaluated"]
+summaries = [e for e in events if e["event_type"] == "action_summary_recorded"]
+assert len(authorizations) == 3 * expected
+if expected:
+    assert match["result"]["capability_matched"] is True
+    assert match["result"]["capability"]["domain"] == "software_architecture"
+    authority, = at("/v1/capabilities/authority")
+    flow, = at("/v1/capabilities/flow")
+    assert authority["result"]["allowed"] is True
+    assert flow["result"]["execution_allowed"] is True
+    assert flow["result"]["confirmation_required"] is False
+    assert flow["result"]["verification_required"] is True
+    exposure, = at("/v1/capabilities/exposure-batch")
+    assert exposure["candidate_ids"] == ["runtime.world_state.read"]
+    assert len(exposure["decisions"]) == 1 and exposure["decisions"][0]["allowed"] is True
+    selection, dispatch = at("/v1/capabilities/authorize")
+    assert [e["event_payload_json"]["request_id"] for e in authorizations] == [
+        request, request + ":runtime.world_state.read:selection", request + ":runtime.world_state.read:dispatch"]
+    assert all(e["event_payload_json"]["capability_id"] == "runtime.world_state.read"
+               and e["event_payload_json"]["decision_code"] == "allowed" for e in authorizations)
+    assert selection["result"]["allowed"] is True and dispatch["result"]["allowed"] is True
+    execution, = executions
+    assert execution["request"]["requested_domains"] == ["active_project"]
+    assert execution["read"]["matching_fixture_claims"] == 1
+    assert execution["read"]["trace"]["included_claim_count"] == 1
+    assert execution["read"]["trace"]["confirmation_required"] is False
+    # The legacy executor's wire model has no turn field. Its exact request
+    # suffix/session link is checked against this turn's dispatch/completion.
+    assert "runtime_turn_id" not in execution["request"]
+    summary, = at("/v1/capabilities/action-summary")
+    assert summary["result"]["execution_status"] == "executed"
+    assert summary["result"]["verification_status"] == "passed"
+    assert summary["result"]["confirmation_status"] == "not_required"
+    assert response["answer"] == summary["result"]["user_visible_summary"]
+    assert response["answer"] == "Action runtime.world_state.read was executed and verification passed."
+    summary_event, = summaries
+    assert summary_event["event_payload_json"]["action_id"] == summary["result"]["action_id"]
+    assert summary_event["event_payload_json"]["owner_id"] == owner
+    assert summary_event["event_payload_json"]["conversation_id"] == conversation
+    verification = capabilities["execution"]["post_execution_verification"]
+    assert verification["status"] == "verified" and verification["matching_claim_count"] == 1
+    ordered = [match, authority, flow, exposure, selection, dispatch, execution, summary]
+    assert [o["order"] for o in ordered] == sorted(o["order"] for o in ordered)
+else:
+    assert not at("/v1/capabilities/authority") and not at("/v1/capabilities/flow")
+    assert not at("/v1/capabilities/exposure-batch") and not at("/v1/capabilities/authorize")
+    assert not summaries or all(e["event_payload_json"]["execution_status"] != "executed" for e in summaries)
+    assert "was executed" not in response["answer"]
+    if tag == "denied":
+        assert match["result"]["capability_matched"] is False
+        assert "surface_not_allowed" in match["result"]["reason_codes"]
+    else:
+        assert assembly["capability_registry"]["reason"] == "strict_world_state_context_only"
+        assert context_reads[0]["read"]["selection_contract"] == "strict_turn"
+for item in (response, trace, calls):
+    assert all(sentinel not in json.dumps(item) for sentinel in (
+        "WORLD_FIXTURE_secret", "WORLD_FIXTURE_expired", "WORLD_FIXTURE_health",
+        "WORLD_FIXTURE_conflict_a", "WORLD_FIXTURE_conflict_b"))
+print(json.dumps({"scenario": tag, "actual_services": True, "request_id": request,
+                  "owner_id": owner, "conversation_id": conversation, "runtime_session_id": session,
+                  "runtime_turn_id": turn, "matches": 1, "read_executions": len(executions),
+                  "context_reads": len(context_reads), "authorization_decisions": len(authorizations),
+                  "provider_proposals": chat["read_proposal_count"], "provider_chat_calls": 1,
+                  "duplicate_dispatches": 0, "challenges": 0, "restricted_values_absent": True}))
+PYCHECKREAD
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+  assert_request_persistence_counts "$conversation" "$request" 0
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  assert_exact_canonical_result "$result"
+  jq -e --arg answer "$(jq -er .answer <<<"$response")" '.state=="completed" and .result.answer==$answer' <<<"$result" >/dev/null
+  local assistant
+  assistant="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.assistant_message_id=m.id AND w.work_id=m.work_id WHERE w.work_id='$work' AND w.owner_id='$owner' AND w.conversation_id='$conversation' AND w.surface='$surface' AND w.state='completed' AND m.role='assistant' AND m.metadata->>'request_id'='$request';")"
+  test -n "$assistant"
+  jq -e --arg assistant "$assistant" '[.events[]|select(.event_type=="turn_completed")][0].event_payload_json.assistant_message_id==$assistant' <<<"$records" >/dev/null
+  echo "World-state read $tag: actual_services=true context_reads=1 executions=$expected matches=1 authorization_decisions=$((3 * expected)) provider_proposals=$expected assistant_publications=1 challenges=0 work=completed idle=true"
+)
+
+run_world_state_read_scenario() (
+  set -Eeuo pipefail
+  local saved_registry="${COMPOSED_CAPABILITY_REGISTRY_ENABLED:-false}"
+  local saved_persona="${COMPOSED_PERSONA_CONTAINMENT_ENABLED:-false}"
+  local saved_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  # Qualify the existing default executable contract, never downgrade strict
+  # world-state authority to obtain execution. Strict mode is a zero-execution control.
+  test "${COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED:-false}" = false
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true COMPOSED_RESTRAINT_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  docker compose -f "$COMPOSE" exec -T provider python -m unittest -v tools.composed_provider_stub.ProviderFixtureTests
+  run_world_state_read_case allowed dev 1 technical_architect
+  run_world_state_read_case denied web 0 general_assistant
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_world_state_read_case strict dev 0 technical_architect
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=false
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED="$saved_registry"
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED="$saved_persona" COMPOSED_RESTRAINT_ENABLED="$saved_restraint"
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  provider_post /fixture/reset '{}'
+)
+
 run_strict_world_state_case() (
   local tag="$1" surface="$2" persona="$3" proposal="${4:-any}" empty="${5:-false}"
   local owner="strict-world-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
@@ -7747,6 +8107,11 @@ if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
 fi
 
 
+if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ]; then
+  run_world_state_read_scenario
+  exit 0
+fi
+
 if [ "${STRICT_WORLD_STATE_AUTHORITY_ONLY:-}" = "1" ]; then
   set -E
   trap 'echo "Strict world state assertion failed: line=$LINENO" >&2' ERR
@@ -7799,6 +8164,7 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
     run_voice_continuation_scenario
     run_transport_latency_regression
+    run_world_state_read_scenario
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
   exit 0
@@ -8066,6 +8432,8 @@ run_wave2e_retrieval_scenario
 run_claim_traceability_scenario
 run_evidence_acquisition_composed_suite
 run_history_followup_composed_suite
+
+run_world_state_read_scenario
 
 echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition, server-owned-history-followups"
 echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
