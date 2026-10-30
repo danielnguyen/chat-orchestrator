@@ -8123,7 +8123,7 @@ if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
 fi
 
 
-if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ] || [ "${EVIDENCE_SCENARIO:-}" = world-state-read ]; then
+if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ]; then
   run_world_state_read_scenario
   exit 0
 fi
@@ -8180,6 +8180,8 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
     run_voice_continuation_scenario
     run_transport_latency_regression
+  fi
+  if [ "${EVIDENCE_SCENARIO:-all}" = all ] || [ "${EVIDENCE_SCENARIO:-all}" = aggregate ]; then
     run_world_state_read_scenario
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
