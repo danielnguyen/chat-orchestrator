@@ -6585,6 +6585,35 @@ async def main():
             assert capability["execution"]["restart_call_count"] == 1
             assert capability["execution"]["post_restart_verification_call_count"] == 1
             assert "verification passed" in response["answer"]
+        elif mode == "replay":
+            execution = capability["execution"]
+            assert execution["response_status"] == "not_executed"
+            assert execution["failure_reason_code"] == "challenge_consumed"
+            assert execution["executor_called"] is False
+            assert execution["executor_result_status"] == "not_called"
+            for count in (
+                "executor_call_count", "connector_execution_call_count",
+                "connector_verification_call_count", "restart_call_count",
+                "post_restart_verification_call_count",
+            ):
+                assert execution[count] == 0
+            assert execution["post_execution_verification"]["call_count"] == 0
+            (selection,) = [o for o in operations if o["request"].get(stage_key) == "selection"]
+            assert selection["request"]["capability_id"] == "jellyfin_restart"
+            assert selection["result"]["allowed"] is False
+            assert selection["result"]["decision_code"] == "confirmation_rejected"
+            assert selection["result"]["reason_codes"] == ["challenge_consumed"]
+            assert not any(o["path"] == "/v1/capabilities/confirm" for o in operations)
+            assert not any(o["request"].get(stage_key) == "dispatch" for o in operations)
+            assert not provider_calls and not attempts and not effects
+            (summary,) = [o for o in operations if o["path"] == "/v1/capabilities/action-summary"]
+            assert summary["result"] == {
+                "execution_status": "not_attempted", "verification_status": "not_required",
+            }
+            assert capability["action_summary"]["status"] == "included"
+            assert capability["action_summary"]["execution_status"] == "not_attempted"
+            assert capability["action_summary"]["verification_status"] == "not_required"
+            assert response["answer"] == "I could not use that capability request safely."
         else:
             assert "no action was taken" in response["answer"].lower()
         print(
