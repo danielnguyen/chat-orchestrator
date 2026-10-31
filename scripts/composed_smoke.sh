@@ -5959,11 +5959,15 @@ while not finished and time.monotonic() < deadline:
             if observation is None:
                 continue
             observation["http_status"] = int(lines[0].split()[1])
+            observation["response_scope"] = {
+                k: payload[k] for k in ("request_id", "owner_id", "conversation_id", "surface",
+                                       "runtime_session_id", "runtime_turn_id") if k in payload}
             path = observation["path"]
             if path == "/v1/world-state/resolve":
                 claims = payload["included_claims"]
                 observation["read"] = {
                     "selection_contract": payload["selection_contract"],
+                    "included_claim_count": len(claims),
                     "trace": payload["trace"],
                     "matching_fixture_claims": sum(
                         c["entity_id"] == "fixture-project" and c["attribute"] == "state"
@@ -6203,6 +6207,10 @@ for operation in operations:
                        ("runtime_session_id", session), ("runtime_turn_id", turn)):
         if key in body:
             assert body[key] == value, "contradictory " + key
+        if key in operation["response_scope"]:
+            assert operation["response_scope"][key] == value, "contradictory response " + key
+    if "request_id" in operation["response_scope"]:
+        assert operation["response_scope"]["request_id"] == body["request_id"], "mismatched response request"
     if "capability_id" in body:
         assert body["capability_id"] == "runtime.world_state.read", "wrong dispatch capability"
     if "capability_id" in operation.get("result", {}):
@@ -6275,6 +6283,7 @@ if expected:
     execution, = executions
     assert execution["request"]["requested_domains"] == ["active_project"]
     assert execution["read"]["matching_fixture_claims"] == 1
+    assert execution["read"]["included_claim_count"] == 1
     assert execution["read"]["trace"]["included_claim_count"] == 1
     assert execution["read"]["trace"]["confirmation_required"] is False
     # The legacy executor's wire model has no turn field. Its exact request
