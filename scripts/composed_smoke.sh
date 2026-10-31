@@ -6391,6 +6391,539 @@ PYCHECKREAD
   echo "World-state read $tag: actual_services=true context_reads=1 executions=$expected matches=1 authorization_decisions=$((3 * expected)) provider_proposals=$expected assistant_publications=1 challenges=0 work=completed idle=true"
 )
 
+# Exercise the existing Python injection seam, NOT the ordinary CO HTTP entry
+# point. Only connector callbacks and the provider are simulated. CR/BMS clients
+# keep their real HTTP transports; no authorization response is replaced.
+simulated_confirmation_turn() {
+  docker compose -f "$COMPOSE" exec -T orchestrator python - "$@" <<'PYCONFIRMTURN'
+import asyncio
+import json
+import sys
+import uuid
+from datetime import UTC, datetime
+from time import monotonic_ns
+
+from clients.memory_store import MemoryStoreClient
+from clients.runtime import RuntimeClient
+from models import ChatRequest
+from services.jellyfin_action_connector import JellyfinOperations
+from services.orchestrate import orchestrate_chat
+
+owner, conversation, mode, pending_json = sys.argv[1:]
+assert mode in {"pending", "accepted", "rejected", "replay", "mismatch", "denied"}
+request_id = str(uuid.uuid4())
+operations, effects, provider_calls, attempts = [], [], [], []
+
+
+class ObservedRuntime(RuntimeClient):
+    async def _post(self, path, *, json):
+        observation = {
+            "path": path,
+            "start_ns": monotonic_ns(),
+            "request": {
+                k: json[k]
+                for k in (
+                    "request_id",
+                    "owner_id",
+                    "conversation_id",
+                    "runtime_session_id",
+                    "runtime_turn_id",
+                    "capability_id",
+                    "authorization_phase",
+                    "confirmation_challenge_ref",
+                )
+                if k in json
+            },
+        }
+        operations.append(observation)
+        try:
+            response = await super()._post(path, json=json)
+        finally:
+            observation["end_ns"] = monotonic_ns()
+        observation["http_status"] = 200
+        result = response.get("result", response)
+        observation["result"] = {
+            k: result[k]
+            for k in (
+                "allowed",
+                "decision_code",
+                "reason_codes",
+                "confirmation_state",
+                "challenge_ref",
+                "execution_status",
+                "verification_status",
+            )
+            if k in result
+        }
+        return response
+
+
+class FixedProvider:
+    async def chat(self, **kwargs):
+        names = [t["function"]["name"] for t in kwargs.get("tools") or []]
+        provider_calls.append({"request_id": kwargs["request_id"], "tool_names": names})
+        assert kwargs["request_id"] == request_id and len(provider_calls) == 1
+        assert mode in {"pending", "denied"}, "provider rediscovery or fallback"
+        if mode == "pending":
+            assert names == ["jellyfin_safe_restart"], "tool was not authorized for exposure"
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "tool_calls": [
+                                {
+                                    "type": "function",
+                                    "function": {
+                                        "name": "jellyfin_safe_restart",
+                                        "arguments": '{"target":"service:jellyfin"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        assert not names, "denied surface exposed executable tool"
+        return {"choices": [{"message": {"content": "No simulated action was taken."}}]}
+
+
+async def restart(value):
+    # This callback has no network, subprocess, filesystem or real service access.
+    attempts.append("restart")
+    assert mode == "accepted" and not effects
+    assert value["request_id"] == request_id + ":jellyfin_restart:execute"
+    assert value["target"] == "service:jellyfin"
+    assert value["capability_id"] == "jellyfin_restart"
+    dispatch = operations[-1]
+    assert dispatch["path"] == "/v1/capabilities/authorize"
+    assert dispatch["request"]["authorization_phase"] == "dispatch"
+    assert dispatch["request"]["capability_id"] == "jellyfin_restart"
+    assert dispatch["result"]["allowed"] is True
+    effects.append({**value, "start_ns": monotonic_ns(), "effect_mode": "simulated"})
+    assert dispatch["end_ns"] < effects[0]["start_ns"]
+    return {"status": "completed", "reason_code": "simulated_completed"}
+
+
+async def status(value):
+    # A bounded observation of the simulated operation, never live Jellyfin.
+    attempts.append("status")
+    assert value["target"] == "service:jellyfin" and effects
+    assert value["purpose"] == "post_restart", "unexpected revalidation requirement"
+    effects.append({"verification": True, "start_ns": monotonic_ns()})
+    now = datetime.now(UTC).isoformat()
+    return {
+        "status": "healthy",
+        "reason_code": "simulated_healthy",
+        "observed_at": now,
+        "verified_at": now,
+        "claims": [],
+    }
+
+
+async def main():
+    memory = MemoryStoreClient("http://bms:8000", "smoke-memory-key")
+    runtime = ObservedRuntime("http://runtime:8000", None)
+    payload = {
+        "owner_id": owner,
+        "conversation_id": conversation,
+        "client_id": "simulated-confirmation-client",
+        "surface": "dev",
+        "messages": [{"role": "user", "content": "Restart Jellyfin."}],
+        "sensitivity": "private",
+    }
+    if mode == "denied":
+        payload["surface"] = "web"
+    if pending_json != "null":
+        payload["messages"] = [{"role": "user", "content": "no" if mode == "rejected" else "yes"}]
+        payload["capability_confirmation"] = {
+            "pending_action": json.loads(pending_json),
+            "confirmed": mode != "rejected",
+        }
+    try:
+        payload = ChatRequest.model_validate(payload).model_dump(exclude_none=True)
+        response = await asyncio.wait_for(
+            orchestrate_chat(
+                payload=payload,
+                memory_store=memory,
+                litellm=FixedProvider(),
+                runtime=runtime,
+                rules_path="/app/router/rules.yaml",
+                model_registry_path="/app/router/model_registry.yaml",
+                allow_manual_override=False,
+                request_id=request_id,
+                enable_runtime_overlays=True,
+                interaction_governance_enabled=True,
+                persona_containment_enabled=True,
+                restraint_enabled=True,
+                capability_registry_enabled=True,
+                jellyfin_operations=JellyfinOperations("simulated", status, restart),
+            ),
+            30,
+        )
+        trace = await memory.get_trace(request_id)
+        assembly = trace["retrieval"]["prompt_assembly"]
+        capability = assembly["capabilities"]
+        executed = int(mode == "accepted")
+        assert attempts == (["restart", "status"] if executed else [])
+        assert len(effects) == executed * 2, "hidden execution or missing verification"
+        assert len(provider_calls) <= int(mode in {"pending", "denied"})
+        if mode == "pending":
+            assert len(provider_calls) == 1
+        assert response["status"] in {"ok", "degraded"}
+        if mode == "pending":
+            assert response["pending_action"]["capability_id"] == "jellyfin_restart"
+        else:
+            assert "pending_action" not in response
+        if executed:
+            assert capability["execution"]["effect_mode"] == "simulated"
+            assert capability["execution"]["restart_call_count"] == 1
+            assert capability["execution"]["post_restart_verification_call_count"] == 1
+            assert "verification passed" in response["answer"]
+        else:
+            assert "no action was taken" in response["answer"].lower()
+        print(
+            json.dumps(
+                {
+                    "mode": mode,
+                    "request_id": request_id,
+                    "response": response,
+                    "session": assembly["runtime_session"]["runtime_session_id"],
+                    "turn": assembly["turn_state"]["runtime_turn_id"],
+                    "provider_calls": provider_calls,
+                    "effects": effects,
+                  "connector_attempts": attempts,
+                    "operations": operations,
+                }
+            )
+        )
+    finally:
+        await runtime.close()
+        await memory.close()
+
+
+asyncio.run(main())
+PYCONFIRMTURN
+}
+
+simulated_confirmation_records() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$@" <<'PYCONFIRMRECORDS'
+import json
+import sqlite3
+import sys
+from datetime import datetime
+
+owner, conversation, report_json = sys.argv[1:]
+report = json.loads(report_json)
+with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db:
+    db.row_factory = sqlite3.Row
+    (session,) = db.execute(
+        "SELECT * FROM conversation_runtime_sessions " "WHERE owner_id=? AND conversation_id=?",
+        (owner, conversation),
+    ).fetchall()
+    assert session["runtime_session_id"] == report["session"]
+    turns = db.execute(
+        "SELECT * FROM conversation_runtime_turns WHERE runtime_session_id=? " "ORDER BY id",
+        (report["session"],),
+    ).fetchall()
+    assert all(t["turn_status"] == "completed" for t in turns)
+    assert turns[-1]["runtime_turn_id"] == report["turn"]
+    events = [
+        dict(e)
+        for e in db.execute(
+            "SELECT * FROM conversation_runtime_events WHERE runtime_session_id=? ORDER BY id",
+            (report["session"],),
+        )
+    ]
+    for e in events:
+        e["event_payload_json"] = json.loads(e["event_payload_json"])
+        for key, expected in (
+            ("owner_id", owner),
+            ("conversation_id", conversation),
+            ("runtime_session_id", report["session"]),
+        ):
+            assert key not in e["event_payload_json"] or e["event_payload_json"][key] == expected
+    current = [e for e in events if e["runtime_turn_id"] == report["turn"]]
+    (started,) = [e for e in current if e["event_type"] == "turn_started"]
+    (completed,) = [e for e in current if e["event_type"] == "turn_completed"]
+    assert started["event_payload_json"]["request_id"] == report["request_id"]
+    assert completed["event_payload_json"]["request_id"] == report["request_id"]
+    if len(turns) > 1:
+        (prior,) = [
+            e
+            for e in events
+            if e["runtime_turn_id"] == turns[-2]["runtime_turn_id"]
+            and e["event_type"] == "turn_completed"
+        ]
+        assert prior["id"] < started["id"], "predecessor did not complete before admission"
+    challenges = [
+        dict(r)
+        for r in db.execute(
+            "SELECT * FROM capability_confirmation_challenges "
+            "WHERE owner_id=? AND conversation_id=?",
+            (owner, conversation),
+        )
+    ]
+    mode = report["mode"]
+    if mode in {"denied", "mismatch"}:
+        assert not challenges
+    else:
+        (challenge,) = challenges
+        assert challenge["owner_id"] == owner and challenge["conversation_id"] == conversation
+        assert challenge["runtime_session_id"] == report["session"]
+        assert challenge["capability_id"] == "jellyfin_restart"
+        assert challenge["operation_class"] == "high_impact"
+        ttl = datetime.fromisoformat(challenge["expires_at"]) - datetime.fromisoformat(
+            challenge["issued_at"])
+        assert 299 < ttl.total_seconds() < 301
+        if mode == "pending":
+            envelope = report["response"]["pending_action"]
+            assert challenge["status"] == "issued" and challenge["consumed_at"] is None
+            assert challenge["originating_runtime_turn_id"] == report["turn"]
+            assert (
+                challenge["originating_request_id"]
+                == report["request_id"] + ":jellyfin_restart:selection"
+            )
+            assert challenge["confirmation_challenge_ref"] == envelope["challenge_ref"]
+            assert challenge["argument_digest"] == envelope["argument_digest"]
+            assert challenge["expires_at"] == envelope["challenge_expires_at"]
+        else:
+            assert challenge["originating_runtime_turn_id"] != report["turn"]
+            assert challenge["status"] == ("rejected" if mode == "rejected" else "accepted")
+            assert (challenge["consumed_at"] is not None) == (mode != "rejected")
+            if mode != "replay":
+                assert challenge["confirmed_runtime_turn_id"] == report["turn"]
+
+    def matching(kind, **fields):
+        return [
+            e
+            for e in current
+            if e["event_type"] == kind
+            and all(e["event_payload_json"].get(k) == v for k, v in fields.items())
+        ]
+
+    dispatch = matching("capability_authorization_evaluated", phase="dispatch")
+    confirmations = matching("confirmation_challenge_evaluated", confirmation_state="accepted")
+    if mode == "accepted":
+        (selection,) = matching("capability_authorization_evaluated", phase="selection")
+        (accepted,) = confirmations
+        (consumed,) = matching("confirmation_challenge_evaluated", confirmation_state="consumed")
+        (dispatched,) = dispatch
+        (summary,) = matching("action_summary_recorded")
+        assert dispatched["event_payload_json"]["decision_code"] == "allowed"
+        assert started["id"] < selection["id"] < accepted["id"] < consumed["id"]
+        assert consumed["id"] < dispatched["id"] < summary["id"] < completed["id"]
+    else:
+        assert not dispatch and not confirmations
+    if mode == "rejected":
+        (rejected,) = matching("confirmation_challenge_evaluated", confirmation_state="rejected")
+        assert started["id"] < rejected["id"] < completed["id"]
+    if mode in {"replay", "mismatch"}:
+        (selection,) = matching("capability_authorization_evaluated", phase="selection")
+        reason = "challenge_consumed" if mode == "replay" else "challenge_missing"
+        assert reason in selection["event_payload_json"]["reason_codes"]
+    print(
+        json.dumps(
+            {
+                "challenges": challenges,
+                "completed_event": completed["event_payload_json"],
+                "events": [
+                    {
+                        "id": e["id"],
+                        "event_id": e["event_id"],
+                        "type": e["event_type"],
+                        "turn": e["runtime_turn_id"],
+                        "association": {
+                            k: v
+                            for k, v in e["event_payload_json"].items()
+                            if k
+                            in {
+                                "request_id",
+                                "capability_id",
+                                "phase",
+                                "decision_code",
+                                "confirmation_state",
+                                "confirmation_challenge_ref",
+                                "challenge_ref",
+                                "assistant_message_id",
+                            }
+                        },
+                    }
+                    for e in events
+                ],
+            }
+        )
+    )
+PYCONFIRMRECORDS
+}
+
+check_simulated_confirmation_turn() {
+  local owner="$1" conversation="$2" mode="$3" pending="${4:-null}"
+  local before after report records request assistant work
+  before="$(strict_information_http_counts '{}' | jq -ce .runtime_access)"
+  report="$(simulated_confirmation_turn "$owner" "$conversation" "$mode" "$pending")"
+  curl -fsS http://127.0.0.1:14371/healthz >/dev/null
+  after="$(strict_information_http_counts "$before" | jq -ce .runtime_access)"
+  records="$(simulated_confirmation_records "$owner" "$conversation" "$report")"
+  request="$(jq -er .request_id <<<"$report")"
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .response.answer <<<"$report")"
+  assert_request_persistence_counts "$conversation" "$request" 0
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND conversation_id='$conversation' AND request_id='$request' AND state='completed';")"
+  assistant="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.assistant_message_id=m.id AND w.work_id=m.work_id WHERE w.work_id='$work' AND w.state='completed' AND m.owner_id='$owner' AND m.conversation_id='$conversation' AND m.role='assistant' AND m.metadata->>'request_id'='$request';")"
+  test -n "$assistant" && test -n "$work"
+  python3 - "$owner" "$conversation" "$report" "$records" "$before" "$after" "$assistant" "$work" <<'PYCHECKCONFIRM'
+import collections
+import json
+import sys
+
+owner, conversation = sys.argv[1:3]
+report, records, before, after = map(json.loads, sys.argv[3:7])
+assistant, work = sys.argv[7:]
+assert records["completed_event"]["assistant_message_id"] == assistant
+assert after["prefix_digest"] == before["digest"] and after["count"] > before["count"] > 0
+delta = collections.Counter(after["operations"])
+delta.subtract(before["operations"])
+assert all(n >= 0 for n in delta.values())
+delta.pop("GET /healthz 200", None)
+observed = collections.Counter()
+allowed = {
+    "/v1/runtime/threads/resolve",
+    "/v1/runtime/turns/start",
+    "/v1/runtime/turns/update",
+    "/v1/runtime/turns/complete",
+    "/v1/runtime/surface-presence/publish",
+    "/v1/runtime/interaction-governance/evaluate",
+    "/v1/runtime/persona-containment/evaluate",
+    "/v1/runtime/restraint/evaluate",
+    "/v1/runtime/presence/evaluate",
+    "/v1/runtime/situated-presence/evaluate",
+    "/v1/runtime/timing/evaluate",
+    "/v1/runtime/identity/resolve",
+    "/v1/runtime/overlay",
+    "/v1/world-state/resolve",
+    "/v1/relationships/select",
+    "/v1/capabilities/match",
+    "/v1/capabilities/authority",
+    "/v1/capabilities/flow",
+    "/v1/capabilities/exposure-batch",
+    "/v1/capabilities/authorize",
+    "/v1/capabilities/confirm",
+    "/v1/capabilities/action-summary",
+}
+for op in report["operations"]:
+    assert op["path"] in allowed, "unexpected scoped operation"
+    assert op["http_status"] == 200 and op["start_ns"] < op["end_ns"]
+    for key, expected in (
+        ("owner_id", owner),
+        ("conversation_id", conversation),
+        ("runtime_session_id", report["session"]),
+        ("runtime_turn_id", report["turn"]),
+    ):
+        assert key not in op["request"] or op["request"][key] == expected
+    observed["POST " + op["path"] + " 200"] += 1
+assert +delta == observed, "incomplete or ambiguous service evidence"
+executed = report["mode"] == "accepted"
+assert len(
+    [o for o in report["operations"] if o["request"].get("authorization_phase") == "dispatch"]
+) == int(executed)
+if executed:
+    (selection,) = [
+        o for o in report["operations"] if o["request"].get("authorization_phase") == "selection"
+    ]
+    (confirmation,) = [o for o in report["operations"] if o["path"] == "/v1/capabilities/confirm"]
+    (dispatch,) = [
+        o for o in report["operations"] if o["request"].get("authorization_phase") == "dispatch"
+    ]
+    (summary,) = [o for o in report["operations"] if o["path"] == "/v1/capabilities/action-summary"]
+    assert selection["end_ns"] < confirmation["start_ns"] < confirmation["end_ns"]
+    assert confirmation["end_ns"] < dispatch["start_ns"] < dispatch["end_ns"]
+    assert dispatch["end_ns"] < report["effects"][0]["start_ns"]
+    assert report["effects"][1]["start_ns"] < summary["start_ns"]
+print(
+    json.dumps(
+        {
+            "scenario": "simulated_confirmation",
+            "mode": report["mode"],
+            "request_id": report["request_id"],
+            "owner_id": owner,
+            "conversation_id": conversation,
+            "session": report["session"],
+            "turn": report["turn"],
+            "co_boundary": "in_process_orchestrate_chat",
+            "cr_bms": "actual_http_services",
+            "effect_mode": "simulated",
+            "execution_count": sum("verification" not in effect for effect in report["effects"]),
+            "verification_count": sum("verification" in effect for effect in report["effects"]),
+            "connector_attempts": report["connector_attempts"],
+            "provider_calls": report["provider_calls"],
+            "operations": report["operations"],
+            "challenges": records["challenges"],
+            "events": records["events"],
+            "service_records": {
+                "before": before["count"],
+                "after": after["count"],
+                "before_digest": before["digest"],
+                "prefix_digest": after["prefix_digest"],
+                "after_digest": after["digest"],
+                "operation_delta": dict(+delta),
+            },
+            "work_id": work,
+            "assistant_message_id": assistant,
+            "canonical_publications": 1,
+            "work_state": "completed",
+            "cr_turn_state": "completed",
+        }
+    )
+)
+PYCHECKCONFIRM
+  # Return the genuine envelope only to the scenario, never rebuild a challenge.
+  jq -c '.response.pending_action // null' <<<"$report" >"$COMPOSED_SMOKE_TMP/confirmation-pending.json"
+}
+
+run_simulated_confirmation_scenario() (
+  set -Eeuo pipefail
+  test "${COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED:-false}" = false
+  test "${COMPOSED_STRICT_CAPABILITY_INFORMATION_ENABLED:-false}" = false
+  local tag owner conversation claim envelope
+  local rejected_owner rejected_conversation rejected_envelope
+  for tag in accepted rejected mismatch denied; do
+    owner="simulated-confirm-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+    conversation="$(create_conversation "$owner" simulated-confirmation-client)"
+    configure_surface_permission "$owner" dev true true false
+    configure_surface_permission "$owner" web true true false
+    # Existing fixture API, fixed disposable simulated fact. No verifier registry,
+    # policy, permission or service configuration is changed.
+    claim="$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+      --arg now "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" \
+      '{request_id:"simulated-safety-fixture",owner_id:$owner,conversation_id:$conversation,surface:"dev",
+        claim:{entity_id:"service:jellyfin",entity_type:"simulated_service",domain:"active_external_system",
+          attribute:"restart_safe",value_json:true,source_type:"integration_event",
+          source_ref:"disposable-simulated-operations",confidence:0.99,freshness_state:"fresh",
+          state_authority:"trusted_integration_event",observed_at:$now,ttl_seconds:300,
+          confirmation_policy:"none",sensitivity:"medium"}}')"
+    cr_post /v1/world-state/claims/upsert "$claim" >/dev/null
+    case "$tag" in
+      accepted)
+        check_simulated_confirmation_turn "$owner" "$conversation" pending
+        envelope="$(cat "$COMPOSED_SMOKE_TMP/confirmation-pending.json")"
+        check_simulated_confirmation_turn "$owner" "$conversation" accepted "$envelope"
+        check_simulated_confirmation_turn "$owner" "$conversation" replay "$envelope"
+        ;;
+      rejected)
+        check_simulated_confirmation_turn "$owner" "$conversation" pending
+        rejected_owner="$owner"; rejected_conversation="$conversation"
+        rejected_envelope="$(cat "$COMPOSED_SMOKE_TMP/confirmation-pending.json")"
+        ;;
+      mismatch)
+        check_simulated_confirmation_turn "$owner" "$conversation" mismatch "$rejected_envelope"
+        check_simulated_confirmation_turn "$rejected_owner" "$rejected_conversation" rejected "$rejected_envelope"
+        ;;
+      denied) check_simulated_confirmation_turn "$owner" "$conversation" denied ;;
+    esac
+  done
+  rm "$COMPOSED_SMOKE_TMP/confirmation-pending.json"
+  echo "Simulated confirmation: seven actual CR/BMS turns; one simulated execution; no live operations."
+)
+
 run_world_state_read_scenario() (
   set -Eeuo pipefail
   local saved_registry="${COMPOSED_CAPABILITY_REGISTRY_ENABLED:-false}"
@@ -8332,6 +8865,11 @@ if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
 fi
 
 
+if [ "${SIMULATED_CONFIRMATION_ONLY:-}" = "1" ]; then
+  run_simulated_confirmation_scenario
+  exit 0
+fi
+
 if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ]; then
   run_world_state_read_scenario
   exit 0
@@ -8392,6 +8930,7 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   fi
   if [ "${EVIDENCE_SCENARIO:-all}" = all ] || [ "${EVIDENCE_SCENARIO:-all}" = aggregate ]; then
     run_world_state_read_scenario
+    run_simulated_confirmation_scenario
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
   exit 0
@@ -8661,6 +9200,7 @@ run_evidence_acquisition_composed_suite
 run_history_followup_composed_suite
 
 run_world_state_read_scenario
+run_simulated_confirmation_scenario
 
 echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition, server-owned-history-followups"
 echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
