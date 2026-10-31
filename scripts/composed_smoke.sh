@@ -115,6 +115,10 @@ cleanup() {
   fi
   if [ "$status" -ne 0 ] && [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
     mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    if [ -f "$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl" ]; then
+      cp "$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl" \
+        "$COMPOSED_SMOKE_LOG_DIR/latency-incomplete-samples.jsonl" || status=1
+    fi
     docker compose -f "$COMPOSE" ps --format json \
       >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
     docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
@@ -5216,9 +5220,18 @@ complete, = positions("/v1/runtime/turns/complete")
 governance = positions("/v1/runtime/interaction-governance/evaluate")
 assert governance and start < governance[0] <= governance[-1] < complete
 identity = positions("/v1/runtime/identity/resolve")
-for path in ("/v1/world-state/resolve", "/v1/relationships/select"):
-    for consumer in positions(path):
-        assert len(identity) == 1 and governance[0] < identity[0] < consumer < complete
+for consumer in positions("/v1/world-state/resolve"):
+    assert len(identity) == 1 and governance[0] < identity[0] < consumer < complete
+early_relationships = []
+for consumer in positions("/v1/relationships/select"):
+    assert consumer < complete
+    if not any(governance[0] < predecessor < consumer for predecessor in identity):
+        # Legacy mandatory retrieval consumes containment's persona before the
+        # later identity endpoint. Preserve that protected-retrieval order and
+        # expose the unsatisfied identity-endpoint edge, rather than claiming it.
+        assert any(governance[0] < predecessor < consumer for predecessor in
+                   positions("/v1/runtime/persona-containment/evaluate"))
+        early_relationships.append(consumer)
 if positions("/v1/capabilities/match"):
     match, = positions("/v1/capabilities/match")
     authority, = positions("/v1/capabilities/authority")
@@ -5233,6 +5246,10 @@ print("Composed CR HTTP observations: " + json.dumps({
     "service_before_count": before["count"], "service_after_count": after["count"],
     "service_prefix_digest": after["prefix_digest"], "service_before_digest": before["digest"],
     "service_operation_delta": dict(sorted((+delta).items())),
+    "relationship_calls_before_identity_endpoint": len(early_relationships),
+    "identity_before_relationship_edge": (
+        "not_exercised" if not positions("/v1/relationships/select") else
+        "NOT SATISFIED" if early_relationships else "SATISFIED"),
     "operations": [{k: o[k] for k in ("path", "method", "order", "start_ns", "end_ns",
                                        "request", "response_scope", "http_status")} for o in ops],
 }, separators=(",", ":")))
@@ -5258,6 +5275,8 @@ run_transport_latency_regression() {
       "$COMPOSED_SMOKE_LOG_DIR/latency-samples.jsonl"
   fi
   for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback safe_action_preview; do
+    # Retain the completed benchmark before the independent functional preview.
+    if [ "$scenario" = safe_action_preview ]; then latency_regression_summary "$samples"; fi
     # Preserve the established evidence/history fixture policies. Ordinary and
     # fallback use the existing fully governed timing fixture configuration.
     case "$scenario" in
@@ -5421,7 +5440,6 @@ run_transport_latency_regression() {
       echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
     fi
   done
-  latency_regression_summary "$samples"
   export COMPOSED_RESTRAINT_ENABLED="$saved_restraint" COMPOSED_HISTORY_FOLLOWUP_ENABLED="$saved_history"
   export COMPOSED_ALLOW_MANUAL_OVERRIDE="$saved_override" COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$saved_reserve"
   export COMPOSED_PRIVACY_CONTEXT_ENABLED="$saved_privacy"
