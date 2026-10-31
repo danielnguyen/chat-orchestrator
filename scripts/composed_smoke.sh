@@ -5360,7 +5360,7 @@ if len(sys.argv) > 1:
         service, separator, message = line.partition("|")
         if not separator or not service.strip().startswith("runtime"):
             continue
-        candidate = re.fullmatch(r"\s*INFO:\s+\S+\s+-\s+(.*)", message)
+        candidate = re.fullmatch(r"\s*INFO:\s+\S+\s+-\s*(.*)", message)
         if candidate is None:
             continue
         match = re.fullmatch(
