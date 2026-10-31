@@ -26,7 +26,8 @@ _delayed_fixture_calls: dict[str, dict[str, Any]] = {}
 _next_semantic_interpretations: list[dict[str, Any]] = []
 _scene_policy_answers: list[dict[str, str]] = []
 _pending_scene_calls: dict[str, dict[str, Any]] = {}
-_world_state_read_fixture: dict[str, str] = {}
+_world_state_read_fixture: dict[str, Any] | None = None
+_READ_HOLD_SECONDS = 8.0
 _WORLD_STATE_READ_ARGUMENTS = {
     "requested_domains": ["active_project"],
     "entity_id": "fixture-project",
@@ -63,6 +64,18 @@ _EXTERNAL_EVIDENCE_ITEM = re.compile(
 )
 
 
+def _clear_read_fixture(reason: str, fixture: dict[str, Any] | None = None) -> None:
+    global _world_state_read_fixture
+    current = _world_state_read_fixture
+    if current is None or (fixture is not None and current is not fixture):
+        return
+    _world_state_read_fixture = None
+    current["timer"].cancel()
+    current["release"].set()
+    _fixture_event(reason, request_id=current.get("request_id"),
+                   call_ref=current.get("call_ref"))
+
+
 def _fixture_event(event: str, **details: Any) -> dict[str, Any]:
     global _fixture_sequence
     _fixture_sequence += 1
@@ -90,6 +103,9 @@ async def fixture_diagnostics(request_id: str | None = None) -> dict[str, Any]:
         "delayed_calls": list(_delayed_fixture_calls.values())[-64:],
         "events": events,
         "request_calls": [item for item in events if item.get("request_id") == request_id],
+        "read_fixture": ({key: _world_state_read_fixture.get(key)
+                          for key in ("request_id", "call_ref", "armed")}
+                         if _world_state_read_fixture is not None else None),
     }
 
 
@@ -301,6 +317,8 @@ async def chat_completions(
     global _next_primary_delay_ms
     request_id = x_request_id or "unscoped"
     generation = _fixture_generation
+    # Snapshot before any await: an already-started call cannot acquire a new hold.
+    read_fixture = _world_state_read_fixture
     call_ref = f"call_{_fixture_sequence + 1}"
     messages = body.get("messages")
     messages = messages if isinstance(messages, list) else []
@@ -438,6 +456,24 @@ async def chat_completions(
         ),
         "",
     )
+    read_fixture_selected = False
+    if (read_fixture is not None and read_fixture is _world_state_read_fixture
+            and latest_user_text == read_fixture["expected_user_text"]
+            and request_id != "unscoped" and _FIXTURE_IDENTIFIER_RE.fullmatch(request_id)
+            and read_fixture.get("call_ref") is None):
+        # Holding does not select a proposal. The harness must independently
+        # resolve admitted work, then bind both this request ID and this call.
+        read_fixture.update(request_id=request_id, call_ref=call_ref)
+        _fixture_event("read_request_held", request_id=request_id, call_ref=call_ref)
+        try:
+            await read_fixture["release"].wait()
+        except asyncio.CancelledError:
+            _clear_read_fixture("read_cancelled", read_fixture)
+            raise
+        if (read_fixture is not _world_state_read_fixture
+                or generation != _fixture_generation or not read_fixture["armed"]):
+            raise HTTPException(status_code=409, detail="read_fixture_expired_or_reset")
+        read_fixture_selected = True
     prompt_fingerprint = hashlib.sha256(
         json.dumps(normalized_messages, sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
@@ -493,19 +529,15 @@ async def chat_completions(
         )
         _fixture_event("failed_primary", request_id=request_id, call_ref=call_ref,
                        request_generation=generation)
+        if read_fixture_selected:
+            _clear_read_fixture("read_failed_primary", read_fixture)
         raise HTTPException(status_code=503, detail="primary failure fixture")
     governed_candidate = _governed_evidence_candidate(prompt_text)
     answer_source = "derived_fixture"
     tool_calls = []
-    read_fixture_selected = (
-        bool(_world_state_read_fixture)
-        and latest_user_text == _world_state_read_fixture["expected_user_text"]
-        and _FIXTURE_IDENTIFIER_RE.fullmatch(request_id) is not None
-        and request_id != "unscoped"
-    )
     if read_fixture_selected:
         # A one-shot proposal, never authority. No caller-supplied tool or args.
-        _world_state_read_fixture.clear()
+        _clear_read_fixture("read_released", read_fixture)
         answer = "No read capability was exposed. No read was proposed."
         answer_source = "world_state_read"
         if tool_names == ["runtime_world_state_read"] and tool_count == 1:
@@ -617,7 +649,7 @@ async def fixture_reset(body: dict[str, Any] | None = None) -> dict[str, Any]:
     _next_primary_delay_ms = 0
     _next_semantic_interpretations.clear()
     _scene_policy_answers.clear()
-    _world_state_read_fixture.clear()
+    _clear_read_fixture("read_reset")
     request_id = (body or {}).get("request_id")
     if isinstance(request_id, str) and request_id:
         _calls.pop(request_id, None)
@@ -673,8 +705,19 @@ async def fixture_sentinels(body: dict[str, Any]) -> dict[str, Any]:
 
 @app.post("/fixture/next-answer")
 async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
+    global _world_state_read_fixture
     if "world_state_read" in body:
         fixture = body["world_state_read"]
+        if (set(body) == {"world_state_read"} and isinstance(fixture, dict)
+                and set(fixture) == {"request_id", "call_ref"}):
+            current = _world_state_read_fixture
+            if (current is None or current["armed"] or current.get("call_ref") is None
+                    or fixture != {key: current.get(key) for key in fixture}):
+                raise HTTPException(status_code=422, detail="read request binding mismatch")
+            current["armed"] = True
+            _fixture_event("read_request_bound", **fixture)
+            current["release"].set()
+            return {"status": "ok", "bound": True, **fixture}
         if (
             set(body) != {"world_state_read"} or not isinstance(fixture, dict)
             or set(fixture) != {"expected_user_text"}
@@ -683,8 +726,12 @@ async def fixture_next_answer(body: dict[str, Any]) -> dict[str, Any]:
             or _world_state_read_fixture or _next_answers or _scene_policy_answers
         ):
             raise HTTPException(status_code=422, detail="invalid world-state read fixture")
-        _world_state_read_fixture.update(fixture)
-        return {"status": "ok", "queued": 1, "generation": _fixture_generation}
+        current = {**fixture, "release": asyncio.Event(), "armed": False}
+        current["timer"] = asyncio.get_running_loop().call_later(
+            _READ_HOLD_SECONDS, _clear_read_fixture, "read_timeout", current,
+        )
+        _world_state_read_fixture = current
+        return {"status": "ok", "held_only": True, "generation": _fixture_generation}
     if "scene_policies" in body:
         policies = body["scene_policies"]
         if (
@@ -755,56 +802,109 @@ class ProviderFixtureTests(unittest.IsolatedAsyncioTestCase):
     def answer(self, response):
         return response["choices"][0]["message"]["content"]
 
+    def read_body(self, names=("runtime_world_state_read",)):
+        return {"messages": [{"role": "user", "content": "read fixture"}],
+                "tools": [{"function": {"name": name}} for name in names]}
+
+    async def prepare_read(self):
+        await fixture_next_answer({"world_state_read": {"expected_user_text": "read fixture"}})
+
+    async def bind_read(self, request_id="intended"):
+        pending = (await fixture_diagnostics())["read_fixture"]
+        self.assertEqual(pending["request_id"], request_id)
+        return await fixture_next_answer({"world_state_read": {
+            "request_id": request_id, "call_ref": pending["call_ref"],
+        }})
+
     async def test_read_fixture_requires_exact_request_exposure_and_single_consumption(self):
         from services.capabilities import (
             parse_provider_capability_request,
             validate_and_digest_capability_request,
         )
 
-        await fixture_next_answer({"world_state_read": {"expected_user_text": "read fixture"}})
-        body = {"messages": [{"role": "user", "content": "other request"}],
-                "tools": [{"type": "function", "function": {"name": "runtime_world_state_read"}}]}
-        self.assertIsNone(parse_provider_capability_request(await chat_completions(body, "other")))
-        body["messages"][0]["content"] = "read fixture"
-        unscoped = await chat_completions(body, "unscoped")
-        self.assertIsNone(parse_provider_capability_request(unscoped))
-        response = await chat_completions(body, "intended")
-        parsed = parse_provider_capability_request(response)
+        await self.prepare_read()
+        intended = asyncio.create_task(chat_completions(self.read_body(), "intended"))
+        await asyncio.sleep(0)
+        other = await chat_completions(self.read_body(), "other")
+        self.assertIsNone(parse_provider_capability_request(other))
+        pending = dict((await fixture_diagnostics())["read_fixture"])
+        for wrong in ({"request_id": "other", "call_ref": pending["call_ref"]},
+                      {"request_id": "intended", "call_ref": "wrong-call"}):
+            with self.assertRaises(HTTPException):
+                await fixture_next_answer({"world_state_read": wrong})
+            self.assertEqual((await fixture_diagnostics())["read_fixture"], pending)
+        await self.bind_read()
+        parsed = parse_provider_capability_request(await intended)
         result = validate_and_digest_capability_request(
             request=parsed, exposed_capability_ids=["runtime.world_state.read"],
         )
         self.assertEqual(result.normalized_arguments, _WORLD_STATE_READ_ARGUMENTS)
-        self.assertIsNone(parse_provider_capability_request(await chat_completions(body, "again")))
-        observations = (await calls("intended"))["calls"]
-        self.assertEqual([c["read_proposal_count"] for c in observations], [1])
+        self.assertIsNone(parse_provider_capability_request(
+            await chat_completions(self.read_body(), "intended")))
+        self.assertIsNone((await fixture_diagnostics())["read_fixture"])
+        self.assertEqual([c["read_proposal_count"] for c in (await calls("intended"))["calls"]],
+                         [1, 0])
+
+    async def test_read_fixture_ignores_request_started_before_preparation(self):
+        await fixture_delay_next_primary({"delay_ms": 40})
+        old = asyncio.create_task(chat_completions(self.read_body(), "old"))
+        await asyncio.sleep(0)
+        self.assertEqual(len(_delayed_fixture_calls), 1)
+        await self.prepare_read()
+        # Let the older delayed call finish while the new fixture is pending.
+        self.assertNotIn("tool_calls", (await old)["choices"][0]["message"])
+        self.assertIsNone((await fixture_diagnostics())["read_fixture"]["request_id"])
+        intended = asyncio.create_task(chat_completions(self.read_body(), "intended"))
+        await asyncio.sleep(0)
+        await self.bind_read()
+        self.assertIn("tool_calls", (await intended)["choices"][0]["message"])
+        self.assertFalse(_delayed_fixture_calls)
 
     async def test_read_fixture_never_proposes_hidden_or_arbitrary_tools(self):
         for names in ([], ["arbitrary_tool"], ["runtime_world_state_read", "arbitrary_tool"]):
             with self.subTest(names=names):
                 await fixture_reset({})
-                await fixture_next_answer({
-                    "world_state_read": {"expected_user_text": "read fixture"},
-                })
-                response = await chat_completions({
-                    "messages": [{"role": "user", "content": "read fixture"}],
-                    "tools": [{"function": {"name": name}} for name in names],
-                }, "denied")
+                await self.prepare_read()
+                task = asyncio.create_task(chat_completions(self.read_body(names), "intended"))
+                await asyncio.sleep(0)
+                await self.bind_read()
+                response = await task
                 self.assertNotIn("tool_calls", response["choices"][0]["message"])
                 self.assertIn("No read was proposed", self.answer(response))
 
-    async def test_read_fixture_rejects_arguments_and_resets_globally_or_by_request(self):
+    async def test_read_fixture_rejects_arguments_and_cleans_up_every_exit(self):
         for fixture in ({"tool": "arbitrary"}, {"expected_user_text": "read", "arguments": {}},
-                        {"expected_user_text": ""}):
+                        {"expected_user_text": ""}, {"request_id": "unknown", "call_ref": "old"}):
             with self.assertRaises(HTTPException):
                 await fixture_next_answer({"world_state_read": fixture})
-        for reset in ({}, {"request_id": "read"}):
-            await fixture_next_answer({"world_state_read": {"expected_user_text": "read fixture"}})
-            await fixture_reset(reset)
-            response = await chat_completions({
-                "messages": [{"role": "user", "content": "read fixture"}],
-                "tools": [{"function": {"name": "runtime_world_state_read"}}],
-            }, "read")
-            self.assertNotIn("tool_calls", response["choices"][0]["message"])
+        for mode in ("cancel", "global_reset", "scoped_reset", "timeout", "unused_timeout"):
+            with self.subTest(mode=mode), patch(__name__ + "._READ_HOLD_SECONDS", .03):
+                await self.prepare_read()
+                fixture = _world_state_read_fixture
+                task = None
+                if mode != "unused_timeout":
+                    task = asyncio.create_task(chat_completions(self.read_body(), "intended"))
+                    await asyncio.sleep(0)
+                if mode == "cancel":
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                elif mode in {"global_reset", "scoped_reset"}:
+                    await fixture_reset(
+                        {} if mode == "global_reset" else {"request_id": "intended"},
+                    )
+                    with self.assertRaises(HTTPException):
+                        await task
+                elif task is not None:
+                    with self.assertRaises(HTTPException):
+                        await asyncio.wait_for(task, .2)
+                else:
+                    await asyncio.sleep(.05)
+                self.assertIsNone((await fixture_diagnostics())["read_fixture"])
+                self.assertTrue(fixture["timer"].cancelled())
+                self.assertFalse(_delayed_fixture_calls)
+                self.assertFalse([t for t in asyncio.all_tasks()
+                                  if t is not asyncio.current_task() and not t.done()])
 
     async def test_delayed_request_cannot_consume_after_global_or_scoped_reset(self):
         for reset in ({}, {"request_id": "old"}):
