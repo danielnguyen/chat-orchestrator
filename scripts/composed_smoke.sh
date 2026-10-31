@@ -6529,7 +6529,7 @@ async def main():
         "conversation_id": conversation,
         "client_id": "simulated-confirmation-client",
         "surface": "dev",
-        "messages": [{"role": "user", "content": "Restart Jellyfin."}],
+        "messages": [{"role": "user", "content": "Please restart Jellyfin."}],
         "sensitivity": "private",
     }
     if mode == "denied":
@@ -6599,6 +6599,12 @@ async def main():
                 }
             )
         )
+    except BaseException as error:
+        # Bounded fixture diagnostics only: no prompts, bodies or world-state values.
+        print(json.dumps({"fixture_failure": type(error).__name__, "mode": mode,
+                          "operations": operations[:64], "provider_calls": provider_calls[:4],
+                          "effects": effects[:4], "attempts": attempts[:4]}), file=sys.stderr)
+        raise
     finally:
         await runtime.close()
         await memory.close()
