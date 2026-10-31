@@ -5076,6 +5076,158 @@ if not all_within:
 PYTHON
 }
 
+# Shared acceptance for the existing representative HTTP turns. Durable records
+# establish association/publication; only the reconciled passive HTTP observer
+# below establishes predecessor response completion. Neither is a CR compute span.
+assert_composed_turn_parity() {
+  local scenario="$1" payload="$2" response="$3" trace="$4" diagnostics="$5" calls="$6"
+  local owner conversation request work result rows
+  owner="$(jq -er .owner_id <<<"$payload")"
+  conversation="$(jq -er .conversation_id <<<"$response")"
+  request="$(jq -er .request_id <<<"$response")"
+  rows="$(psql_exec -At -v owner="$owner" -v request="$request" <<'SQL'
+SELECT coalesce(json_agg(w), '[]') FROM work_items w
+WHERE owner_id=:'owner' AND request_id=:'request';
+SQL
+)"
+  work="$(jq -er 'if length==1 then .[0].work_id else error("work cardinality") end' <<<"$rows")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  assert_exact_canonical_result "$result"
+  python3 - "$scenario" "$payload" "$response" "$trace" "$diagnostics" "$calls" "$rows" "$result" <<'PYPARITY'
+import json
+import sys
+
+scenario = sys.argv[1]
+payload, response, trace, diagnostics, calls, rows, result = map(json.loads, sys.argv[2:])
+work, = rows
+request = response["request_id"]
+session, turn = diagnostics["runtime_session"], diagnostics["latest_turn"]
+assembly = trace["retrieval"]["prompt_assembly"]
+for key in ("owner_id", "conversation_id", "surface"):
+    assert session[key] == trace[key] == work[key] == payload[key], "parity scope: " + key
+assert work["client_id"] == payload["client_id"]
+assert work["request_id"] == trace["request_id"] == request
+assert work["state"] == result["state"] == "completed" and work["failure_code"] is None
+assert result["result"]["answer"] == response["answer"]
+assert result["result"]["assistant_message_id"] == work["assistant_message_id"]
+assert response["conversation_id"] == payload["conversation_id"]
+assert response.get("pending_action") is None
+assert turn["turn_status"] == "completed" and diagnostics["active_turn"] is None
+assert turn["runtime_session_id"] == session["runtime_session_id"]
+runtime_projection = trace["prompt"] if scenario.startswith("history_") else assembly
+assert runtime_projection["runtime_session"]["runtime_session_id"] == session["runtime_session_id"]
+assert runtime_projection["turn_state"]["runtime_turn_id"] == turn["runtime_turn_id"]
+events = [e for e in diagnostics["events"] if e["runtime_turn_id"] == turn["runtime_turn_id"]]
+assert all(e["runtime_session_id"] == session["runtime_session_id"] for e in events)
+def one(kind):
+    event, = [e for e in events if e["event_type"] == kind]
+    return event["event_payload_json"]
+assert one("turn_started")["request_id"] == one("turn_completed")["request_id"] == request
+assert one("turn_completed")["assistant_message_id"] == work["assistant_message_id"]
+assert not any(e["event_type"] == "confirmation_challenge_evaluated" for e in events)
+for call in calls["calls"]:
+    assert call["request_id"] == request, "foreign provider call"
+    assert not call.get("read_proposal_count", 0), "unexpected action proposal"
+if scenario != "safe_action_preview":
+    assert not any(e["event_type"] in {"action_authority_evaluated", "action_flow_evaluated",
+                                     "action_summary_recorded"} for e in events)
+else:
+    # Authority/flow have no persisted CR events on this legacy branch. Their
+    # actual HTTP requests are checked by the observer, not invented events.
+    summary = one("action_summary_recorded")
+    assert summary["execution_status"] == "not_attempted"
+    assert summary["verification_status"] == "not_required"
+if not scenario.startswith("history_"):
+    assert assembly["capabilities"]["executor_call_count"] == 0
+    assert assembly["capabilities"]["dispatch_completed"] is False
+print("Composed parity association: " + json.dumps({
+    "scenario": scenario, "request_id": request, **{k: session[k] for k in (
+        "owner_id", "conversation_id", "surface", "runtime_session_id")},
+    "runtime_turn_id": turn["runtime_turn_id"], "work_id": work["work_id"],
+    "assistant_message_id": work["assistant_message_id"], "CO": "served_HTTP",
+    "CR": "HTTP", "BMS": "HTTP", "canonical_work_runtime_equal": True,
+    "pending_actions": 0, "executor_calls": 0,
+}, separators=(",", ":")))
+PYPARITY
+  # Challenges are service-owned state, not inferred from a trace or absent event.
+  docker compose -f "$COMPOSE" exec -T runtime python - "$owner" "$conversation" <<'PYCHALLENGES'
+import sqlite3
+import sys
+with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db:
+    assert db.execute("SELECT count(*) FROM capability_confirmation_challenges "
+                      "WHERE owner_id=? AND conversation_id=?", sys.argv[1:]).fetchone()[0] == 0
+PYCHALLENGES
+}
+
+assert_composed_http_predecessors() {
+  local observation="$1" before="$2" after="$3" trace="$4"
+  python3 - "$observation" "$before" "$after" "$trace" <<'PYJOINS'
+import collections
+import json
+import sys
+
+observed, before, after, trace = map(json.loads, sys.argv[1:])
+assert observed["completed"] is True
+assert after["count"] > before["count"] > 0
+assert after["prefix_digest"] == before["digest"], "incomplete CR access logs"
+delta = collections.Counter(after["operations"])
+delta.subtract(before["operations"])
+assert all(n >= 0 for n in delta.values()), "regressed CR access logs"
+delta.pop("GET /healthz 200", None)
+ops = observed["operations"]
+assert +delta == collections.Counter(f'{o["method"]} {o["path"]} {o["http_status"]}' for o in ops)
+assert [o["order"] for o in ops] == list(range(len(ops))) and ops
+assembly = trace["retrieval"]["prompt_assembly"]
+runtime_projection = trace["prompt"] if trace["retrieval"]["status"] == "not_requested" else assembly
+scope = {"owner_id": trace["owner_id"], "conversation_id": trace["conversation_id"],
+         "surface": trace["surface"],
+         "runtime_session_id": runtime_projection["runtime_session"]["runtime_session_id"],
+         "runtime_turn_id": runtime_projection["turn_state"]["runtime_turn_id"]}
+for op in ops:
+    assert op["http_status"] == 200
+    assert type(op["start_ns"]) is int and type(op["end_ns"]) is int
+    assert 0 <= op["start_ns"] <= op["end_ns"]
+    for body in (op["request"], op["response_scope"]):
+        for key, value in scope.items():
+            assert key not in body or body[key] == value, "contradictory HTTP scope"
+    assert op["request"]["request_id"].split(":", 1)[0] == trace["request_id"]
+for predecessor, consumer in zip(ops, ops[1:]):
+    assert predecessor["end_ns"] <= consumer["start_ns"], "CR response not complete before successor"
+assert ops[0]["path"] == "/v1/runtime/threads/resolve"
+assert sum(o["path"] == "/v1/runtime/turns/start" for o in ops) == 1
+assert sum(o["path"] == "/v1/runtime/turns/complete" for o in ops) == 1
+assert not any(o["path"] == "/v1/capabilities/confirm" for o in ops)
+def positions(path):
+    return [i for i, o in enumerate(ops) if o["path"] == path]
+start, = positions("/v1/runtime/turns/start")
+complete, = positions("/v1/runtime/turns/complete")
+governance = positions("/v1/runtime/interaction-governance/evaluate")
+assert governance and start < governance[0] <= governance[-1] < complete
+identity = positions("/v1/runtime/identity/resolve")
+for path in ("/v1/world-state/resolve", "/v1/relationships/select"):
+    for consumer in positions(path):
+        assert len(identity) == 1 and governance[0] < identity[0] < consumer < complete
+if positions("/v1/capabilities/match"):
+    match, = positions("/v1/capabilities/match")
+    authority, = positions("/v1/capabilities/authority")
+    flow, = positions("/v1/capabilities/flow")
+    summary, = positions("/v1/capabilities/action-summary")
+    timing, = positions("/v1/runtime/timing/evaluate")
+    assert identity[0] < match < timing < authority < flow < summary < complete
+print("Composed CR predecessor joins: reconciled=true clock=observer_monotonic_ns "
+      "boundary=CR_HTTP_request_body_received_response_body_observed server_compute_spans=false")
+print("Composed CR HTTP observations: " + json.dumps({
+    "request_id": trace["request_id"], "scope": scope,
+    "service_before_count": before["count"], "service_after_count": after["count"],
+    "service_prefix_digest": after["prefix_digest"], "service_before_digest": before["digest"],
+    "service_operation_delta": dict(sorted((+delta).items())),
+    "operations": [{k: o[k] for k in ("path", "method", "order", "start_ns", "end_ns",
+                                       "request", "response_scope", "http_status")} for o in ops],
+}, separators=(",", ":")))
+PYJOINS
+}
+
 run_transport_latency_regression() {
   local scenario index owner client conversation payload question response request answer trace calls diagnostics
   local turn expected_calls expected_timing claims measured recognizer samples expected_users
@@ -5084,6 +5236,9 @@ run_transport_latency_regression() {
   local saved_override="${COMPOSED_ALLOW_MANUAL_OVERRIDE:-false}"
   local saved_reserve="${COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE:-2048}"
   local saved_privacy="${COMPOSED_PRIVACY_CONTEXT_ENABLED:-false}"
+  local saved_registry="${COMPOSED_CAPABILITY_REGISTRY_ENABLED:-false}"
+  local saved_containment="${COMPOSED_PERSONA_CONTAINMENT_ENABLED:-false}"
+  local surface count observation observer_pid service_before service_after
   samples="$COMPOSED_SMOKE_TMP/current-latency-samples.jsonl"
   : > "$samples"
   if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
@@ -5091,20 +5246,28 @@ run_transport_latency_regression() {
     rm -f "$COMPOSED_SMOKE_LOG_DIR/latency-regression.json" \
       "$COMPOSED_SMOKE_LOG_DIR/latency-samples.jsonl"
   fi
-  for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback; do
+  for scenario in ordinary_text evidence_governed history_deterministic history_classified provider_fallback safe_action_preview; do
     # Preserve the established evidence/history fixture policies. Ordinary and
     # fallback use the existing fully governed timing fixture configuration.
     case "$scenario" in
-      ordinary_text|provider_fallback) export COMPOSED_RESTRAINT_ENABLED=true ;;
+      ordinary_text|provider_fallback|safe_action_preview) export COMPOSED_RESTRAINT_ENABLED=true ;;
       *) export COMPOSED_RESTRAINT_ENABLED=false ;;
     esac
+    export COMPOSED_CAPABILITY_REGISTRY_ENABLED=false
+    if [ "$scenario" = safe_action_preview ]; then
+      export COMPOSED_CAPABILITY_REGISTRY_ENABLED=true COMPOSED_PERSONA_CONTAINMENT_ENABLED=true
+    fi
     case "$scenario" in
       history_*) restart_orchestrator_with_history_followup true ;;
       *) restart_orchestrator_with_history_followup false ;;
     esac
-    for index in $(seq 1 12); do
+    count=12; surface=chat
+    # One functional representative only; preserve all five benchmark families,
+    # warmups, fifty samples, percentile calculations and budgets unchanged.
+    if [ "$scenario" = safe_action_preview ]; then count=1; surface=dev; fi
+    for index in $(seq 1 "$count"); do
       owner="owner-latency-$scenario-$index"; client="client-latency-$scenario-$index"
-      configure_surface_permission "$owner" chat true true false
+      configure_surface_permission "$owner" "$surface" true true false
       conversation="$(create_conversation "$owner" "$client")"
       question="What is 2+2?"; expected_calls=1; expected_timing=1; claims=0
       if [[ "$scenario" == history_* ]]; then
@@ -5128,11 +5291,14 @@ run_transport_latency_regression() {
         provider_fallback)
           provider_post /fixture/fail-next-primary '{}'
           queue_provider_answer '4.'; expected_calls=2 ;;
+        safe_action_preview)
+          question="What would happen if you run a service health check?"
+          queue_provider_answer 'I ran the service health check.' ;;
         *) queue_provider_answer '4.' ;;
       esac
       payload="$(jq -nc --arg owner "$owner" --arg client "$client" --arg conversation "$conversation" \
-        --arg question "$question" --arg scenario "$scenario" '
-        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",sensitivity:"private",
+        --arg question "$question" --arg scenario "$scenario" --arg surface "$surface" '
+        {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,sensitivity:"private",
          messages:[{role:"user",content:$question}]}
         + if $scenario=="evidence_governed" then
           {external_context_enabled:true,external_context:{enabled:true,source_ids:["records_primary"],
@@ -5140,10 +5306,30 @@ run_transport_latency_regression() {
           else {} end')"
       echo "Latency regression progress: scenario=$scenario turn=$index of=12"
       measured=false; [ "$index" -le 2 ] || measured=true
+      if [ "$index" = 1 ]; then
+        service_before="$(strict_information_http_counts '{}' | jq -ce .runtime_access)"
+        observation="$COMPOSED_SMOKE_TMP/parity-$scenario.jsonl"
+        world_state_read_observer "$owner" "$conversation" >"$observation" &
+        observer_pid=$!
+        for _ in $(seq 1 100); do
+          if head -1 "$observation" | jq -e '.ready==true' >/dev/null 2>&1; then break; fi
+          kill -0 "$observer_pid"
+          sleep .1
+        done
+        head -1 "$observation" | jq -e '.ready==true' >/dev/null
+      fi
       response="$(latency_measure_chat "$payload" "$scenario" "$measured" "$samples" "$((index - 2))")"
+      if [ "$index" = 1 ]; then
+        wait "$observer_pid"
+        curl -fsS --max-time 2 http://127.0.0.1:14371/healthz >/dev/null
+        service_after="$(strict_information_http_counts "$service_before" | jq -ce .runtime_access)"
+      fi
       request="$(jq -er .request_id <<<"$response")"; answer="$(jq -er .answer <<<"$response")"
       trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
       diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+      if [ "$index" = 1 ]; then
+        assert_composed_http_predecessors "$(tail -1 "$observation")" "$service_before" "$service_after" "$trace"
+      fi
       jq -e --argjson expected "$expected_calls" \
         '([.calls[]|select(.kind=="chat")]|length)==$expected' <<<"$calls" >/dev/null
       case "$scenario" in
@@ -5159,6 +5345,7 @@ run_transport_latency_regression() {
               and .prompt.provider_fallback_context.regression_budget_class=="provider_fallback"
               and .prompt.provider_fallback_context.timing_reevaluated==false' <<<"$trace" >/dev/null
             jq -e '[.calls[]|select(.kind=="chat")]|.[0].status=="failed" and .[1].status=="ok"' <<<"$calls" >/dev/null
+            jq -e '[.calls[]|select(.kind=="chat")]|.[0].prompt_fingerprint==.[1].prompt_fingerprint' <<<"$calls" >/dev/null
           else
             jq -e '.status=="ok"' <<<"$response" >/dev/null
             jq -e '.fallback.triggered==false' <<<"$trace" >/dev/null
@@ -5175,7 +5362,18 @@ run_transport_latency_regression() {
               and .sufficiency.status=="sufficient_for_declared_scope"
               and .next_steps.selections[0].selected_next_step=="answer_within_declared_scope")' <<<"$trace" >/dev/null
           assert_dsa_operation_counts "$(fetch_dsa_audit)" 1 0 0
-          assert_evidence_runtime_events "$diagnostics" "$request" 1 1 1 1 ;;
+          assert_evidence_runtime_events "$diagnostics" "$request" 1 1 1 1
+          if [ "$index" = 1 ]; then assert_targeted_dependency_timings "$request"; fi ;;
+        safe_action_preview)
+          jq -e '.status=="ok" and .pending_action==null and
+            .answer=="Preview: Would evaluate Run service health check as a read_only capability. Registry note: Reads local service health status without changing state. The registry marks it as reversible. No action was taken. Verification would be available after execution."' <<<"$response" >/dev/null
+          jq -e '.fallback.triggered==false and
+            .retrieval.prompt_assembly.runtime_timing.result.latency_budget_class=="safe_action_preview" and
+            (.retrieval.prompt_assembly.capability_registry |
+              .match.matched_capability_id=="service_health_check" and .authority.allowed==true and
+              .action_flow.dry_run_required==true and .action_flow.execution_allowed==false and
+              .action_flow.confirmation_required==false) and
+            .retrieval.prompt_assembly.capabilities.action_summary.status=="included"' <<<"$trace" >/dev/null ;;
         history_*)
           assert_pure_history_case "$owner" "$conversation" "$response" "$question" \
             "$recognizer" support_explanation support "$expected_calls"
@@ -5189,6 +5387,8 @@ run_transport_latency_regression() {
           and ([$events[]|select(.event_type=="timing_evaluated")]|length)==$timing
           and ([$events[]|select(.event_type=="action_authority_evaluated" or .event_type=="action_flow_evaluated")]|length)==0
       ' <<<"$diagnostics" >/dev/null
+      assert_composed_turn_parity "$scenario" "$payload" "$response" "$trace" "$diagnostics" "$calls"
+      if [ "$scenario" != evidence_governed ]; then assert_dsa_operation_counts "$(fetch_dsa_audit)" 0 0 0; fi
       assert_persisted_answer_matches "$conversation" "$request" "$answer"
       assert_request_persistence_counts "$conversation" "$request" "$claims"
       expected_users=1; [[ "$scenario" != history_* ]] || expected_users=2
@@ -5204,12 +5404,17 @@ run_transport_latency_regression() {
         ' <<<"$trace"
       fi
     done
-    echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
+    if [ "$scenario" = safe_action_preview ]; then
+      echo "Composed safe_action_preview: functional_turns=1 benchmark=false parity=true effects=0 persisted_equal=true completed=true idle=true"
+    else
+      echo "Latency behavior $scenario: warmups=2 measured=10 parity=true actions=0 persisted_equal=true completed=true idle=true"
+    fi
   done
   latency_regression_summary "$samples"
   export COMPOSED_RESTRAINT_ENABLED="$saved_restraint" COMPOSED_HISTORY_FOLLOWUP_ENABLED="$saved_history"
   export COMPOSED_ALLOW_MANUAL_OVERRIDE="$saved_override" COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$saved_reserve"
   export COMPOSED_PRIVACY_CONTEXT_ENABLED="$saved_privacy"
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED="$saved_registry" COMPOSED_PERSONA_CONTAINMENT_ENABLED="$saved_containment"
   docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
   wait_for_http "http://127.0.0.1:14361/healthz"
   provider_post /fixture/reset '{}'
@@ -5963,6 +6168,7 @@ while not finished and time.monotonic() < deadline:
                               "capability_id", "requested_domains", "argument_digest",
                               "persona_selection_mode", "stage")
                 observation = {"path": path, "method": lines[0].split()[0], "order": len(observations),
+                               "start_ns": time.monotonic_ns(),
                                "association": "owner_conversation" if explicit else "session",
                                "request": {k: scope[k] for k in scope_keys if k in scope}}
                 if path == "/v1/capabilities/exposure-batch":
@@ -5975,6 +6181,7 @@ while not finished and time.monotonic() < deadline:
             if observation is None:
                 continue
             observation["http_status"] = int(lines[0].split()[1])
+            observation["end_ns"] = time.monotonic_ns()
             response_scope = (payload["binding"] if observation["path"] ==
                               "/v1/runtime/surface-presence/publish" else payload)
             observation["response_scope"] = {
