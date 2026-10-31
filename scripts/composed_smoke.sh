@@ -6070,7 +6070,7 @@ run_world_state_read_case() (
   before="$(world_state_read_records "$owner" "$conversation" '')"
   provider_post /fixture/reset '{}'
   # Preparation only holds a matching call; it cannot produce a proposal until
-  # current-work supplies the server-owned request ID and that held call is bound.
+  # admitted BMS work supplies the server-owned request ID and that call is bound.
   provider_post /fixture/next-answer "$(jq -nc --arg text "$text" '{world_state_read:{expected_user_text:$text}}')"
   service_before="$(strict_information_http_counts '{}' | jq -ce .runtime_access)"
   world_state_read_observer "$owner" "$conversation" >"$observation" &
@@ -6089,7 +6089,13 @@ run_world_state_read_case() (
   trap 'provider_post /fixture/reset "{}"; kill "$chat_pid" "$observer_pid" 2>/dev/null || true; wait "$chat_pid" "$observer_pid" 2>/dev/null || true' EXIT
   bound_request=''
   for _ in $(seq 1 50); do
-    current="$(co_current_work "$owner" world-read-client 2)"
+    # Synchronous executable turns do not publish a deferred current-work locator.
+    # Read their existing admitted work directly, without changing that lifecycle.
+    current="$(psql_exec -At -c "SELECT json_build_object('status','resolved','work',
+      (SELECT json_build_object('work_id',work_id,'request_id',request_id,
+        'conversation_id',conversation_id,'state',state) FROM work_items
+        WHERE owner_id='$owner' AND conversation_id='$conversation'
+          AND client_id='world-read-client' AND surface='$surface'));")"
     diagnostics="$(curl -fsS --max-time 2 http://127.0.0.1:14381/fixture/diagnostics)"
     if jq -e --arg conversation "$conversation" '.status=="resolved" and
         .work.conversation_id==$conversation and .work.state=="running"' <<<"$current" >/dev/null; then
@@ -6103,6 +6109,8 @@ run_world_state_read_case() (
     kill -0 "$chat_pid"
     sleep .1
   done
+  jq -nc --argjson work "$current" --argjson provider "$diagnostics" \
+    '{admitted_work:$work.work,held_provider_call:$provider.read_fixture}'
   test -n "${call_ref:-}"
   provider_post /fixture/next-answer "$(jq -nc --arg request "$bound_request" --arg call "$call_ref" \
     '{world_state_read:{request_id:$request,call_ref:$call}}')"
