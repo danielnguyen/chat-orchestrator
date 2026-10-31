@@ -5878,6 +5878,7 @@ known_sessions = set()
 packet_count = 0
 http_requests = 0
 finished = False
+turn_completed = False
 print('{"ready":true}', flush=True)
 deadline = time.monotonic() + 45
 while not finished and time.monotonic() < deadline:
@@ -5945,7 +5946,7 @@ while not finished and time.monotonic() < deadline:
                 scope_keys = ("request_id", "owner_id", "conversation_id", "surface",
                               "runtime_session_id", "runtime_turn_id", "active_persona_id",
                               "capability_id", "requested_domains", "argument_digest",
-                              "persona_selection_mode")
+                              "persona_selection_mode", "stage")
                 observation = {"path": path, "method": lines[0].split()[0], "order": len(observations),
                                "association": "owner_conversation" if explicit else "session",
                                "request": {k: scope[k] for k in scope_keys if k in scope}}
@@ -5959,9 +5960,12 @@ while not finished and time.monotonic() < deadline:
             if observation is None:
                 continue
             observation["http_status"] = int(lines[0].split()[1])
+            response_scope = (payload["binding"] if observation["path"] ==
+                              "/v1/runtime/surface-presence/publish" else payload)
             observation["response_scope"] = {
-                k: payload[k] for k in ("request_id", "owner_id", "conversation_id", "surface",
-                                       "runtime_session_id", "runtime_turn_id") if k in payload}
+                k: response_scope[k] for k in ("request_id", "owner_id", "conversation_id", "surface",
+                                              "runtime_session_id", "runtime_turn_id", "stage")
+                if k in response_scope}
             path = observation["path"]
             if path == "/v1/world-state/resolve":
                 claims = payload["included_claims"]
@@ -5984,6 +5988,9 @@ while not finished and time.monotonic() < deadline:
                 else:
                     observation["result"] = payload["result"]
             if path == "/v1/runtime/turns/complete":
+                turn_completed = True
+            if path == "/v1/runtime/surface-presence/publish":
+                assert turn_completed, "terminal presence preceded turn completion"
                 finished = True
 print(json.dumps({"operations": observations, "completed": finished,
                   "packets": packet_count, "http_requests": http_requests}), flush=True)
@@ -6178,6 +6185,7 @@ allowed_paths = {
     "/v1/runtime/restraint/evaluate", "/v1/runtime/presence/evaluate",
     "/v1/runtime/situated-presence/evaluate", "/v1/runtime/identity/resolve",
     "/v1/runtime/timing/evaluate", "/v1/runtime/overlay", "/v1/world-state/resolve",
+    "/v1/runtime/surface-presence/publish",
     "/v1/capabilities/match", "/v1/capabilities/authority", "/v1/capabilities/flow",
     "/v1/capabilities/exposure-batch", "/v1/capabilities/authorize",
     "/v1/capabilities/action-summary",
@@ -6219,6 +6227,8 @@ for operation in operations:
             assert operation["response_scope"][key] == value, "contradictory response " + key
     if "request_id" in operation["response_scope"]:
         assert operation["response_scope"]["request_id"] == body["request_id"], "mismatched response request"
+    if operation["path"] == "/v1/runtime/surface-presence/publish":
+        assert body["stage"] == operation["response_scope"]["stage"] == "terminal"
     if "capability_id" in body:
         assert body["capability_id"] == "runtime.world_state.read", "wrong dispatch capability"
     if "capability_id" in operation.get("result", {}):
