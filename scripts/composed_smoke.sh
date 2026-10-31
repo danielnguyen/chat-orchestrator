@@ -119,6 +119,7 @@ cleanup() {
       >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
     docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
       | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
+      | sed -E 's#"(GET|POST|PUT) /[^"]* HTTP/#"\1 /{redacted} HTTP/#g' \
       >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
   fi
   docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || status=1
@@ -5338,7 +5339,7 @@ PYCODE
 # leave this helper. In particular the read executor would call world-state.
 strict_information_http_counts() {
   docker compose -f "$COMPOSE" logs --no-color runtime bms | python3 -c '
-import json, re, sys
+import collections, hashlib, json, re, sys
 paths = ["/v1/runtime/identity/resolve", "/v1/runtime/persona-containment/evaluate",
          "/v1/capabilities/match", "/v1/capabilities/discover",
          "/v1/world-state/resolve", "/v1/relationships/select",
@@ -5351,7 +5352,31 @@ counts = {p: len(re.findall(r"\"POST " + re.escape(p) + r" HTTP/", text)) for p 
 counts["protected_memory_retrieval"] = len(re.findall(r"\"POST /v2/conversations/[^ /]+/retrieve HTTP/", text))
 counts["identity_conflicts"] = len(re.findall(r"\"POST /v1/runtime/identity/resolve HTTP/[^\"]+\" 409", text))
 counts["world_state_conflicts"] = len(re.findall(r"\"POST /v1/world-state/resolve HTTP/[^\"]+\" 409", text))
-print(json.dumps(counts))'
+if len(sys.argv) > 1:
+    # CR owns these completed-request access records. Preserve a prefix digest
+    # so missing/rotated logs cannot masquerade as a valid before/after delta.
+    access = []
+    for line in text.splitlines():
+        service, separator, message = line.partition("|")
+        if not separator or not service.strip().startswith("runtime"):
+            continue
+        candidate = re.fullmatch(r"\s*INFO:\s+\S+\s+-\s*(.*)", message)
+        if candidate is None:
+            continue
+        match = re.fullmatch(
+            r"\"([A-Z]+) ([^ \"\x00-\x20]+) HTTP/[0-9]\.[0-9]\" ([1-5][0-9]{2})(?: [^\r\n]*)?",
+            candidate[1])
+        assert match is not None, "incomplete or malformed CR access log"
+        access.append(" ".join(match.groups()))
+    assert access, "missing CR service access logs"
+    digest = lambda rows: hashlib.sha256(json.dumps(rows).encode()).hexdigest()
+    baseline = json.loads(sys.argv[1])
+    counts["runtime_access"] = {
+        "count": len(access), "digest": digest(access),
+        "prefix_digest": digest(access[:baseline.get("count", 0)]),
+        "operations": dict(collections.Counter(access)),
+    }
+print(json.dumps(counts))' "${@}"
 }
 
 strict_information_binding_fixture() {
@@ -5832,6 +5857,566 @@ with sqlite3.connect('/data/runtime_state.sqlite3') as db:
         print('{"fixture_restored":true}')
 PYCODE
 }
+
+# Supplemental attribution at the existing CR HTTP boundary, never execution
+# counting authority. Every operation must reconcile with CR-owned access logs;
+# incomplete capture fails qualification. Raw claims/prompts stay in this process.
+world_state_read_observer() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" <<'PYOBSERVE'
+import collections
+import json
+import socket
+import struct
+import sys
+import time
+
+owner, conversation = sys.argv[1:]
+# ETH_P_ALL receives both inbound requests and outbound service responses.
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+sock.bind(("eth0", 0))
+sock.settimeout(.2)
+streams = {}
+queues = collections.defaultdict(collections.deque)
+observations = []
+known_sessions = set()
+packet_count = 0
+http_requests = 0
+finished = False
+turn_completed = False
+print('{"ready":true}', flush=True)
+deadline = time.monotonic() + 45
+while not finished and time.monotonic() < deadline:
+    try:
+        packet = sock.recv(262144)
+        packet_count += 1
+    except socket.timeout:
+        continue
+    if packet[12:14] != b"\x08\x00":
+        continue
+    ip = packet[14:]
+    if len(ip) < 40 or ip[9] != 6:
+        continue
+    ihl = (ip[0] & 15) * 4
+    tcp = ip[ihl:struct.unpack("!H", ip[2:4])[0]]
+    source, destination, sequence = struct.unpack("!HHI", tcp[:8])
+    if 8000 not in (source, destination):
+        continue
+    data = tcp[(tcp[12] >> 4) * 4:]
+    if not data:
+        continue
+    incoming = destination == 8000
+    connection = ((ip[12:16], source, ip[16:20], destination) if incoming
+                  else (ip[16:20], destination, ip[12:16], source))
+    key = (connection, incoming)
+    if key not in streams:
+        if not data.startswith((b"POST ", b"GET ", b"HTTP/")):
+            continue
+        streams[key] = [sequence, b""]
+    stream = streams[key]
+    if sequence < stream[0]:
+        data = data[stream[0] - sequence:]
+    elif sequence > stream[0]:
+        raise AssertionError("observer TCP gap; execution evidence unavailable")
+    stream[0] += len(data)
+    stream[1] += data
+    assert len(stream[1]) < 2_000_000, "observer response bound"
+    while b"\r\n\r\n" in stream[1]:
+        headers, body = stream[1].split(b"\r\n\r\n", 1)
+        lines = headers.decode("latin1").split("\r\n")
+        fields = dict(line.lower().split(": ", 1) for line in lines[1:] if ": " in line)
+        assert "transfer-encoding" not in fields, "observer needs content-length framing"
+        size = int(fields.get("content-length", 0))
+        if len(body) < size:
+            break
+        stream[1] = body[size:]
+        payload = json.loads(body[:size]) if size else {}
+        if incoming:
+            http_requests += 1
+            path = lines[0].split()[1]
+            scope = (payload["candidates"][0] if path == "/v1/capabilities/exposure-batch"
+                     else payload)
+            explicit = scope.get("owner_id") == owner and scope.get("conversation_id") == conversation
+            selected = (explicit or scope.get("runtime_session_id") in known_sessions
+                        or scope.get("owner_id") == owner
+                        or scope.get("conversation_id") == conversation)
+            if explicit and scope.get("runtime_session_id"):
+                known_sessions.add(scope["runtime_session_id"])
+            observation = None
+            if selected:
+                for candidate in (payload["candidates"] if path.endswith("exposure-batch") else [scope]):
+                    for key, value in (("owner_id", owner), ("conversation_id", conversation)):
+                        assert key not in candidate or candidate[key] == value, "contradictory " + key
+                assert len(observations) < 128, "observer operation bound"
+                scope_keys = ("request_id", "owner_id", "conversation_id", "surface",
+                              "runtime_session_id", "runtime_turn_id", "active_persona_id",
+                              "capability_id", "requested_domains", "argument_digest",
+                              "persona_selection_mode", "stage")
+                observation = {"path": path, "method": lines[0].split()[0], "order": len(observations),
+                               "association": "owner_conversation" if explicit else "session",
+                               "request": {k: scope[k] for k in scope_keys if k in scope}}
+                if path == "/v1/capabilities/exposure-batch":
+                    observation["candidate_ids"] = [c["capability_id"] for c in payload["candidates"]]
+                observations.append(observation)
+            queues[connection].append(observation)
+        else:
+            assert queues[connection], "observer missed request"
+            observation = queues[connection].popleft()
+            if observation is None:
+                continue
+            observation["http_status"] = int(lines[0].split()[1])
+            response_scope = (payload["binding"] if observation["path"] ==
+                              "/v1/runtime/surface-presence/publish" else payload)
+            observation["response_scope"] = {
+                k: response_scope[k] for k in ("request_id", "owner_id", "conversation_id", "surface",
+                                              "runtime_session_id", "runtime_turn_id", "stage")
+                if k in response_scope}
+            path = observation["path"]
+            if path == "/v1/world-state/resolve":
+                claims = payload["included_claims"]
+                observation["read"] = {
+                    "selection_contract": payload["selection_contract"],
+                    "included_claim_count": len(claims),
+                    "trace": payload["trace"],
+                    "matching_fixture_claims": sum(
+                        c["entity_id"] == "fixture-project" and c["attribute"] == "state"
+                        and c["value_json"] == "WORLD_FIXTURE_project" for c in claims),
+                    "restricted_values_absent": all(
+                        sentinel not in json.dumps(payload) for sentinel in (
+                            "WORLD_FIXTURE_secret", "WORLD_FIXTURE_expired", "WORLD_FIXTURE_health",
+                            "WORLD_FIXTURE_conflict_a", "WORLD_FIXTURE_conflict_b")),
+                }
+            elif path.startswith("/v1/capabilities/"):
+                if path.endswith("exposure-batch"):
+                    observation["decisions"] = [d["authorization"]["result"]
+                                                for d in payload["decisions"]]
+                else:
+                    observation["result"] = payload["result"]
+            if path == "/v1/runtime/turns/complete":
+                turn_completed = True
+            if path == "/v1/runtime/surface-presence/publish":
+                assert turn_completed, "terminal presence preceded turn completion"
+                finished = True
+print(json.dumps({"operations": observations, "completed": finished,
+                  "packets": packet_count, "http_requests": http_requests}), flush=True)
+assert finished, "observer did not see completed request"
+assert all(o.get("http_status") == 200 for o in observations), "CR operation failed"
+PYOBSERVE
+}
+
+# Actual durable CR authority and immutable source rows, independently of CO.
+world_state_read_records() {
+  docker compose -f "$COMPOSE" exec -T runtime python - "$1" "$2" "$3" <<'PYRECORDS'
+import hashlib
+import json
+import sqlite3
+import sys
+
+owner, conversation, request = sys.argv[1:]
+with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db:
+    db.row_factory = sqlite3.Row
+    claims = [dict(r) for r in db.execute(
+        "SELECT * FROM runtime_world_state_claims WHERE owner_id=? ORDER BY world_state_claim_id",
+        (owner,))]
+    report = {"claims_digest": hashlib.sha256(json.dumps(claims, sort_keys=True).encode()).hexdigest(),
+              "claim_count": len(claims)}
+    if request:
+        sessions = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_sessions WHERE owner_id=? AND conversation_id=?",
+            (owner, conversation))]
+        assert len(sessions) == 1
+        session = sessions[0]
+        turns = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_turns WHERE runtime_session_id=?",
+            (session["runtime_session_id"],))]
+        assert len(turns) == 1 and turns[0]["turn_status"] == "completed"
+        turn = turns[0]
+        events = [dict(r) for r in db.execute(
+            "SELECT * FROM conversation_runtime_events WHERE runtime_turn_id=? ORDER BY id",
+            (turn["runtime_turn_id"],))]
+        for event in events:
+            event["event_payload_json"] = json.loads(event["event_payload_json"])
+        assert all(e["runtime_session_id"] == session["runtime_session_id"] for e in events)
+        assert turn["runtime_session_id"] == session["runtime_session_id"]
+        for event in events:
+            assert event["runtime_turn_id"] == turn["runtime_turn_id"]
+            payload = event["event_payload_json"]
+            for key, value in (("owner_id", owner), ("conversation_id", conversation),
+                               ("runtime_session_id", session["runtime_session_id"]),
+                               ("runtime_turn_id", turn["runtime_turn_id"])):
+                assert key not in payload or payload[key] == value, "contradictory CR " + key
+            if "request_id" in payload:
+                assert payload["request_id"] in {
+                    request, request + ":action-summary",
+                    request + ":runtime.world_state.read:selection",
+                    request + ":runtime.world_state.read:dispatch",
+                }, "unexpected CR event request"
+        def items(kind):
+            return [e for e in events if e["event_type"] == kind]
+        for kind in ("turn_started", "interaction_governance_evaluated", "turn_completed"):
+            event, = items(kind)
+            assert event["event_payload_json"]["request_id"] == request
+        assert not items("confirmation_challenge_evaluated")
+        assert db.execute("SELECT count(*) FROM capability_confirmation_challenges "
+                          "WHERE owner_id=? AND conversation_id=?", (owner, conversation)).fetchone()[0] == 0
+        thread = db.execute("SELECT * FROM conversation_runtime_threads WHERE owner_id=? "
+                            "AND conversation_id=?", (owner, conversation)).fetchone()
+        assert thread["state"] == "idle" and thread["active_runtime_turn_id"] is None
+        report.update(session=session, turn=turn, events=events, challenges=0)
+print(json.dumps(report))
+PYRECORDS
+}
+
+run_world_state_read_case() (
+  set -Eeuo pipefail
+  local tag="$1" surface="$2" expected="$3" persona="$4"
+  trap 'echo "World-state read assertion failed: case=$tag line=$LINENO" >&2' ERR
+  local owner="world-read-$tag-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  local conversation fixture before after response request trace calls records work result observer_pid chat_pid
+  local service_before service_after current diagnostics call_ref bound_request
+  local text="Show runtime world state for this conversation ($owner)."
+  local observation="$COMPOSED_SMOKE_TMP/world-read-$tag.jsonl"
+  conversation="$(create_conversation "$owner" world-read-client)"
+  configure_surface_permission "$owner" "$surface" true true false
+  fixture="$(strict_world_state_seed "$owner" "$conversation")"
+  before="$(world_state_read_records "$owner" "$conversation" '')"
+  provider_post /fixture/reset '{}'
+  # Preparation only holds a matching call; it cannot produce a proposal until
+  # admitted BMS work supplies the server-owned request ID and that call is bound.
+  provider_post /fixture/next-answer "$(jq -nc --arg text "$text" '{world_state_read:{expected_user_text:$text}}')"
+  service_before="$(strict_information_http_counts '{}' | jq -ce .runtime_access)"
+  world_state_read_observer "$owner" "$conversation" >"$observation" &
+  observer_pid=$!
+  for _ in $(seq 1 100); do
+    if head -1 "$observation" | jq -e '.ready==true' >/dev/null 2>&1; then break; fi
+    kill -0 "$observer_pid"
+    sleep .1
+  done
+  head -1 "$observation" | jq -e '.ready==true' >/dev/null
+  co_post "$(jq -nc --arg owner "$owner" --arg conversation "$conversation" \
+    --arg surface "$surface" --arg text "$text" '{owner_id:$owner,client_id:"world-read-client",
+      conversation_id:$conversation,surface:$surface,messages:[{role:"user",content:$text}],sensitivity:"private"}')" \
+    >"$COMPOSED_SMOKE_TMP/world-read-$tag-response.json" &
+  chat_pid=$!
+  trap 'provider_post /fixture/reset "{}"; kill "$chat_pid" "$observer_pid" 2>/dev/null || true; wait "$chat_pid" "$observer_pid" 2>/dev/null || true' EXIT
+  bound_request=''
+  for _ in $(seq 1 50); do
+    # Synchronous executable turns do not publish a deferred current-work locator.
+    # Read their existing admitted work directly, without changing that lifecycle.
+    current="$(psql_exec -At -c "SELECT json_build_object('status','resolved','work',
+      (SELECT json_build_object('work_id',work_id,'request_id',request_id,
+        'conversation_id',conversation_id,'state',state) FROM work_items
+        WHERE owner_id='$owner' AND conversation_id='$conversation'
+          AND client_id='world-read-client' AND surface='$surface'));")"
+    diagnostics="$(curl -fsS --max-time 2 http://127.0.0.1:14381/fixture/diagnostics)"
+    if jq -e --arg conversation "$conversation" '.status=="resolved" and
+        .work.conversation_id==$conversation and .work.state=="running"' <<<"$current" >/dev/null; then
+      bound_request="$(jq -er .work.request_id <<<"$current")"
+      if jq -e --arg request "$bound_request" '.read_fixture.request_id==$request and
+          .read_fixture.armed==false and (.read_fixture.call_ref|type)=="string"' <<<"$diagnostics" >/dev/null; then
+        call_ref="$(jq -er .read_fixture.call_ref <<<"$diagnostics")"
+        break
+      fi
+    fi
+    kill -0 "$chat_pid"
+    sleep .1
+  done
+  jq -nc --argjson work "$current" --argjson provider "$diagnostics" \
+    '{admitted_work:$work.work,held_provider_call:$provider.read_fixture}'
+  test -n "${call_ref:-}"
+  provider_post /fixture/next-answer "$(jq -nc --arg request "$bound_request" --arg call "$call_ref" \
+    '{world_state_read:{request_id:$request,call_ref:$call}}')"
+  wait "$chat_pid"
+  response="$(<"$COMPOSED_SMOKE_TMP/world-read-$tag-response.json")"
+  local observer_status=0
+  wait "$observer_pid" || observer_status=$?
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    cp "$observation" "$COMPOSED_SMOKE_LOG_DIR/world-state-read-$tag.jsonl"
+  fi
+  request="$(jq -er .request_id <<<"$response")"
+  test "$request" = "$bound_request"
+  # A real health response is a log-flush barrier after completed-turn response.
+  curl -fsS --max-time 2 -H 'X-API-Key: smoke-runtime-key' http://127.0.0.1:14371/healthz >/dev/null
+  service_after="$(strict_information_http_counts "$service_before" | jq -ce .runtime_access)"
+  trace="$(fetch_trace "$request")"; calls="$(fetch_provider_calls "$request")"
+  diagnostics="$(curl -fsS --max-time 2 http://127.0.0.1:14381/fixture/diagnostics | \
+    jq -c --argjson held "$diagnostics" '{read_fixture:$held.read_fixture,events:.events,
+      pending_read_fixture:.read_fixture}')"
+  records="$(world_state_read_records "$owner" "$conversation" "$request")"
+  test "$observer_status" = 0
+  after="$(jq -c '{claims_digest,claim_count}' <<<"$records")"
+  test "$(jq -c . <<<"$before")" = "$after"
+  test "$(jq .claim_count <<<"$before")" = 8
+  # Service totals are global, not request attribution. Exact equality against
+  # diagnostics rejects unrelated traffic and incomplete captures, including a
+  # duplicate execution that the passive observer entirely missed.
+  python3 - "$tag" "$expected" "$persona" "$owner" "$conversation" "$request" \
+    "$response" "$trace" "$calls" "$records" "$(tail -1 "$observation")" \
+    "$service_before" "$service_after" "$diagnostics" <<'PYCHECKREAD'
+import collections
+import json
+import sys
+
+tag, expected, persona, owner, conversation, request = sys.argv[1:7]
+response, trace, calls, records, observed, service_before, service_after, binding = map(json.loads, sys.argv[7:])
+expected = int(expected)
+assert response["status"] in {"ok", "degraded"}
+assembly = trace["retrieval"]["prompt_assembly"]
+capabilities = assembly["capabilities"]
+session, turn = records["session"]["runtime_session_id"], records["turn"]["runtime_turn_id"]
+assert assembly["runtime_session"]["runtime_session_id"] == session
+assert assembly["turn_state"]["runtime_turn_id"] == turn
+assert records["session"]["surface"] == ("web" if tag == "denied" else "dev")
+assert records["session"]["owner_id"] == owner, "contradictory session owner"
+assert records["session"]["conversation_id"] == conversation, "contradictory session conversation"
+assert records["turn"]["runtime_session_id"] == session
+operations = observed["operations"]
+assert observed["completed"] is True, "missing completed HTTP observation"
+assert service_after["count"] > service_before["count"] > 0, "missing service access evidence"
+assert service_after["prefix_digest"] == service_before["digest"], "truncated service access evidence"
+delta = collections.Counter(service_after["operations"])
+delta.subtract(service_before["operations"])
+assert all(n >= 0 for n in delta.values()), "service access counter regressed"
+assert delta["POST /v1/world-state/resolve 200"] == 1 + expected, "service read total mismatch"
+delta.pop("GET /healthz 200", None)
+delta = +delta
+captured = collections.Counter(f'{o["method"]} {o["path"]} {o.get("http_status")}' for o in operations)
+assert delta == captured, "incomplete or ambiguous HTTP attribution"
+allowed_paths = {
+    "/v1/runtime/threads/resolve", "/v1/runtime/turns/start", "/v1/runtime/turns/update",
+    "/v1/runtime/turns/complete", "/v1/runtime/interaction-governance/evaluate",
+    "/v1/runtime/persona-containment/evaluate", "/v1/relationships/select",
+    "/v1/runtime/restraint/evaluate", "/v1/runtime/presence/evaluate",
+    "/v1/runtime/situated-presence/evaluate", "/v1/runtime/identity/resolve",
+    "/v1/runtime/timing/evaluate", "/v1/runtime/overlay", "/v1/world-state/resolve",
+    "/v1/runtime/surface-presence/publish",
+    "/v1/capabilities/match", "/v1/capabilities/authority", "/v1/capabilities/flow",
+    "/v1/capabilities/exposure-batch", "/v1/capabilities/authorize",
+    "/v1/capabilities/action-summary",
+}
+def at(path):
+    return [o for o in operations if o["path"] == path]
+expected_paths = dict.fromkeys(allowed_paths, 1)
+expected_paths["/v1/runtime/turns/update"] = 2
+expected_paths["/v1/world-state/resolve"] = 1 + expected
+expected_paths["/v1/capabilities/authorize"] = 2
+if not expected:
+    for path in ("authority", "flow", "exposure-batch", "authorize", "action-summary"):
+        expected_paths.pop("/v1/capabilities/" + path)
+assert collections.Counter(o["path"] for o in operations) == expected_paths, "unexpected scoped operation count"
+assert [o["order"] for o in operations] == list(range(len(operations))), "ambiguous operation order"
+for operation in operations:
+    body = operation["request"]
+    assert operation["path"] in allowed_paths, "unexpected scoped operation"
+    assert operation["method"] == "POST" and operation["http_status"] == 200, "failed scoped operation"
+    assert (body.get("owner_id") == owner and body.get("conversation_id") == conversation
+            or body.get("runtime_session_id") == session), "missing request association"
+    suffixes = {"/v1/capabilities/match": ":capability-match",
+                "/v1/capabilities/authority": ":capability-authority",
+                "/v1/capabilities/flow": ":capability-flow",
+                "/v1/capabilities/action-summary": ":action-summary"}
+    permitted_requests = {request + suffixes.get(operation["path"], "")}
+    if operation["path"] == "/v1/world-state/resolve":
+        permitted_requests.add(request + ":runtime.world_state.read:execute")
+    if operation["path"] == "/v1/capabilities/authorize":
+        permitted_requests = {request + ":runtime.world_state.read:" + stage
+                              for stage in ("selection", "dispatch")}
+    assert body["request_id"] in permitted_requests, "unexpected request association"
+    for key, value in (("owner_id", owner), ("conversation_id", conversation),
+                       ("surface", records["session"]["surface"]),
+                       ("runtime_session_id", session), ("runtime_turn_id", turn)):
+        if key in body:
+            assert body[key] == value, "contradictory " + key
+        if key in operation["response_scope"]:
+            assert operation["response_scope"][key] == value, "contradictory response " + key
+    if "request_id" in operation["response_scope"]:
+        assert operation["response_scope"]["request_id"] == body["request_id"], "mismatched response request"
+    if operation["path"] == "/v1/runtime/surface-presence/publish":
+        assert body["stage"] == operation["response_scope"]["stage"] == "terminal"
+    if "capability_id" in body:
+        assert body["capability_id"] == "runtime.world_state.read", "wrong dispatch capability"
+    if "capability_id" in operation.get("result", {}):
+        assert operation["result"]["capability_id"] == "runtime.world_state.read", "mismatched result capability"
+    # Before identity resolution, legacy containment can use an advisory
+    # governance proposal. Every governed read/capability request uses the
+    # subsequently resolved surface-bound identity.
+    if operation["path"].startswith(("/v1/world-state/", "/v1/capabilities/")):
+        assert body["active_persona_id"] == persona, operation["path"]
+assert assembly["runtime_identity"]["active_persona_id"] == persona
+match, = at("/v1/capabilities/match")
+reads = at("/v1/world-state/resolve")
+executions = [r for r in reads if r["request"]["request_id"] == request + ":runtime.world_state.read:execute"]
+context_reads = [r for r in reads if r not in executions]
+assert len(executions) == expected and len(context_reads) == 1
+assert all(r["read"]["restricted_values_absent"] for r in reads)
+assert not at("/v1/capabilities/confirm")
+assert not any(o["path"].endswith(("/upsert", "/verify")) for o in operations)
+chat, = [c for c in calls["calls"] if c["kind"] == "chat"]
+assert chat["request_id"] == request and chat["read_fixture_selected"] is True
+assert chat["read_proposal_count"] == expected
+assert chat["tool_names"] == (["runtime_world_state_read"] if expected else [])
+assert binding["read_fixture"]["request_id"] == request
+held, = [e for e in binding["events"]
+         if e.get("request_id") == request and e["event"] == "read_request_held"]
+assert held["call_ref"] == binding["read_fixture"]["call_ref"]
+assert binding["pending_read_fixture"] is None, "leaked read proposal"
+bound, = [e for e in binding["events"]
+          if e.get("request_id") == request and e["event"] == "read_request_bound"]
+consumed, = [e for e in binding["events"]
+             if e.get("request_id") == request and e["event"] == "read_fixture_consumed"]
+assert held["call_ref"] == bound["call_ref"] == consumed["call_ref"]
+assert held["sequence"] < bound["sequence"] < consumed["sequence"]
+assert consumed["proposal_count"] == expected
+assert all(c["kind"] in {"chat", "semantic_interpreter"} for c in calls["calls"])
+assert capabilities["executor_call_count"] == expected
+assert capabilities["dispatch_completed"] is bool(expected)
+assert capabilities["follow_up"]["call_count"] == 0
+events = records["events"]
+authorizations = [e for e in events if e["event_type"] == "capability_authorization_evaluated"]
+summaries = [e for e in events if e["event_type"] == "action_summary_recorded"]
+assert len(authorizations) == 3 * expected
+if expected:
+    registry = assembly["capability_registry"]
+    assert registry["context_included"] is True
+    assert registry["match"]["matched_capability_id"] == "runtime.world_state.read"
+    assert capabilities["validation"]["validation_status"] == "ok"
+    assert capabilities["validation"]["reason_code"] == "validated"
+    assert match["result"]["capability_matched"] is True
+    assert match["result"]["capability"]["domain"] == "software_architecture"
+    authority, = at("/v1/capabilities/authority")
+    flow, = at("/v1/capabilities/flow")
+    assert authority["result"]["allowed"] is True
+    assert flow["result"]["execution_allowed"] is True
+    assert flow["result"]["confirmation_required"] is False
+    assert flow["result"]["verification_required"] is True
+    exposure, = at("/v1/capabilities/exposure-batch")
+    assert exposure["candidate_ids"] == ["runtime.world_state.read"]
+    assert len(exposure["decisions"]) == 1 and exposure["decisions"][0]["allowed"] is True
+    selection, dispatch = at("/v1/capabilities/authorize")
+    assert [o["request"]["request_id"] for o in (selection, dispatch)] == [
+        request + ":runtime.world_state.read:selection", request + ":runtime.world_state.read:dispatch"]
+    assert [e["event_payload_json"]["request_id"] for e in authorizations] == [
+        request, request + ":runtime.world_state.read:selection", request + ":runtime.world_state.read:dispatch"]
+    assert all(e["event_payload_json"]["capability_id"] == "runtime.world_state.read"
+               and e["event_payload_json"]["decision_code"] == "allowed" for e in authorizations)
+    assert selection["result"]["allowed"] is True and dispatch["result"]["allowed"] is True
+    digest = capabilities["validation"]["argument_digest"]
+    assert selection["request"]["argument_digest"] == dispatch["request"]["argument_digest"] == digest
+    execution, = executions
+    assert execution["request"]["requested_domains"] == ["active_project"]
+    assert execution["read"]["matching_fixture_claims"] == 1
+    assert execution["read"]["included_claim_count"] == 1
+    assert execution["read"]["trace"]["included_claim_count"] == 1
+    assert execution["read"]["trace"]["confirmation_required"] is False
+    # The legacy executor's wire model has no turn field. Its exact request
+    # suffix/session link is checked against this turn's dispatch/completion.
+    assert "runtime_turn_id" not in execution["request"]
+    summary, = at("/v1/capabilities/action-summary")
+    assert summary["result"]["execution_status"] == "executed"
+    assert summary["result"]["verification_status"] == "passed"
+    assert summary["result"]["confirmation_status"] == "not_required"
+    assert response["answer"] == summary["result"]["user_visible_summary"]
+    assert response["answer"] == "Action runtime.world_state.read was executed and verification passed."
+    summary_event, = summaries
+    assert summary_event["event_payload_json"]["action_id"] == summary["result"]["action_id"]
+    assert summary_event["event_payload_json"]["owner_id"] == owner
+    assert summary_event["event_payload_json"]["conversation_id"] == conversation
+    for key in ("execution_status", "verification_status", "capability_id"):
+        assert summary_event["event_payload_json"][key] == summary["result"][key], "mismatched durable summary"
+    verification = capabilities["execution"]["post_execution_verification"]
+    assert verification["status"] == "verified" and verification["matching_claim_count"] == 1
+    admission, = at("/v1/runtime/turns/start")
+    governance, = at("/v1/runtime/interaction-governance/evaluate")
+    identity, = at("/v1/runtime/identity/resolve")
+    completed, = at("/v1/runtime/turns/complete")
+    ordered = [admission, governance, identity, context_reads[0], match, authority, flow,
+               exposure, selection, dispatch, execution, summary, completed]
+    assert [o["order"] for o in ordered] == sorted(o["order"] for o in ordered)
+else:
+    assert not at("/v1/capabilities/authority") and not at("/v1/capabilities/flow")
+    assert not at("/v1/capabilities/exposure-batch") and not at("/v1/capabilities/authorize")
+    assert not summaries or all(e["event_payload_json"]["execution_status"] != "executed" for e in summaries)
+    assert "was executed" not in response["answer"]
+    if tag == "denied":
+        assert match["result"]["capability_matched"] is False
+        assert "surface_not_allowed" in match["result"]["reason_codes"]
+    else:
+        assert assembly["capability_registry"]["reason"] == "strict_world_state_context_only"
+        assert context_reads[0]["read"]["selection_contract"] == "strict_turn"
+for item in (response, trace, calls):
+    assert all(sentinel not in json.dumps(item) for sentinel in (
+        "WORLD_FIXTURE_secret", "WORLD_FIXTURE_expired", "WORLD_FIXTURE_health",
+        "WORLD_FIXTURE_conflict_a", "WORLD_FIXTURE_conflict_b"))
+# Allowlisted associations only: no prompts, raw values, headers or full bodies.
+def public_snapshot(snapshot):
+    # Keep exact historical URL maps internal to reconciliation. Publishing only
+    # counts/digests preserves proof without exposing unrelated paths or queries.
+    counts = snapshot["operations"]
+    return {**{key: snapshot[key] for key in ("count", "digest", "prefix_digest")},
+            "world_state_read_count": counts.get("POST /v1/world-state/resolve 200", 0),
+            "health_check_count": counts.get("GET /healthz 200", 0)}
+print(json.dumps({"scenario": tag, "evidence_source": "CR service access logs",
+                  "service_before": public_snapshot(service_before),
+                  "service_after": public_snapshot(service_after),
+                  "service_operation_delta": dict(sorted(delta.items())), "operations": operations,
+                  "provider_binding": [held, bound, consumed],
+                  "events": [{key: e[key] for key in (
+                      "event_id", "event_type", "runtime_session_id", "runtime_turn_id")}
+                             | {"association": {key: e["event_payload_json"][key]
+                                   for key in ("request_id", "owner_id", "conversation_id", "capability_id",
+                                               "decision_code", "action_id", "assistant_message_id")
+                                   if key in e["event_payload_json"]}} for e in events]}))
+print(json.dumps({"scenario": tag, "actual_services": True, "request_id": request,
+                  "owner_id": owner, "conversation_id": conversation, "runtime_session_id": session,
+                  "runtime_turn_id": turn, "matches": 1, "read_executions": len(executions),
+                  "context_reads": len(context_reads), "authorization_decisions": len(authorizations),
+                  "provider_proposals": chat["read_proposal_count"], "provider_chat_calls": 1,
+                  "duplicate_dispatches": 0, "challenges": 0, "restricted_values_absent": True}))
+PYCHECKREAD
+  assert_persisted_answer_matches "$conversation" "$request" "$(jq -er .answer <<<"$response")"
+  assert_request_persistence_counts "$conversation" "$request" 0
+  work="$(psql_exec -At -c "SELECT work_id FROM work_items WHERE owner_id='$owner' AND request_id='$request';")"
+  result="$(co_work_result "$owner" "$conversation" "$work")"
+  assert_public_work "$result" "$work" "$conversation" "$request"
+  assert_exact_canonical_result "$result"
+  jq -e --arg answer "$(jq -er .answer <<<"$response")" '.state=="completed" and .result.answer==$answer' <<<"$result" >/dev/null
+  local assistant
+  assistant="$(psql_exec -At -c "SELECT m.id FROM messages m JOIN work_items w ON w.assistant_message_id=m.id AND w.work_id=m.work_id WHERE w.work_id='$work' AND w.owner_id='$owner' AND w.conversation_id='$conversation' AND w.surface='$surface' AND w.state='completed' AND m.role='assistant' AND m.metadata->>'request_id'='$request';")"
+  test -n "$assistant"
+  jq -e --arg assistant "$assistant" '[.events[]|select(.event_type=="turn_completed")][0].event_payload_json.assistant_message_id==$assistant' <<<"$records" >/dev/null
+  jq -nc --arg request "$request" --arg owner "$owner" --arg conversation "$conversation" \
+    --arg work "$work" --arg assistant "$assistant" \
+    '{request_id:$request,owner_id:$owner,conversation_id:$conversation,work_id:$work,
+      assistant_message_id:$assistant,canonical_publications:1,work_state:"completed",cr_turn_state:"completed"}'
+  echo "World-state read $tag: actual_services=true context_reads=1 executions=$expected matches=1 authorization_decisions=$((3 * expected)) provider_proposals=$expected assistant_publications=1 challenges=0 work=completed idle=true"
+)
+
+run_world_state_read_scenario() (
+  set -Eeuo pipefail
+  local saved_registry="${COMPOSED_CAPABILITY_REGISTRY_ENABLED:-false}"
+  local saved_persona="${COMPOSED_PERSONA_CONTAINMENT_ENABLED:-false}"
+  local saved_restraint="${COMPOSED_RESTRAINT_ENABLED:-false}"
+  # Qualify the existing default executable contract, never downgrade strict
+  # world-state authority to obtain execution. Strict mode is a zero-execution control.
+  test "${COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED:-false}" = false
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED=true
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED=true COMPOSED_RESTRAINT_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  docker compose -f "$COMPOSE" exec -T provider python -m unittest -v tools.composed_provider_stub.ProviderFixtureTests
+  run_world_state_read_case allowed dev 1 technical_architect
+  run_world_state_read_case denied web 0 general_assistant
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=true
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  run_world_state_read_case strict dev 0 technical_architect
+  export COMPOSED_STRICT_WORLD_STATE_AUTHORITY_ENABLED=false
+  export COMPOSED_CAPABILITY_REGISTRY_ENABLED="$saved_registry"
+  export COMPOSED_PERSONA_CONTAINMENT_ENABLED="$saved_persona" COMPOSED_RESTRAINT_ENABLED="$saved_restraint"
+  docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
+  wait_for_http http://127.0.0.1:14361/healthz
+  provider_post /fixture/reset '{}'
+)
 
 run_strict_world_state_case() (
   local tag="$1" surface="$2" persona="$3" proposal="${4:-any}" empty="${5:-false}"
@@ -7747,6 +8332,11 @@ if [ "$(printenv SURFACE_COMPATIBILITY_ONLY || true)" = 1 ]; then
 fi
 
 
+if [ "${WORLD_STATE_READ_ONLY:-}" = "1" ]; then
+  run_world_state_read_scenario
+  exit 0
+fi
+
 if [ "${STRICT_WORLD_STATE_AUTHORITY_ONLY:-}" = "1" ]; then
   set -E
   trap 'echo "Strict world state assertion failed: line=$LINENO" >&2' ERR
@@ -7799,6 +8389,9 @@ if [ "${EVIDENCE_ACQUISITION_ONLY:-}" = "1" ]; then
   if [ "${EVIDENCE_SCENARIO:-all}" = all ]; then
     run_voice_continuation_scenario
     run_transport_latency_regression
+  fi
+  if [ "${EVIDENCE_SCENARIO:-all}" = all ] || [ "${EVIDENCE_SCENARIO:-all}" = aggregate ]; then
+    run_world_state_read_scenario
   fi
   echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
   exit 0
@@ -8066,6 +8659,8 @@ run_wave2e_retrieval_scenario
 run_claim_traceability_scenario
 run_evidence_acquisition_composed_suite
 run_history_followup_composed_suite
+
+run_world_state_read_scenario
 
 echo "Composed smoke passed: scenarios=A-active-canonical, B-stale-only, C-unsafe-derivative, D-provider-fallback, E-corrected-replacement, F-bms-diagnostics-compat, G-claim-capture-and-explanation, evidence-acquisition, server-owned-history-followups"
 echo "Topology: CO HTTP -> CR HTTP + DSA HTTP -> deterministic external-source fixture HTTP; CO HTTP -> deterministic provider HTTP + BMS HTTP -> PostgreSQL 16 + Qdrant."
