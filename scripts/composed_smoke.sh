@@ -6535,7 +6535,10 @@ async def main():
     if mode == "denied":
         payload["surface"] = "web"
     if pending_json != "null":
-        payload["messages"] = [{"role": "user", "content": "no" if mode == "rejected" else "yes"}]
+        payload["messages"] = [{"role": "user", "content": (
+            "Please reject the pending Jellyfin restart." if mode == "rejected"
+            else "Please confirm the pending Jellyfin restart."
+        )}]
         payload["capability_confirmation"] = {
             "pending_action": json.loads(pending_json),
             "confirmed": mode != "rejected",
