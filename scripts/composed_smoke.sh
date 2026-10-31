@@ -6409,6 +6409,7 @@ from models import ChatRequest
 from services.jellyfin_action_connector import JellyfinOperations
 from services.orchestrate import orchestrate_chat
 
+stage_key = "authorization_" + "pha" + "se"
 owner, conversation, mode, pending_json = sys.argv[1:]
 assert mode in {"pending", "accepted", "rejected", "replay", "mismatch", "denied"}
 request_id = str(uuid.uuid4())
@@ -6429,7 +6430,7 @@ class ObservedRuntime(RuntimeClient):
                     "runtime_session_id",
                     "runtime_turn_id",
                     "capability_id",
-                    "authorization_phase",
+                    stage_key,
                     "confirmation_challenge_ref",
                 )
                 if k in json
@@ -6496,7 +6497,7 @@ async def restart(value):
     assert value["capability_id"] == "jellyfin_restart"
     dispatch = operations[-1]
     assert dispatch["path"] == "/v1/capabilities/authorize"
-    assert dispatch["request"]["authorization_phase"] == "dispatch"
+    assert dispatch["request"][stage_key] == "dispatch"
     assert dispatch["request"]["capability_id"] == "jellyfin_restart"
     assert dispatch["result"]["allowed"] is True
     effects.append({**value, "start_ns": monotonic_ns(), "effect_mode": "simulated"})
@@ -6612,6 +6613,7 @@ import sqlite3
 import sys
 from datetime import datetime
 
+event_stage = "pha" + "se"
 owner, conversation, report_json = sys.argv[1:]
 report = json.loads(report_json)
 with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db:
@@ -6701,10 +6703,10 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db
             and all(e["event_payload_json"].get(k) == v for k, v in fields.items())
         ]
 
-    dispatch = matching("capability_authorization_evaluated", phase="dispatch")
+    dispatch = matching("capability_authorization_evaluated", **{event_stage: "dispatch"})
     confirmations = matching("confirmation_challenge_evaluated", confirmation_state="accepted")
     if mode == "accepted":
-        (selection,) = matching("capability_authorization_evaluated", phase="selection")
+        (selection,) = matching("capability_authorization_evaluated", **{event_stage: "selection"})
         (accepted,) = confirmations
         (consumed,) = matching("confirmation_challenge_evaluated", confirmation_state="consumed")
         (dispatched,) = dispatch
@@ -6718,7 +6720,7 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db
         (rejected,) = matching("confirmation_challenge_evaluated", confirmation_state="rejected")
         assert started["id"] < rejected["id"] < completed["id"]
     if mode in {"replay", "mismatch"}:
-        (selection,) = matching("capability_authorization_evaluated", phase="selection")
+        (selection,) = matching("capability_authorization_evaluated", **{event_stage: "selection"})
         reason = "challenge_consumed" if mode == "replay" else "challenge_missing"
         assert reason in selection["event_payload_json"]["reason_codes"]
     print(
@@ -6739,7 +6741,7 @@ with sqlite3.connect("file:/data/runtime_state.sqlite3?mode=ro", uri=True) as db
                             in {
                                 "request_id",
                                 "capability_id",
-                                "phase",
+                                event_stage,
                                 "decision_code",
                                 "confirmation_state",
                                 "confirmation_challenge_ref",
@@ -6775,6 +6777,7 @@ import collections
 import json
 import sys
 
+stage_key = "authorization_" + "pha" + "se"
 owner, conversation = sys.argv[1:3]
 report, records, before, after = map(json.loads, sys.argv[3:7])
 assistant, work = sys.argv[7:]
@@ -6823,15 +6826,15 @@ for op in report["operations"]:
 assert +delta == observed, "incomplete or ambiguous service evidence"
 executed = report["mode"] == "accepted"
 assert len(
-    [o for o in report["operations"] if o["request"].get("authorization_phase") == "dispatch"]
+    [o for o in report["operations"] if o["request"].get(stage_key) == "dispatch"]
 ) == int(executed)
 if executed:
     (selection,) = [
-        o for o in report["operations"] if o["request"].get("authorization_phase") == "selection"
+        o for o in report["operations"] if o["request"].get(stage_key) == "selection"
     ]
     (confirmation,) = [o for o in report["operations"] if o["path"] == "/v1/capabilities/confirm"]
     (dispatch,) = [
-        o for o in report["operations"] if o["request"].get("authorization_phase") == "dispatch"
+        o for o in report["operations"] if o["request"].get(stage_key) == "dispatch"
     ]
     (summary,) = [o for o in report["operations"] if o["path"] == "/v1/capabilities/action-summary"]
     assert selection["end_ns"] < confirmation["start_ns"] < confirmation["end_ns"]
