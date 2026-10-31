@@ -6541,6 +6541,8 @@ async def main():
             "confirmed": mode != "rejected",
         }
     try:
+        await memory.open()
+        await runtime.open()
         payload = ChatRequest.model_validate(payload).model_dump(exclude_none=True)
         response = await asyncio.wait_for(
             orchestrate_chat(
