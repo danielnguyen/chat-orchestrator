@@ -5081,7 +5081,7 @@ PYTHON
 # below establishes predecessor response completion. Neither is a CR compute span.
 assert_composed_turn_parity() {
   local scenario="$1" payload="$2" response="$3" trace="$4" diagnostics="$5" calls="$6"
-  local owner conversation request work result rows
+  local owner conversation request work result rows users
   owner="$(jq -er .owner_id <<<"$payload")"
   conversation="$(jq -er .conversation_id <<<"$response")"
   request="$(jq -er .request_id <<<"$response")"
@@ -5094,12 +5094,16 @@ SQL
   result="$(co_work_result "$owner" "$conversation" "$work")"
   assert_public_work "$result" "$work" "$conversation" "$request"
   assert_exact_canonical_result "$result"
-  python3 - "$scenario" "$payload" "$response" "$trace" "$diagnostics" "$calls" "$rows" "$result" <<'PYPARITY'
+  users="$(psql_exec -At -v input="$(jq -er .latest_turn.input_message_id <<<"$diagnostics")" <<'SQL'
+SELECT coalesce(json_agg(m), '[]') FROM messages m WHERE id=:'input' AND role='user';
+SQL
+)"
+  python3 - "$scenario" "$payload" "$response" "$trace" "$diagnostics" "$calls" "$rows" "$result" "$users" <<'PYPARITY'
 import json
 import sys
 
 scenario = sys.argv[1]
-payload, response, trace, diagnostics, calls, rows, result = map(json.loads, sys.argv[2:])
+payload, response, trace, diagnostics, calls, rows, result, users = map(json.loads, sys.argv[2:])
 work, = rows
 request = response["request_id"]
 session, turn = diagnostics["runtime_session"], diagnostics["latest_turn"]
@@ -5118,6 +5122,13 @@ assert turn["runtime_session_id"] == session["runtime_session_id"]
 runtime_projection = trace["prompt"] if scenario.startswith("history_") else assembly
 assert runtime_projection["runtime_session"]["runtime_session_id"] == session["runtime_session_id"]
 assert runtime_projection["turn_state"]["runtime_turn_id"] == turn["runtime_turn_id"]
+user, = users
+assert user["id"] == turn["input_message_id"]
+assert user["work_id"] is None  # BMS reserves the reverse work binding for assistants.
+assert user["content"] == payload["messages"][-1]["content"]
+for key in ("owner_id", "conversation_id", "client_id"):
+    assert user[key] == payload[key], "canonical user scope: " + key
+assert user["metadata"]["surface"] == payload["surface"]
 events = [e for e in diagnostics["events"] if e["runtime_turn_id"] == turn["runtime_turn_id"]]
 assert all(e["runtime_session_id"] == session["runtime_session_id"] for e in events)
 def one(kind):
@@ -5179,7 +5190,7 @@ ops = observed["operations"]
 assert +delta == collections.Counter(f'{o["method"]} {o["path"]} {o["http_status"]}' for o in ops)
 assert [o["order"] for o in ops] == list(range(len(ops))) and ops
 assembly = trace["retrieval"]["prompt_assembly"]
-runtime_projection = trace["prompt"] if trace["retrieval"]["status"] == "not_requested" else assembly
+runtime_projection = assembly if "runtime_session" in assembly else trace["prompt"]
 scope = {"owner_id": trace["owner_id"], "conversation_id": trace["conversation_id"],
          "surface": trace["surface"],
          "runtime_session_id": runtime_projection["runtime_session"]["runtime_session_id"],
@@ -5304,7 +5315,7 @@ run_transport_latency_regression() {
           {external_context_enabled:true,external_context:{enabled:true,source_ids:["records_primary"],
             allowed_sensitivity:"medium",max_results:5,domain_tags:[],exact_source_refs:[]}}
           else {} end')"
-      echo "Latency regression progress: scenario=$scenario turn=$index of=12"
+      echo "Latency regression progress: scenario=$scenario turn=$index of=$count"
       measured=false; [ "$index" -le 2 ] || measured=true
       if [ "$index" = 1 ]; then
         service_before="$(strict_information_http_counts '{}' | jq -ce .runtime_access)"
