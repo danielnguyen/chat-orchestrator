@@ -119,6 +119,7 @@ cleanup() {
       >"$COMPOSED_SMOKE_LOG_DIR/service-status.jsonl" 2>/dev/null || true
     docker compose -f "$COMPOSE" logs --no-color --tail=300 2>/dev/null \
       | grep -E 'Started server process|Application startup|Uvicorn running|"(GET|POST|PUT) /[^ ?"]+ HTTP/[0-9.]+' \
+      | sed -E 's#"(GET|POST|PUT) /[^"]* HTTP/#"\1 /{redacted} HTTP/#g' \
       >"$COMPOSED_SMOKE_LOG_DIR/bounded-service.log" || true
   fi
   docker compose -f "$COMPOSE" down -v --remove-orphans >/dev/null 2>&1 || status=1
@@ -5359,11 +5360,14 @@ if len(sys.argv) > 1:
         service, separator, message = line.partition("|")
         if not separator or not service.strip().startswith("runtime"):
             continue
-        match = re.search(r"\"([A-Z]+) ([^ \"]+) HTTP/[0-9.]+\" ([0-9]{3})(?: |$)", message)
-        if match:
-            access.append(" ".join(match.groups()))
-        else:
-            assert not re.search(r"\"[A-Z]+ /|HTTP/[0-9.]", message), "incomplete CR access log"
+        candidate = re.fullmatch(r"\s*INFO:\s+\S+\s+-\s+(.*)", message)
+        if candidate is None:
+            continue
+        match = re.fullmatch(
+            r"\"([A-Z]+) ([^ \"\x00-\x20]+) HTTP/[0-9]\.[0-9]\" ([1-5][0-9]{2})(?: [^\r\n]*)?",
+            candidate[1])
+        assert match is not None, "incomplete or malformed CR access log"
+        access.append(" ".join(match.groups()))
     assert access, "missing CR service access logs"
     digest = lambda rows: hashlib.sha256(json.dumps(rows).encode()).hexdigest()
     baseline = json.loads(sys.argv[1])
@@ -6344,9 +6348,17 @@ for item in (response, trace, calls):
         "WORLD_FIXTURE_secret", "WORLD_FIXTURE_expired", "WORLD_FIXTURE_health",
         "WORLD_FIXTURE_conflict_a", "WORLD_FIXTURE_conflict_b"))
 # Allowlisted associations only: no prompts, raw values, headers or full bodies.
+def public_snapshot(snapshot):
+    # Keep exact historical URL maps internal to reconciliation. Publishing only
+    # counts/digests preserves proof without exposing unrelated paths or queries.
+    counts = snapshot["operations"]
+    return {**{key: snapshot[key] for key in ("count", "digest", "prefix_digest")},
+            "world_state_read_count": counts.get("POST /v1/world-state/resolve 200", 0),
+            "health_check_count": counts.get("GET /healthz 200", 0)}
 print(json.dumps({"scenario": tag, "evidence_source": "CR service access logs",
-                  "service_before": service_before, "service_after": service_after,
-                  "service_operation_delta": dict(delta), "operations": operations,
+                  "service_before": public_snapshot(service_before),
+                  "service_after": public_snapshot(service_after),
+                  "service_operation_delta": dict(sorted(delta.items())), "operations": operations,
                   "provider_binding": [held, bound, consumed],
                   "events": [{key: e[key] for key in (
                       "event_id", "event_type", "runtime_session_id", "runtime_turn_id")}
