@@ -4381,6 +4381,7 @@ run_deferred_delivery_scenario() {
   local owner="owner-deferred-delivery" client="client-deferred-delivery"
   local conversation payload response http_status request_id work_id current work proof calls
   local public before_dsa before_calls after_calls before_rows after_rows
+  local poll_count wait_started wait_elapsed_ms runtime_counts provider_counts health diagnostic
   conversation="$(resolve_conversation "$owner" "$client" "deferred-delivery")"
   # The composed CO uses the default disabled capability registry: read-only delivery only.
   provider_post "/fixture/delay-next-primary" '{"delay_ms":5000}'
@@ -4413,17 +4414,36 @@ run_deferred_delivery_scenario() {
   jq -e --arg work "$work_id" --arg request "$request_id" \
     '.status == "resolved" and .work.work_id == $work and .work.request_id == $request' \
     <<<"$current" >/dev/null
+  wait_started="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  poll_count=0
   for _ in $(seq 1 100); do
+    poll_count=$((poll_count + 1))
     work="$(curl -fsS -G "http://127.0.0.1:14321/v1/internal/work-items/$work_id" \
       -H "X-API-Key: smoke-memory-key" --data-urlencode "owner_id=$owner" \
       --data-urlencode "conversation_id=$conversation")"
     if [ "$(jq -r '.state' <<<"$work")" = "completed" ]; then break; fi
     sleep 0.1
   done
-  jq -e --arg work "$work_id" --arg request "$request_id" '
-    .work_id == $work and .request_id == $request and .state == "completed"
-    and .assistant_message_id != null and .failure_code == null
-  ' <<<"$work" >/dev/null
+  wait_elapsed_ms="$(python3 -c 'import sys,time; print((time.monotonic_ns()-int(sys.argv[1]))//1000000)' "$wait_started")"
+  # Retain only structural evidence before the strict assertion and disposable cleanup.
+  # This is the final polled projection, not a later read that could hide a timeout.
+  diagnostic="$(jq -nc --arg owner "$owner" --arg client "$client" \
+    --arg conversation "$conversation" --arg request "$request_id" --arg work_id "$work_id" \
+    --argjson work "$work" --argjson polls "$poll_count" --argjson elapsed "$wait_elapsed_ms" '
+      {scenario:"deferred_delivery",owner_id:$owner,client_id:$client,
+       conversation_id:$conversation,request_id:$request,work_id:$work_id,
+       work_id_match:($work.work_id==$work_id),request_id_match:($work.request_id==$request),
+       owner_match:($work.owner_id==$owner),client_match:($work.client_id==$client),
+       conversation_match:($work.conversation_id==$conversation),
+       state:($work.state|if IN("pending","running","completed","failed") then . else "invalid" end),
+       assistant_associated:($work.assistant_message_id!=null),
+       failure_code:($work.failure_code|if .==null or IN("interrupted","execution_failed","dependency_unavailable","authority_unavailable") then . else "invalid" end),
+       polls:$polls,wait_elapsed_ms:$elapsed}')"
+  echo "Deferred delivery final poll: $diagnostic"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    printf '%s\n' "$diagnostic" >>"$COMPOSED_SMOKE_LOG_DIR/deferred-delivery.jsonl"
+  fi
   proof="$(psql_exec -At -v owner="$owner" -v client="$client" -v work="$work_id" \
     -v request="$request_id" -v conversation="$conversation" <<'SQL'
 SELECT json_build_object(
@@ -4431,6 +4451,14 @@ SELECT json_build_object(
   'user_count', (SELECT count(*) FROM messages WHERE owner_id=:'owner' AND role='user'),
   'assistant_count', (SELECT count(*) FROM messages
     WHERE owner_id=:'owner' AND role='assistant'),
+  'request_work_count', (SELECT count(*) FROM work_items
+    WHERE owner_id=:'owner' AND request_id=:'request'),
+  'request_user_count', (SELECT count(*) FROM messages
+    WHERE owner_id=:'owner' AND conversation_id=:'conversation'
+      AND role='user' AND metadata->>'request_id'=:'request'),
+  'request_assistant_count', (SELECT count(*) FROM messages
+    WHERE owner_id=:'owner' AND conversation_id=:'conversation'
+      AND role='assistant' AND metadata->>'request_id'=:'request'),
   'canonical_match_count', (SELECT count(*) FROM work_items w JOIN messages m
     ON m.work_id=w.work_id AND m.id=w.assistant_message_id
     WHERE w.work_id=:'work' AND w.owner_id=:'owner' AND w.request_id=:'request'
@@ -4442,6 +4470,44 @@ SELECT json_build_object(
 );
 SQL
 )"
+  runtime_counts="$(runtime_thread_snapshot "$owner" "$conversation" | jq -c '
+    {session_count, turn_count:(.turn_statuses|length),
+     completed:([.turn_statuses[]|select(.=="completed")]|length),
+     abandoned:([.turn_statuses[]|select(.=="abandoned")]|length),
+     other:([.turn_statuses[]|select(.!="completed" and .!="abandoned")]|length),
+     active_turn:(.active_runtime_turn_id!=null)}')"
+  calls="$(fetch_provider_calls "$request_id")"
+  provider_counts="$(curl -fsS -G http://127.0.0.1:14381/fixture/diagnostics \
+    --data-urlencode "request_id=$request_id" | jq -c --arg request "$request_id" \
+    --argjson calls "$calls" '
+      {started:([.request_calls[]|select(.event=="request_started")]|length),
+       completed:([.request_calls[]|select(.event=="completed")]|length),
+       rejected_reset:([.request_calls[]|select(.event=="rejected_reset")]|length),
+       delayed:([.delayed_calls[]|select(.request_id==$request)]|length),
+       chat:([$calls.calls[]|select(.kind=="chat")]|length),
+       chat_ok:([$calls.calls[]|select(.kind=="chat" and .status=="ok")]|length),
+       chat_other:([$calls.calls[]|select(.kind=="chat" and .status!="ok")]|length)}')"
+  health='{}'
+  local service port code
+  for service in orchestrator runtime bms provider; do
+    case "$service" in orchestrator) port=14361;; runtime) port=14371;; bms) port=14321;; provider) port=14381;; esac
+    code="$(curl -s --max-time 2 -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/healthz" || true)"
+    health="$(jq -c --arg service "$service" --arg code "$code" \
+      '.+{($service):(if $code=="200" then "healthy" elif $code=="000" then "unavailable" else "http_error" end)}' <<<"$health")"
+  done
+  diagnostic="$(jq -nc --argjson projection "$diagnostic" \
+    --argjson counts "$proof" --argjson runtime "$runtime_counts" \
+    --argjson provider "$provider_counts" --argjson health "$health" '
+      $projection+{bms:$counts,runtime:$runtime,provider:$provider,health:$health}')"
+  echo "Deferred delivery diagnostic: $diagnostic"
+  if [ -n "${COMPOSED_SMOKE_LOG_DIR:-}" ]; then
+    mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+    printf '%s\n' "$diagnostic" >>"$COMPOSED_SMOKE_LOG_DIR/deferred-delivery.jsonl"
+  fi
+  jq -e --arg work "$work_id" --arg request "$request_id" '
+    .work_id == $work and .request_id == $request and .state == "completed"
+    and .assistant_message_id != null and .failure_code == null
+  ' <<<"$work" >/dev/null
   jq -e '.work_count == 1 and .user_count == 1 and .assistant_count == 1
     and .canonical_match_count == 1 and .locator_count == 1' <<<"$proof" >/dev/null
   calls="$(fetch_provider_calls "$request_id")"
