@@ -4453,9 +4453,9 @@ SELECT json_build_object(
     WHERE owner_id=:'owner' AND role='assistant'),
   'request_work_count', (SELECT count(*) FROM work_items
     WHERE owner_id=:'owner' AND request_id=:'request'),
-  'request_user_count', (SELECT count(*) FROM messages
+  'conversation_user_count', (SELECT count(*) FROM messages
     WHERE owner_id=:'owner' AND conversation_id=:'conversation'
-      AND role='user' AND metadata->>'request_id'=:'request'),
+      AND role='user'),
   'request_assistant_count', (SELECT count(*) FROM messages
     WHERE owner_id=:'owner' AND conversation_id=:'conversation'
       AND role='assistant' AND metadata->>'request_id'=:'request'),
