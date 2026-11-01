@@ -4365,9 +4365,21 @@ assert_exact_canonical_result() {
 SELECT json_build_object('assistant_message_id',m.id,'answer',m.content)
 FROM work_items w JOIN messages m ON m.id=w.assistant_message_id AND m.work_id=w.work_id
 WHERE w.work_id=:'work' AND w.state='completed' AND m.role='assistant'
-  AND m.owner_id=w.owner_id AND m.conversation_id=w.conversation_id;
+  AND m.owner_id=w.owner_id AND m.conversation_id=w.conversation_id
+  AND m.client_id IS NOT DISTINCT FROM w.client_id
+  AND (m.metadata IS NULL OR (
+    jsonb_typeof(m.metadata)='object'
+    AND ((m.metadata->'surface') IS NULL OR (
+      jsonb_typeof(m.metadata->'surface')='string'
+      AND m.metadata->>'surface'=w.surface
+    ))
+  ));
 SQL
 )"
+  if [ -z "$canonical" ]; then
+    echo "Canonical assistant association/provenance mismatch" >&2
+    return 1
+  fi
   jq -e --argjson canonical "$canonical" '.result == $canonical' <<<"$value" >/dev/null
 }
 
