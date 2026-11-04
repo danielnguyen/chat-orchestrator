@@ -5201,7 +5201,8 @@ assert_classifier_request() {
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .response_schema_required == ["intent","confidence","target_mode","new_verification_requested"]
-      and .max_completion_tokens == 120
+      and .max_completion_tokens == 512
+      and .reasoning_effort == "minimal"
       and .message_count == 2
       and .normalized_messages == [
         {role:"system",content:$system},

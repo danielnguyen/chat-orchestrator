@@ -68,6 +68,70 @@ async def test_composed_scene_fixture_rejects_malformed_configuration(policies):
         assert stub._scene_policy_answers == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_primary", [False, True])
+@pytest.mark.parametrize("reasoning_effort", ["minimal", "low", None])
+async def test_composed_classifier_records_request_settings(fail_primary, reasoning_effort):
+    from tools import composed_provider_stub as stub
+
+    request_id = "classifier-request"
+    body = {
+        "model": "gpt-5-mini",
+        "messages": [
+            {"role": "system", "content": "Classify the current turn."},
+            {"role": "user", "content": "Which records did you check?"},
+        ],
+        "max_completion_tokens": 512,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "history_followup_classification",
+                "strict": True,
+                "schema": {
+                    "additionalProperties": False,
+                    "required": [
+                        "intent", "confidence", "target_mode", "new_verification_requested",
+                    ],
+                },
+            },
+        },
+    }
+    if reasoning_effort is not None:
+        body["reasoning_effort"] = reasoning_effort
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=stub.app),
+                                 base_url="http://fixture") as client:
+        await client.post("/fixture/reset")
+        try:
+            if fail_primary:
+                assert (await client.post("/fixture/fail-next-primary")).status_code == 200
+            response = await client.post(
+                "/v1/chat/completions", json=body, headers={"X-Request-ID": request_id},
+            )
+            assert response.status_code == (503 if fail_primary else 200)
+            report = (await client.get(f"/calls/{request_id}")).json()
+            assert report["request_id"] == request_id
+            assert len(report["calls"]) == 1
+            record = report["calls"][0]
+            assert record["kind"] == "chat"
+            assert record["status"] == ("failed" if fail_primary else "ok")
+            assert record["request_id"] == request_id
+            assert record["model"] == body["model"]
+            assert record["max_completion_tokens"] == 512
+            assert record["reasoning_effort"] == reasoning_effort
+            assert record["tool_count"] == 0
+            assert record["message_count"] == 2
+            assert record["normalized_messages"] == body["messages"]
+            assert record["response_format_type"] == "json_schema"
+            assert record["response_schema_name"] == "history_followup_classification"
+            assert record["response_schema_strict"] is True
+            assert record["response_schema_additional_properties"] is False
+            assert record["response_schema_required"] == (
+                body["response_format"]["json_schema"]["schema"]["required"]
+            )
+        finally:
+            await client.post("/fixture/reset")
+
+
 @pytest.fixture
 def work_reads(monkeypatch):
     from test_memory_store_client import result_projection
