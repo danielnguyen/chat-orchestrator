@@ -37479,6 +37479,10 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
     assert "Missing evidence is not linguistic ambiguity" in prompt
     assert "Preserve uncertainty" in prompt
     assert "raise confidence to obtain history access" in prompt
+    assert "Express target uncertainty through confidence\nand ambiguous_history_followup" in prompt
+    stated_modes = prompt.split("Allowed target modes: ", 1)[1].split(".", 1)[0].split(", ")
+    schema = classifier_call["response_format"]["json_schema"]["schema"]
+    assert stated_modes == schema["properties"]["target_mode"]["enum"]
     serialized_classifier = json.dumps(classifier_call, sort_keys=True)
     for forbidden in (
         "PRIVATE RAW SUMMARY",

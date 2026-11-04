@@ -363,7 +363,8 @@ without seeing those records or the answer. Missing evidence is not linguistic a
 Use high confidence (>=0.85) when both intent and target mode are clear; medium (0.60-<0.85)
 when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported.
 Preserve uncertainty when the wording admits competing intents or target modes; do not
-raise confidence to obtain history access. Use target_mode none when no target is clear.
+raise confidence to obtain history access. Express target uncertainty through confidence
+and ambiguous_history_followup. Allowed target modes: immediate_previous, explicit_reference.
 Asking what was examined does not imply it supported the answer or covered all available
 sources. Asking about support, coverage, or gaps does not itself request fresh verification.
 Set new_verification_requested true only for an explicit fresh-check request."""
