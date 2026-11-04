@@ -790,22 +790,39 @@ def parse_history_classifier_completion(value: Any) -> dict[str, Any]:
         "created",
         "model",
         "system_fingerprint",
+        "service_tier",
     }
     if not isinstance(value, dict) or set(value) - allowed_fields:
         raise ValueError("classifier_completion_invalid")
+    if value.get("service_tier") is not None and not isinstance(value["service_tier"], str):
+        raise ValueError("classifier_metadata_invalid")
     choices = value.get("choices")
     if not isinstance(choices, list) or len(choices) != 1:
         raise ValueError("classifier_choices_invalid")
     choice = choices[0]
     if not isinstance(choice, dict):
         raise ValueError("classifier_choice_invalid")
+    if choice.get("finish_reason", "stop") != "stop":
+        raise ValueError("classifier_finish_reason_invalid")
     message = choice.get("message")
     if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
         raise ValueError("classifier_tool_call_forbidden")
     if message.get("refusal") not in (None, ""):
         raise ValueError("classifier_refusal_invalid")
-    if set(message) - {"role", "content", "refusal", "tool_calls"}:
+    if set(message) - {
+        "role", "content", "refusal", "tool_calls", "annotations", "provider_specific_fields"
+    }:
         raise ValueError("classifier_message_invalid")
+    # Provider metadata is inert: only content may supply the typed classification.
+    annotations = message.get("annotations")
+    if annotations is not None and (
+        not isinstance(annotations, list)
+        or any(not isinstance(annotation, dict) for annotation in annotations)
+    ):
+        raise ValueError("classifier_metadata_invalid")
+    provider_fields = message.get("provider_specific_fields")
+    if provider_fields is not None and not isinstance(provider_fields, dict):
+        raise ValueError("classifier_metadata_invalid")
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("classifier_content_invalid")

@@ -354,6 +354,7 @@ async def chat_completions(
             schema.get("required") if isinstance(schema, dict) else None
         ),
         "max_completion_tokens": body.get("max_completion_tokens"),
+        "reasoning_effort": body.get("reasoning_effort"),
     }
     _fixture_event("request_started", request_id=request_id, call_ref=call_ref,
                    request_generation=generation,
