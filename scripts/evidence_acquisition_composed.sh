@@ -5059,7 +5059,18 @@ acquisition_coverage asks whether available scope was covered.
 acquisition_gaps asks what may have been missed.
 new_verification_request explicitly asks for a fresh check.
 ambiguous_history_followup is plausibly historical but its requested kind is unclear.
-not_history_followup is an ordinary question or instruction."
+not_history_followup is an ordinary question or instruction.
+Confidence measures how clearly the current wording identifies the intent and target mode.
+It does not certify retained evidence, source completeness, or historical truth.
+A clear request to list records examined for the preceding answer can be high confidence
+without seeing those records or the answer. Missing evidence is not linguistic ambiguity.
+Use high confidence (>=0.85) when both intent and target mode are clear; medium (0.60-<0.85)
+when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported.
+Preserve uncertainty when the wording admits competing intents or target modes; do not
+raise confidence to obtain history access. Use target_mode none when no target is clear.
+Asking what was examined does not imply it supported the answer or covered all available
+sources. Asking about support, coverage, or gaps does not itself request fresh verification.
+Set new_verification_requested true only for an explicit fresh-check request."
 readonly HISTORY_TRACE_KEYS='["answer_provider_call_count","bms_call_count","bms_reason_code","bms_resolution_status","candidate_intent","candidate_source","candidate_target_mode","clarification_required","classifier_call_count","classifier_eligibility","classifier_logical_route","classifier_status","confidence_band","cr_history_policy_call_count","cr_policy_status","deterministic_match_status","explicit_verification_requested","feature_enabled","fresh_verification_entry_status","history_lookup_allowed","lineage_dereference_count","lineage_result","render_status","resolution_source","resolved_record_kind","verification_after_history_allowed"]'
 
 restart_orchestrator_with_history_followup() {
