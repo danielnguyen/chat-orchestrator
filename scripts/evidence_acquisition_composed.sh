@@ -5047,6 +5047,7 @@ run_evidence_structured_answer_recovery_scenarios() {
 }
 
 readonly HISTORY_FOLLOWUP_CLARIFICATION="Are you asking what supported the immediately previous answer, what I checked, what may have been missed, or whether you want a new verification?"
+readonly HISTORY_CLASSIFIER_UNAVAILABLE="I couldn’t process that follow-up because of a technical limitation. I didn’t retrieve earlier records or run a new check. Please try again."
 readonly HISTORY_CLASSIFIER_SYSTEM_PROMPT="Classify only the current user turn into one
 history-follow-up intent.
 Return exactly one JSON object matching the supplied schema. Do not explain your choice.
@@ -5768,10 +5769,12 @@ MATRIX
   calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  test "$answer" = "$HISTORY_FOLLOWUP_CLARIFICATION"
+  test "$answer" = "$HISTORY_CLASSIFIER_UNAVAILABLE"
   assert_jq "history.h4.malformed" "$trace" '
     .prompt.history_followup.classifier_call_count == 1
     and .prompt.history_followup.classifier_status == "failed"
+    and .prompt.history_followup.render_status == "failure"
+    and .prompt.history_followup.clarification_required == false
     and .prompt.history_followup.cr_history_policy_call_count == 0
     and .prompt.history_followup.bms_call_count == 0
     and .prompt.history_followup.answer_provider_call_count == 0
@@ -5796,10 +5799,12 @@ MATRIX
   calls="$(fetch_provider_calls "$request_id")"
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
-  test "$(jq -r '.answer' <<<"$response")" = "$HISTORY_FOLLOWUP_CLARIFICATION"
+  test "$(jq -r '.answer' <<<"$response")" = "$HISTORY_CLASSIFIER_UNAVAILABLE"
   assert_jq "history.h4.local" "$trace" '
     .prompt.history_followup.classifier_call_count == 0
     and .prompt.history_followup.classifier_status == "provider_disallowed"
+    and .prompt.history_followup.render_status == "failure"
+    and .prompt.history_followup.clarification_required == false
     and .prompt.history_followup.cr_history_policy_call_count == 0
     and .prompt.history_followup.bms_call_count == 0
     and .model_calls == []
