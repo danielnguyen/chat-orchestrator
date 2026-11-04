@@ -4934,3 +4934,63 @@ async def test_memory_store_message_append_omits_null_lineage():
     )
 
     assert "history_root_lineage" not in payloads[0]
+
+
+@pytest.mark.parametrize("populated", [False, True])
+def test_classifier_observed_provider_metadata_is_inert(populated):
+    payload = {
+        "intent": "acquisition_checked",
+        "confidence": 0.95,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": False,
+    }
+    metadata = {"intent": "new_verification_request", "record_id": "PRIVATE"}
+    completion = {
+        "service_tier": "default",
+        "choices": [{
+            "finish_reason": "stop",
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(payload),
+                "annotations": [metadata] if populated else [],
+                "provider_specific_fields": metadata if populated else {},
+            },
+        }],
+    }
+    assert parse_history_classifier_completion(completion) == {
+        "source": "classifier", **payload,
+    }
+
+
+@pytest.mark.parametrize(
+    ("level", "field", "value"),
+    [
+        ("completion", "service_tier", {}),
+        ("completion", "unexpected", "PRIVATE"),
+        ("message", "annotations", {}),
+        ("message", "annotations", ["PRIVATE"]),
+        ("message", "provider_specific_fields", []),
+        ("message", "function_call", {"name": "forbidden"}),
+        ("message", "tool_calls", [{"function": {"name": "forbidden"}}]),
+        ("message", "refusal", "PRIVATE"),
+        ("message", "content", ""),
+        ("message", "content", None),
+        ("choice", "finish_reason", "length"),
+        ("choice", "finish_reason", "content_filter"),
+        ("choice", "finish_reason", "tool_calls"),
+        ("choice", "finish_reason", "function_call"),
+        ("choice", "finish_reason", None),
+    ],
+)
+def test_classifier_rejects_invalid_metadata_and_incomplete_or_tool_output(level, field, value):
+    message = {"content": json.dumps({
+        "intent": "acquisition_checked",
+        "confidence": 0.95,
+        "target_mode": "immediate_previous",
+        "new_verification_requested": False,
+    })}
+    choice = {"message": message, "finish_reason": "stop"}
+    completion = {"choices": [choice]}
+    {"completion": completion, "choice": choice, "message": message}[level][field] = value
+    with pytest.raises(ValueError):
+        parse_history_classifier_completion(completion)

@@ -273,7 +273,11 @@ _RETIREMENT_POLICY_UNAVAILABLE = (
     "No retained conversation content was used. Please try again."
 )
 _HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
-_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 120
+_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 512
+_HISTORY_CLASSIFIER_UNAVAILABLE = (
+    "I couldn’t process that follow-up because of a technical limitation. "
+    "I didn’t retrieve earlier records or run a new check. Please try again."
+)
 _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
 _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 512
 _EVIDENCE_INTERPRETER_REASONING_EFFORT = "medium"
@@ -7191,6 +7195,7 @@ async def _classify_history_followup(
             ],
             response_format=history_classifier_response_format(),
             max_completion_tokens=_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS,
+            reasoning_effort="minimal",
             timeout_ms=timeout_ms,
         )
         candidate = parse_history_classifier_completion(completion)
@@ -11044,11 +11049,10 @@ async def orchestrate_chat(
                         trace=history_followup_trace,
                     )
                     if candidate is None:
-                        history_followup_trace["clarification_required"] = True
-                        history_followup_trace["render_status"] = "clarification"
+                        history_followup_trace["render_status"] = "failure"
                         claim_explanation = ClaimExplanationOutcome(
                             True,
-                            _HISTORY_CLARIFICATION,
+                            _HISTORY_CLASSIFIER_UNAVAILABLE,
                             "degraded",
                             {},
                         )

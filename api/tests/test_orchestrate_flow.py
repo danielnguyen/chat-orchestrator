@@ -36893,8 +36893,9 @@ class PersistedOrdinaryAcquisitionMemoryStore(FakeMemoryStore):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("natural_followup", [False, True])
 async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followup(
-    tmp_path,
+    tmp_path, natural_followup,
 ):
     rules, models = _write_history_route_files(
         tmp_path,
@@ -37059,11 +37060,20 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         for summary in manifest["acquisition"]["source_summaries"]
     ] == ["EV maintenance log", "Primary vehicle maintenance log"]
 
+    followup_text = "Which records did you check?" if natural_followup else "what did you check?"
+    if natural_followup:
+        completion = _classifier_completion("acquisition_checked")
+        completion["service_tier"] = "default"
+        completion["choices"][0]["finish_reason"] = "stop"
+        completion["choices"][0]["message"].update({
+            "annotations": [], "provider_specific_fields": {"record_id": "PRIVATE_METADATA"},
+        })
+        provider.completions.append(completion)
     follow_up = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            "what did you check?",
+            followup_text,
             conversation_id=original["conversation_id"],
-            messages=[{"role": "user", "content": "what did you check?"}],
+            messages=[{"role": "user", "content": followup_text}],
         ),
         memory_store=memory_store,
         litellm=provider,
@@ -37126,7 +37136,9 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
         },
     ]
     assert len(candidate_calls) == 1
-    assert len(provider.calls) == 2
+    assert len(provider.calls) == 2 + int(natural_followup)
+    assert history_trace["classifier_call_count"] == int(natural_followup)
+    assert "PRIVATE_METADATA" not in json.dumps((follow_up, follow_up_prompt_trace))
     assert history_trace["bms_resolution_status"] == "resolved"
     assert follow_up_prompt_trace["claim_explanation"][
         "manifest_projection_status"
@@ -37543,8 +37555,8 @@ async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
     assert result["selected_model"] == "not_called"
     assert len(litellm.calls) == 1
     assert litellm.calls[0]["timeout_ms"] == 3000
-    assert litellm.calls[0]["max_completion_tokens"] == 120
-    assert "reasoning_effort" not in litellm.calls[0]
+    assert litellm.calls[0]["max_completion_tokens"] == 512
+    assert litellm.calls[0]["reasoning_effort"] == "minimal"
     assert len(runtime.interaction_governance_calls) == 2
     assert len(memory_store.immediate_history_calls) == 1
     assert memory_store.retrieve_calls == []
@@ -37580,8 +37592,8 @@ async def test_provider_paths_use_independent_nondefault_timeouts(tmp_path):
     assert evidence_litellm.calls[0]["max_completion_tokens"] == 512
     assert evidence_litellm.calls[0]["reasoning_effort"] == "medium"
     assert history_litellm.calls[0]["timeout_ms"] == 1111
-    assert history_litellm.calls[0]["max_completion_tokens"] == 120
-    assert "reasoning_effort" not in history_litellm.calls[0]
+    assert history_litellm.calls[0]["max_completion_tokens"] == 512
+    assert history_litellm.calls[0]["reasoning_effort"] == "minimal"
 
 
 @pytest.mark.asyncio
@@ -37640,14 +37652,14 @@ async def test_negative_controls_do_not_classify_or_lookup_immediate_history(tmp
         },
     ],
 )
-async def test_classifier_failures_are_provider_free_clarifications(tmp_path, completion):
+async def test_classifier_failures_are_bounded_technical_failures(tmp_path, completion):
     result, memory_store, runtime, litellm = await _run_history_followup(
         tmp_path,
         text="Where did that conclusion come from?",
         completion=completion,
     )
 
-    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert result["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
     assert len(litellm.calls) == 1
     assert len(runtime.interaction_governance_calls) == 1
     assert memory_store.immediate_history_calls == []
@@ -37669,7 +37681,7 @@ async def test_classifier_failures_are_provider_free_clarifications(tmp_path, co
         RuntimeError("classifier client failed"),
     ],
 )
-async def test_classifier_transport_failures_make_one_attempt_and_clarify(
+async def test_classifier_transport_failures_make_one_attempt_and_report_failure(
     tmp_path, error
 ):
     classifier = SequenceLiteLLM([error])
@@ -37678,7 +37690,7 @@ async def test_classifier_transport_failures_make_one_attempt_and_clarify(
         text="Where did that conclusion come from?",
         litellm_override=classifier,
     )
-    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert result["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
     assert len(litellm.calls) == 1
     assert len(runtime.interaction_governance_calls) == 1
     assert memory_store.immediate_history_calls == []
@@ -37698,7 +37710,7 @@ async def test_cloud_classifier_is_disallowed_by_local_only_but_local_route_is_a
         completion=_classifier_completion("support_explanation"),
         payload_overrides={"sensitivity": "local_only"},
     )
-    assert blocked["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert blocked["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
     assert blocked_litellm.calls == []
     assert len(blocked_runtime.interaction_governance_calls) == 1
     assert blocked_store.immediate_history_calls == []
@@ -37745,7 +37757,7 @@ async def test_cloud_classifier_respects_profile_surface_and_provider_policy(
         payload_overrides=payload_overrides,
         routing_policy=routing_policy,
     )
-    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert result["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
     assert litellm.calls == []
     assert len(runtime.interaction_governance_calls) == 1
     assert memory_store.immediate_history_calls == []
@@ -37762,7 +37774,7 @@ async def test_malformed_classifier_route_fails_closed_without_provider_or_bms(
         completion=_classifier_completion("support_explanation"),
         provider=provider,
     )
-    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert result["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
     assert litellm.calls == []
     assert len(runtime.interaction_governance_calls) == 1
     assert memory_store.immediate_history_calls == []
@@ -45556,3 +45568,76 @@ async def test_dependency_timing_diagnostics_do_not_change_ordinary_turn_or_trac
         assert records[0]["request_id"] == out["request_id"]
         assert records[0]["request_outcome"] == "returned"
     assert timing._request_timings.get() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_records_followup_with_observed_provider_envelope(tmp_path, truncated):
+    completion = _classifier_completion("acquisition_checked")
+    completion.update({
+        "id": "classifier-response", "created": 1, "model": "gpt-5-mini",
+        "object": "chat.completion", "service_tier": "default",
+        "usage": {"completion_tokens": 120, "completion_tokens_details": {
+            "reasoning_tokens": 120,
+        }},
+    })
+    choice = completion["choices"][0]
+    choice["finish_reason"] = "length" if truncated else "stop"
+    choice["message"].update({
+        "role": "assistant", "annotations": [],
+        "provider_specific_fields": {"record_id": "PRIVATE_METADATA"},
+    })
+    if truncated:
+        choice["message"]["content"] = ""
+    result, memory_store, runtime, provider = await _run_history_followup(
+        tmp_path, text="Which records did you check?", completion=completion,
+    )
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["max_completion_tokens"] == 512
+    assert provider.calls[0]["reasoning_effort"] == "minimal"
+    assert result["selected_model"] == "not_called"
+    assert memory_store.retrieve_calls == []
+    assert trace["answer_provider_call_count"] == 0
+    assert trace["fresh_verification_entry_status"] == "not_requested"
+    assert "PRIVATE_METADATA" not in json.dumps((result, trace))
+    if truncated:
+        assert result["answer"] == orchestrate_service._HISTORY_CLASSIFIER_UNAVAILABLE
+        assert trace["classifier_status"] == "failed"
+        assert trace["render_status"] == "failure"
+        assert trace["clarification_required"] is False
+        assert memory_store.immediate_history_calls == []
+        assert len(runtime.interaction_governance_calls) == 1
+    else:
+        assert trace["classifier_status"] == "accepted"
+        assert trace["candidate_intent"] == "acquisition_checked"
+        assert trace["cr_policy_status"] == "accepted"
+        # The default fixture has no acquisition record; never reconstruct one.
+        assert trace["bms_resolution_status"] == "no_record"
+        assert "couldn’t resolve a retained acquisition record" in result["answer"]
+        assert len(memory_store.immediate_history_calls) == 1
+        lookup = memory_store.immediate_history_calls[0]
+        assert lookup["owner_id"] == "owner"
+        assert lookup["conversation_id"] == "conv-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intent,confidence", [
+    ("acquisition_checked", 0.55), ("ambiguous_history_followup", 0.95),
+])
+async def test_uncertain_history_intent_remains_distinct_from_technical_failure(
+    tmp_path, intent, confidence
+):
+    result, memory_store, runtime, provider = await _run_history_followup(
+        tmp_path, text="Which records did you check?",
+        completion=_classifier_completion(intent, confidence=confidence),
+        policy_status="clarification_required",
+    )
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
+    assert trace["classifier_status"] == "accepted"
+    assert trace["clarification_required"] is True
+    assert trace["render_status"] == "clarification"
+    assert len(provider.calls) == 1
+    assert len(runtime.interaction_governance_calls) == 2
+    assert memory_store.immediate_history_calls == memory_store.retrieve_calls == []
