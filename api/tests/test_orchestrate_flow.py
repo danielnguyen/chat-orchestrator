@@ -37464,7 +37464,25 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
     assert len(litellm.calls) == 1
     classifier_call = litellm.calls[0]
     assert classifier_call["model"] == "gpt-5-mini"
-    assert classifier_call["messages"][-1] == {"role": "user", "content": text}
+    assert classifier_call["messages"] == [
+        {"role": "system", "content": orchestrate_service._HISTORY_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+    prompt = classifier_call["messages"][0]["content"]
+    assert (
+        "Confidence measures how clearly the current wording identifies the intent and target mode"
+        in prompt
+    )
+    assert (
+        "It does not certify retained evidence, source completeness, or historical truth" in prompt
+    )
+    assert "Missing evidence is not linguistic ambiguity" in prompt
+    assert "Preserve uncertainty" in prompt
+    assert "raise confidence to obtain history access" in prompt
+    assert "Express target uncertainty through confidence\nand ambiguous_history_followup" in prompt
+    stated_modes = prompt.split("Allowed target modes: ", 1)[1].split(".", 1)[0].split(", ")
+    schema = classifier_call["response_format"]["json_schema"]["schema"]
+    assert stated_modes == schema["properties"]["target_mode"]["enum"]
     serialized_classifier = json.dumps(classifier_call, sort_keys=True)
     for forbidden in (
         "PRIVATE RAW SUMMARY",
@@ -37539,6 +37557,11 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
     [
         ("Where did that conclusion come from?", "support_explanation", False),
         ("Which records did you look at?", "acquisition_checked", False),
+        (
+            "Could you list the records consulted for your last answer?",
+            "acquisition_checked", False,
+        ),
+        ("What material did you examine before answering?", "acquisition_checked", False),
         ("Did you cover everything available?", "acquisition_coverage", False),
         ("Anything you may have skipped?", "acquisition_gaps", False),
         ("Can you verify that again now?", "new_verification_request", True),
@@ -37547,6 +37570,7 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
 async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
     tmp_path, text, intent, verify
 ):
+    # Supplied classifications test integration mechanics, not model calibration.
     result, memory_store, runtime, litellm = await _run_history_followup(
         tmp_path,
         text=text,
@@ -45622,20 +45646,26 @@ async def test_records_followup_with_observed_provider_envelope(tmp_path, trunca
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("intent,confidence", [
-    ("acquisition_checked", 0.55), ("ambiguous_history_followup", 0.95),
+@pytest.mark.parametrize("text,intent,confidence", [
+    ("Which records did you check?", "acquisition_checked", 0.55),
+    ("Could you list the records consulted for your last answer?", "acquisition_checked", 0.75),
+    ("What about that evidence?", "ambiguous_history_followup", 0.95),
 ])
 async def test_uncertain_history_intent_remains_distinct_from_technical_failure(
-    tmp_path, intent, confidence
+    tmp_path, text, intent, confidence
 ):
     result, memory_store, runtime, provider = await _run_history_followup(
-        tmp_path, text="Which records did you check?",
+        tmp_path, text=text,
         completion=_classifier_completion(intent, confidence=confidence),
         policy_status="clarification_required",
     )
     trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
     assert result["answer"] == orchestrate_service._HISTORY_CLARIFICATION
     assert trace["classifier_status"] == "accepted"
+    candidate = runtime.interaction_governance_calls[1]["history_followup_candidate"]
+    assert candidate["confidence"] == confidence
+    assert candidate["intent"] == intent
+    assert trace["fresh_verification_entry_status"] == "not_requested"
     assert trace["clarification_required"] is True
     assert trace["render_status"] == "clarification"
     assert len(provider.calls) == 1

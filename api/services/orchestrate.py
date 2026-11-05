@@ -355,7 +355,19 @@ acquisition_coverage asks whether available scope was covered.
 acquisition_gaps asks what may have been missed.
 new_verification_request explicitly asks for a fresh check.
 ambiguous_history_followup is plausibly historical but its requested kind is unclear.
-not_history_followup is an ordinary question or instruction."""
+not_history_followup is an ordinary question or instruction.
+Confidence measures how clearly the current wording identifies the intent and target mode.
+It does not certify retained evidence, source completeness, or historical truth.
+A clear request to list records examined for the preceding answer can be high confidence
+without seeing those records or the answer. Missing evidence is not linguistic ambiguity.
+Use high confidence (>=0.85) when both intent and target mode are clear; medium (0.60-<0.85)
+when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported.
+Preserve uncertainty when the wording admits competing intents or target modes; do not
+raise confidence to obtain history access. Express target uncertainty through confidence
+and ambiguous_history_followup. Allowed target modes: immediate_previous, explicit_reference.
+Asking what was examined does not imply it supported the answer or covered all available
+sources. Asking about support, coverage, or gaps does not itself request fresh verification.
+Set new_verification_requested true only for an explicit fresh-check request."""
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
