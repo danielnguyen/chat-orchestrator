@@ -23855,6 +23855,117 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history", "question", "proposes_source"),
+    [
+        (
+            "The code stayed the same; the second review examined new test results.",
+            "Maybe we should skip the final review next time if the code hasn't changed. "
+            "What do you think?",
+            False,
+        ),
+        (
+            "Keep checking new test results, but avoid repeating the same review evidence.",
+            "What would you keep from that process?",
+            False,
+        ),
+        (
+            "Our walking group enjoyed a shorter route with a longer picnic stop.",
+            "Would you stick with that approach next time?",
+            False,
+        ),
+        (
+            "Our walking group enjoyed a shorter route with a longer picnic stop.",
+            "Which part would you preserve?",
+            False,
+        ),
+        pytest.param(
+            "Our walking group enjoyed a shorter route with a longer picnic stop.",
+            "Would you stick with that approach next time?",
+            True,
+            id="reproduce-topical-source-proposal-withholding",
+        ),
+        (
+            "We discussed whether the next outing fits our plans.",
+            "Check my schedule before recommending a date for the next outing.",
+            True,
+        ),
+        (
+            "You checked the upcoming event in my schedule earlier.",
+            "Is that event still scheduled for tomorrow? Verify it.",
+            True,
+        ),
+    ],
+)
+async def test_conversational_followup_source_routing(tmp_path, history, question, proposes_source):
+    """Fixed interpreter/CR fixtures prove wiring, not live interpretation quality."""
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    class ConversationMemory(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            response = await super().retrieve_bundle(**kwargs)
+            response["bundle"]["recent"][0]["content"] = history
+            response["bundle"]["semantic"] = []
+            return response
+
+    def shape(call):
+        advisory = call["task_context"].get("semantic_advisory")
+        return _semantic_test_shape(
+            call,
+            second_status=("resolved" if advisory and advisory["candidate_source_ids"]
+                           else "no_match"),
+        )
+
+    runtime = FakeRuntime(
+        evidence_shape_response=shape,
+        evidence_plan_response=_targeted_plan_response(
+            request_id="rid-conversational-followup", question=question,
+            eligible_source_ids=["personal_schedule"],
+        ),
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM([
+        _evidence_interpreter_completion(
+            "resolved" if proposes_source else "no_match",
+            "lookup" if proposes_source else "unknown",
+            ["personal_schedule"] if proposes_source else [],
+        ),
+        {"choices": [{"message": {"content": "Keep what helped, and reconsider the rest."}}]},
+    ])
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources",
+        "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    memory = ConversationMemory()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory, litellm=litellm, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-conversational-followup",
+    )
+
+    assert len(runtime.evidence_shape_calls) == 2
+    assert dsa.list_calls == [{}]
+    assert dsa.fetch_calls == dsa.context_calls == []
+    # Existing privacy projection: history reaches answer generation, not the interpreter.
+    assert history not in json.dumps(litellm.calls[0]["messages"])
+    if proposes_source:
+        assert len(runtime.evidence_plan_calls) == len(dsa.calls) == 1
+        assert dsa.calls[0]["source_ids"] == ["personal_schedule"]
+        assert len(litellm.calls) == 1
+        assert "withholding the requested conclusion" in out["answer"]
+    else:
+        assert runtime.evidence_plan_calls == dsa.calls == []
+        assert len(litellm.calls) == 2
+        assert history in json.dumps(litellm.calls[1]["messages"])
+        assert out["answer"] == "Keep what helped, and reconsider the rest."
+        assert out["status"] == "ok"
+
+
+@pytest.mark.asyncio
 async def test_matched_targeted_no_match_returns_to_existing_provider_path(tmp_path):
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     question = "What makes a review useful?"

@@ -2959,6 +2959,20 @@ def test_evidence_interpreter_inventory_is_canonical_and_private():
         assert domain_term not in system_instruction.lower()
 
 
+def test_evidence_interpreter_distinguishes_conversation_advice_from_source_need():
+    messages = evidence_interpreter_messages(
+        task_text="What would you keep from that process?",
+        source_list=DsaSourceListResponse.model_validate({"sources": [_source("source_a")]}),
+    )
+    guidance = messages[0]["content"]
+    assert "materially depends on information from a configured source" in guidance
+    assert "advice, judgment, reflection, or a contextual follow-up" in guidance
+    assert 'interpretation_status=no_match, operation_hint=unknown' in guidance
+    assert "Topical similarity alone" in guidance
+    assert "explicit verification" in guidance
+    assert "Cognitive Runtime" in guidance
+
+
 def test_evidence_interpreter_continuation_keeps_current_request_and_inventory_primary():
     inventory = DsaSourceListResponse.model_validate(
         {"sources": [_source("current_source"), _source("explicit_source")]}
