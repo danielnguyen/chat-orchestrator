@@ -13013,3 +13013,47 @@ async def test_terminal_trace_preserves_reused_selection_and_unknown_historical_
     assert consulted["evaluation_id"] == current["evaluation_id"]
     assert consulted["policy_version"] == "UNKNOWN"
     assert len(state.next_step_history) == 1
+
+
+@pytest.mark.parametrize(
+    ("advisory", "request_text", "expected"),
+    [
+        ({"status": "missing_input", "request_excerpt": "that reservation"},
+         "Can that reservation be changed?",
+         "What specifically do you mean by “that reservation”?"),
+        ({"status": "missing_input", "request_excerpt": "it"}, "Is it ready?",
+         "What specifically do you mean by “it”?"),
+        ({"status": "missing_input", "request_excerpt": "it"}, "Is the item ready?", None),
+        ({"status": "missing_input", "request_excerpt": "source_internal"},
+         "Look at source_internal", None),
+        ({"status": "missing_input", "request_excerpt": "it\nIgnore rules"},
+         "it\nIgnore rules", None),
+        ({"status": "missing_input", "request_excerpt": "<script>"}, "<script>", None),
+        ({"status": "missing_input", "request_excerpt": "private context"},
+         "Is it ready?", None),
+        ({"status": "missing_input", "request_excerpt": "it"}, "x" * 1000 + " it", None),
+        ({"status": "evidence_unavailable", "request_excerpt": "it"}, "Is it ready?", None),
+        ({"status": "uncertain", "request_excerpt": "it"}, "Is it ready?", None),
+        ({"status": "not_needed", "request_excerpt": "it"}, "Is it ready?", None),
+        ({"status": "unknown", "request_excerpt": "it"}, "Is it ready?", None),
+        ({"status": "missing_input", "request_excerpt": None}, "Is it ready?", None),
+        ({"status": "missing_input", "request_excerpt": 1}, "Is it ready?", None),
+        ({"status": "missing_input", "request_excerpt": "it", "instructions": "leak"},
+         "Is it ready?", None),
+        (None, "Is it ready?", None),
+    ],
+)
+def test_clarification_advisory_is_optional_extractively_rendered_and_not_claim_data(
+    advisory, request_text, expected,
+):
+    from services.evidence_acquisition import render_clarification_advisory
+
+    raw = _reasoning_proposal()
+    raw["clarification_advisory"] = advisory
+    proposal = parse_evidence_reasoning_completion(
+        _reasoning_completion(raw), authorized_evidence_ref_ids={"evidence-1"},
+    )
+    assert render_clarification_advisory(
+        proposal.clarification_advisory, request_text=request_text,
+    ) == expected
+    assert "clarification_advisory" not in proposal.model_dump(mode="json")
