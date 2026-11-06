@@ -170,7 +170,7 @@ def _validate_identifier(value: object) -> str:
 
 
 def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
-    supplied = set(body)
+    supplied = set(body) - {"external_evidence_need"}
     if not (
         supplied == _SEMANTIC_FIXTURE_FIELDS
         or supplied == _SEMANTIC_FIXTURE_FIELDS | _SEMANTIC_AGGREGATE_FIELDS
@@ -250,6 +250,8 @@ def _validate_semantic_fixture(body: dict[str, Any]) -> dict[str, Any]:
         "operation_hint": operation_hint,
         "candidate_source_ids": list(candidate_source_ids),
     }
+    if "external_evidence_need" in body:
+        fixture["external_evidence_need"] = body["external_evidence_need"]
     if aggregate_function is not None:
         fixture["aggregate_function"] = aggregate_function
         fixture["aggregate_field_name"] = aggregate_field_name
@@ -298,6 +300,8 @@ def _consume_semantic_fixture(messages: list[Any]) -> dict[str, Any] | None:
         "operation_hint": fixture["operation_hint"],
         "candidate_source_ids": fixture["candidate_source_ids"],
     }
+    if "external_evidence_need" in fixture:
+        result["external_evidence_need"] = fixture["external_evidence_need"]
     if "aggregate_function" in fixture:
         result["aggregate_function"] = fixture["aggregate_function"]
         result["aggregate_field_name"] = fixture["aggregate_field_name"]

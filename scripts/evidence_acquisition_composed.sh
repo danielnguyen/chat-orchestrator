@@ -817,7 +817,7 @@ assert_semantic_interpreter_calls() {
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .response_schema_required
-        == ["interpretation_status", "operation_hint", "candidate_source_ids",
+        == ["external_evidence_need", "interpretation_status", "operation_hint", "candidate_source_ids",
             "aggregate_function", "aggregate_field_name"]
       and .tool_count == 0
       and .max_completion_tokens == 512
@@ -1380,7 +1380,102 @@ run_evidence_source_scope_scenarios() {
   assert_dsa_operation_counts "$audit" 0 0 0
   assert_single_inventory_request 6
   assert_evidence_runtime_events "$diagnostics" "$request_id" 1 0 0 0
+  run_external_evidence_need_scenarios
   echo "Evidence source scope: natural_match=1 semantic_match=1 probes=2 ambiguous=1 ordinary_inventory_only=1"
+}
+
+# Fixed interpreter outputs exercise real receiver routing; they do not evaluate an LLM.
+run_external_evidence_need_scenarios() {
+  local domain variant premise question answer signal owner client conversation_id
+  local response request_id trace manifest provider_calls audit diagnostics fixture
+  local external='{"enabled":true,"allowed_sensitivity":"medium","max_results":5}'
+  for domain in batches tanks; do
+    for variant in supplied implicit verify verify-supplied mixed; do
+      provider_post "/fixture/reset" '{}'
+      reset_source_fixture
+      reset_dsa_audit
+      owner="owner-evidence-need-$domain-$variant"
+      client="client-evidence-need-$domain-$variant"
+      conversation_id="$(resolve_conversation "$owner" "$client" "evidence-need-$domain-$variant")"
+      if [ "$domain" = batches ]; then
+        premise="Batch A takes about 12 hours and batch B about 18 hours."
+        question="Which batch takes longer?"
+        answer="Batch B takes about 6 hours longer."
+      else
+        premise="The east tank holds 40 litres and the west tank holds 65 litres."
+        question="Which tank holds more?"
+        answer="The west tank holds 25 litres more."
+      fi
+      signal="external_facts_needed"
+      if [ "$variant" != implicit ]; then
+        question="$premise $question"
+      fi
+      case "$variant" in
+        supplied) signal="supplied_information_sufficient" ;;
+        verify) question="$question Independently verify those values." ;;
+        verify-supplied)
+          question="$question Independently verify those values."
+          signal="supplied_information_sufficient"
+          ;;
+        mixed) question="$question Also find the latest inspection result." ;;
+      esac
+      fixture="$(jq -nc --arg question "$question" --arg signal "$signal" '{
+        expected_request_text:$question,
+        expected_source_id:"complete_register",
+        expected_content_fields:["Entry","Required","Status"],
+        interpretation_status:"ambiguous",
+        operation_hint:"comparison",
+        candidate_source_ids:["complete_register","records_primary"],
+        external_evidence_need:$signal
+      }')"
+      queue_semantic_interpretation "$fixture"
+      if [ "$variant" = supplied ]; then
+        queue_provider_answer "$answer"
+      fi
+      response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "$question" "$external")"
+      request_id="$(jq -r '.request_id' <<<"$response")"
+      trace="$(fetch_trace "$request_id")"
+      manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
+      provider_calls="$(fetch_provider_calls "$request_id")"
+      audit="$(fetch_dsa_audit)"
+      diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+      assert_semantic_interpreter_calls "$provider_calls" 1
+      assert_jq "evidence_need.accepted" "$trace" '
+        .prompt.semantic_interpreter.status == "accepted"
+        and .prompt.semantic_interpreter.operation_hint == "comparison"
+        and .prompt.semantic_interpreter.candidate_count == 2
+      '
+      if [ "$variant" = supplied ]; then
+        jq -e --arg answer "$answer" '.status == "ok" and .answer == $answer' \
+          <<<"$response" >/dev/null
+        assert_jq "evidence_need.ordinary" "$manifest" '
+          .status == "not_applicable"
+          and .shape.derivation_status == "not_applicable"
+          and .plan.plan_status == "not_compiled"
+          and .acquisition.dsa_outcome == "not_called"
+        '
+        assert_dsa_operation_counts "$audit" 0 0 0
+        assert_evidence_runtime_events "$diagnostics" "$request_id" 2 0 0 0
+        assert_jq "evidence_need.answer_call" "$provider_calls" '
+          ([.calls[] | select(.kind == "chat")] | length) == 1
+        '
+      else
+        assert_jq "evidence_need.governed" "$manifest" '
+          .shape.derivation_status == "derived"
+          and .shape.task_shape == "cross_source_comparison"
+          and .shape.source_match.probe_source_count == 2
+          and .plan.plan_status != "not_compiled"
+          and .acquisition.dsa_outcome != "not_called"
+        '
+        assert_jq "evidence_need.bounded_sources" "$audit" '
+          [.[] | select(.operation == "context_pack")] as $calls
+          | ($calls | length) == 1
+          and ($calls[0].source_ids | sort) == ["complete_register","records_primary"]
+        '
+      fi
+    done
+  done
+  echo "External evidence need: supplied=2 implicit=2 verification=4 mixed=2"
 }
 
 run_evidence_targeted_scenario() {

@@ -3091,6 +3091,10 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
     assert response_format["type"] == "json_schema"
     assert schema["strict"] is True
     assert schema["schema"]["additionalProperties"] is False
+    assert schema["schema"]["properties"]["external_evidence_need"] == {
+        "type": "string",
+        "enum": ["supplied_information_sufficient", "external_facts_needed", "uncertain"],
+    }
     candidate_schema = schema["schema"]["properties"]["candidate_source_ids"]
     assert candidate_schema["type"] == "array"
     assert candidate_schema["maxItems"] == 3
@@ -3102,6 +3106,7 @@ def test_evidence_interpreter_response_format_is_strict_and_closed():
         "pattern": r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     }
     assert schema["schema"]["required"] == [
+        "external_evidence_need",
         "interpretation_status",
         "operation_hint",
         "candidate_source_ids",
@@ -13064,3 +13069,84 @@ def test_clarification_advisory_is_optional_extractively_rendered_and_not_claim_
         proposal.clarification_advisory, request_text=request_text,
     ) == expected
     assert "clarification_advisory" not in proposal.model_dump(mode="json")
+
+
+@pytest.mark.parametrize("signal", [
+    "supplied_information_sufficient", "external_facts_needed", "uncertain",
+    None, "", "unsupported", "EXTERNAL_FACTS_NEEDED", True, 1, [], {},
+])
+@pytest.mark.parametrize("status,candidates", [
+    ("resolved", ["source_a"]),
+    ("resolved", ["source_a", "source_b"]),
+    ("no_match", ["source_a"]),
+])
+def test_external_evidence_need_preserves_valid_advice(signal, status, candidates):
+    payload = {
+        "interpretation_status": status,
+        "operation_hint": "comparison",
+        "candidate_source_ids": candidates,
+    }
+    legacy = parse_evidence_interpreter_completion(
+        _semantic_completion(payload), inventory_source_ids={"source_a", "source_b"},
+    )
+    payload["external_evidence_need"] = signal
+    expected = dict(legacy)
+    if isinstance(signal, str) and signal in {
+        "supplied_information_sufficient", "external_facts_needed", "uncertain",
+    }:
+        expected["external_evidence_need"] = signal
+    assert parse_evidence_interpreter_completion(
+        _semantic_completion(payload), inventory_source_ids={"source_a", "source_b"},
+    ) == expected
+
+
+@pytest.mark.parametrize("signal", ["supplied_information_sufficient", {}, None])
+@pytest.mark.parametrize("invalid", [
+    {"candidate_source_ids": ["unauthorized"]},
+    {"candidate_source_ids": ["source_a", "source_a"]},
+    {"operation_hint": "invented"},
+    {"extra_authority": True},
+])
+def test_external_evidence_need_does_not_relax_other_validation(signal, invalid):
+    payload = {
+        "interpretation_status": "resolved", "operation_hint": "lookup",
+        "candidate_source_ids": ["source_a"], "external_evidence_need": signal,
+        **invalid,
+    }
+    with pytest.raises(ProviderOutputValidationError):
+        parse_evidence_interpreter_completion(
+            _semantic_completion(payload), inventory_source_ids={"source_a"},
+        )
+
+
+@pytest.mark.parametrize("optional", [
+    {},
+    {"external_evidence_need": "supplied_information_sufficient"},
+    {"external_evidence_need": "external_facts_needed"},
+    {"external_evidence_need": "uncertain"},
+    {"external_evidence_need": None},
+    {"external_evidence_need": {"malformed": True}},
+])
+def test_composed_fixture_transports_external_evidence_need(optional):
+    from tools import composed_provider_stub as stub
+
+    fixture = stub._validate_semantic_fixture({
+        "expected_request_text": "Which container holds more?",
+        "expected_source_id": "source_a", "expected_content_fields": [],
+        "interpretation_status": "ambiguous", "operation_hint": "comparison",
+        "candidate_source_ids": ["source_a", "source_b"], **optional,
+    })
+    stub._next_semantic_interpretations.append(fixture)
+    try:
+        output = stub._consume_semantic_fixture([{
+            "role": "user", "content": json.dumps({
+                "request_text": "Which container holds more?",
+                "sources": [{"source_id": "source_a", "content_fields": []}],
+            }),
+        }])
+        assert output == {
+            "interpretation_status": "ambiguous", "operation_hint": "comparison",
+            "candidate_source_ids": ["source_a", "source_b"], **optional,
+        }
+    finally:
+        stub._next_semantic_interpretations.clear()
