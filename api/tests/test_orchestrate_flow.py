@@ -37580,18 +37580,18 @@ async def test_thin_client_natural_paraphrase_uses_one_classifier_and_bms_record
         {"role": "user", "content": text},
     ]
     prompt = classifier_call["messages"][0]["content"]
+    assert "Confidence measures clarity of the current wording's intent and target mode" in prompt
     assert (
-        "Confidence measures how clearly the current wording identifies the intent and target mode"
+        "not whether retained evidence exists, sources are complete, or a claim is true" in prompt
+    )
+    assert "can be high confidence without seeing the records or answer" in prompt
+    assert "Preserve competing interpretations" in prompt
+    assert "Never raise confidence to obtain history access" in prompt
+    assert (
+        "Express historical target uncertainty through confidence and ambiguous_history_followup"
         in prompt
     )
-    assert (
-        "It does not certify retained evidence, source completeness, or historical truth" in prompt
-    )
-    assert "Missing evidence is not linguistic ambiguity" in prompt
-    assert "Preserve uncertainty" in prompt
-    assert "raise confidence to obtain history access" in prompt
-    assert "Express target uncertainty through confidence\nand ambiguous_history_followup" in prompt
-    stated_modes = prompt.split("Allowed target modes: ", 1)[1].split(".", 1)[0].split(", ")
+    stated_modes = prompt.split("Allowed target modes are ", 1)[1].split(".", 1)[0].split(" and ")
     schema = classifier_call["response_format"]["json_schema"]["schema"]
     assert stated_modes == schema["properties"]["target_mode"]["enum"]
     serialized_classifier = json.dumps(classifier_call, sort_keys=True)
@@ -37750,10 +37750,14 @@ async def test_new_lookup_with_missing_inputs_can_reach_normal_answer(
         {"role": "user", "content": text},
     ]
     prompt = classifier_call["messages"][0]["content"]
-    assert "A conversational referent is not itself a reference to an answer's evidence" in prompt
-    assert "Missing task inputs do not make a new lookup an ambiguous history follow-up" in prompt
-    assert "new_verification_request explicitly asks to freshly verify an earlier answer" in prompt
-    assert "For independent lookups, return not_history_followup" in prompt
+    # Pin the exact UTF-8 prompt evaluated in the owner-operated candidate replay.
+    assert hashlib.sha256(prompt.encode("utf-8")).hexdigest() == (
+        "46c6496640a561f03c8c8870bec8905448082734e8824992f139f55c693c1e80"
+    )
+    assert "Missing lookup inputs are not omissions in an earlier evidence search" in prompt
+    assert (
+        "not_history_followup: an ordinary question, instruction, or independent lookup" in prompt
+    )
     assert classifier_call["max_completion_tokens"] == 512
     assert classifier_call["reasoning_effort"] == "minimal"
     assert "response_format" not in answer_call

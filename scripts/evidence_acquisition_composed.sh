@@ -5048,42 +5048,7 @@ run_evidence_structured_answer_recovery_scenarios() {
 
 readonly HISTORY_FOLLOWUP_CLARIFICATION="Are you asking what supported the immediately previous answer, what I checked, what may have been missed, or whether you want a new verification?"
 readonly HISTORY_CLASSIFIER_UNAVAILABLE="I couldn’t process that follow-up because of a technical limitation. I didn’t retrieve earlier records or run a new check. Please try again."
-readonly HISTORY_CLASSIFIER_SYSTEM_PROMPT="Classify only the current user turn into one
-history-follow-up intent.
-Return exactly one JSON object matching the supplied schema. Do not explain your choice.
-Use immediate_previous only for an unquoted request about the immediately previous answer.
-Use explicit_reference only when the current text itself explicitly selects an earlier target.
-support_explanation asks what supported or justified the answer.
-acquisition_checked asks what was examined.
-acquisition_coverage asks whether available scope was covered.
-acquisition_gaps asks what may have been missed.
-new_verification_request explicitly asks to freshly verify an earlier answer or claim.
-It does not mean every new request to check a fact or perform a lookup.
-ambiguous_history_followup is plausibly historical but its requested kind is unclear.
-not_history_followup is an ordinary question or instruction.
-First distinguish a task about a conversational subject from a task about an earlier answer.
-A conversational referent is not itself a reference to an answer's evidence.
-A request for new information about that subject is an independent lookup, even if the
-subject was mentioned earlier or the user has not supplied the inputs needed to check it.
-Missing task inputs do not make a new lookup an ambiguous history follow-up.
-For independent lookups, return not_history_followup with new_verification_requested false;
-use immediate_previous only as the schema's required target placeholder, not a history target.
-Reserve ambiguous_history_followup for uncertainty about a genuinely historical request,
-not uncertainty about how to carry out a new task. Explicit requests to recheck an earlier
-answer remain new_verification_request, even when the earlier evidence may be missing.
-Confidence measures how clearly the current wording identifies the intent and target mode.
-It does not certify retained evidence, source completeness, or historical truth.
-A clear request to list records examined for the preceding answer can be high confidence
-without seeing those records or the answer. Missing evidence is not linguistic ambiguity.
-Use high confidence (>=0.85) when both intent and target mode are clear; medium (0.60-<0.85)
-when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported.
-Preserve uncertainty when the wording admits competing intents or target modes; do not
-raise confidence to obtain history access. Express target uncertainty through confidence
-and ambiguous_history_followup. Allowed target modes: immediate_previous, explicit_reference.
-Asking what was examined does not imply it supported the answer or covered all available
-sources. Asking about support, coverage, or gaps does not itself request fresh verification.
-Set new_verification_requested true only for an explicit fresh check of an earlier answer
-or claim, not for an independent lookup."
+readonly HISTORY_CLASSIFIER_SYSTEM_PROMPT="Classify only the current user message. Return exactly one JSON object matching the supplied schema. Do not answer the user or explain your classification.  First identify what the user wants examined: an earlier assistant answer and its basis, or a subject in the world. Classify the requested operation, not merely the presence of conversational references such as \"that\", \"you\", or \"check\".  Previous-answer targeting applies when the message asks about an earlier answer's support, records examined, coverage, omissions, or explicitly asks to verify that answer or claim again. The reference may be implicit in wording such as \"Which records did you consult?\" It need not say \"previous answer\". Do not invent a previous claim from a reference to a conversational subject.  A request for new information or a new lookup about that subject is not_history_followup. This remains true when the subject was mentioned earlier, its identity is unclear, or the user has not supplied the inputs needed for the lookup. Missing lookup inputs are not omissions in an earlier evidence search. An independent lookup may need clarification by the ordinary answer path; that does not make it ambiguous_history_followup.  Examples: \"Can you check the tracking status of that package? I haven't given you a carrier or tracking number.\" => not_history_followup; new_verification_requested false. \"What evidence supported your previous answer about that package?\" => support_explanation; new_verification_requested false. \"Please check fresh sources to verify your previous answer about that package.\" => new_verification_request; new_verification_requested true. \"Can you check whether that appointment is confirmed? I haven't supplied a booking reference.\" => not_history_followup; new_verification_requested false. \"Which records did you consult for your last answer?\" => acquisition_checked; new_verification_requested false. \"What might you have missed when checking sources for your last answer?\" => acquisition_gaps; new_verification_requested false. \"What about that evidence?\" => ambiguous_history_followup; new_verification_requested false. \"What would you recommend for that situation?\" => not_history_followup; new_verification_requested false.  For requests about an earlier answer, choose the requested kind: support_explanation: what supported or justified the answer. acquisition_checked: what was examined. acquisition_coverage: whether the available scope was covered. acquisition_gaps: what may have been missed in the earlier examination. new_verification_request: an explicit fresh check of an earlier answer or claim. ambiguous_history_followup: a plausibly historical evidence request whose kind or target is genuinely uncertain. not_history_followup: an ordinary question, instruction, or independent lookup.  Choose target_mode after intent: Use immediate_previous for an unquoted request about the immediately previous answer. Use explicit_reference only when the current text itself explicitly selects an earlier target. For not_history_followup, use immediate_previous solely as the required schema placeholder; it does not assert a historical target. Allowed target modes are immediate_previous and explicit_reference.  Set new_verification_requested true only when the user explicitly requests a fresh check of an earlier answer or claim. Questions about support, checked records, coverage, or gaps do not by themselves request fresh verification. For not_history_followup and ambiguous_history_followup, set it false.  Confidence measures clarity of the current wording's intent and target mode, not whether retained evidence exists, sources are complete, or a claim is true. A clear request to list records consulted can be high confidence without seeing the records or answer. A clear independent lookup can be high confidence even when required lookup inputs are missing. Use high confidence (>=0.85) when intent and target mode are clear; medium (0.60-<0.85) when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported. Preserve competing interpretations. Express historical target uncertainty through confidence and ambiguous_history_followup. Never raise confidence to obtain history access.  Classifying a request does not establish that anything was checked, supported, covered, missed, or verified. Do not reconstruct history or select record IDs."
 readonly HISTORY_TRACE_KEYS='["answer_provider_call_count","bms_call_count","bms_reason_code","bms_resolution_status","candidate_intent","candidate_source","candidate_target_mode","clarification_required","classifier_call_count","classifier_eligibility","classifier_logical_route","classifier_status","confidence_band","cr_history_policy_call_count","cr_policy_status","deterministic_match_status","explicit_verification_requested","feature_enabled","fresh_verification_entry_status","history_lookup_allowed","lineage_dereference_count","lineage_result","render_status","resolution_source","resolved_record_kind","verification_after_history_allowed"]'
 
 restart_orchestrator_with_history_followup() {
