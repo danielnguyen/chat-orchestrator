@@ -877,6 +877,7 @@ assert_general_evidence_reasoning_calls() {
       and .response_schema_strict == true
       and .response_schema_additional_properties == false
       and .response_schema_required == [
+        "clarification_advisory",
         "proposed_claim",
         "supporting_evidence_ref_ids",
         "counterevidence_ref_ids",

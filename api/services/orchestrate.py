@@ -143,6 +143,7 @@ from services.evidence_acquisition import (
     project_generic_scope_authority,
     promote_exact_fetch_proposal,
     provider_allowed,
+    render_clarification_advisory,
     render_governed_evidence_answer,
     render_process_failure_response,
     retain_initial_attempt_summary,
@@ -8552,6 +8553,10 @@ async def _run_general_evidence_reasoning(
             list(state.shape.reason_codes) if state.shape is not None else None
         ),
     )
+    if result["conclusion_disposition"] == "withheld":
+        output["clarification_answer"] = render_clarification_advisory(
+            proposal.clarification_advisory, request_text=request_text,
+        )
     output.update(
         {
             "proposal": proposal.model_dump(mode="json"),
@@ -14620,7 +14625,7 @@ async def orchestrate_chat(
             elif diagnostic_response is not None:
                 answer = claim_candidate_answer
             else:
-                answer = WITHHELD_ANSWER
+                answer = general_evidence_reasoning.get("clarification_answer") or WITHHELD_ANSWER
             answer_sources = []
             artifact_refs_for_sources = []
         else:
