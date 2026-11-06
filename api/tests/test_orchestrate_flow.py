@@ -37698,6 +37698,78 @@ async def test_natural_history_paraphrase_matrix_calls_classifier_and_bms_once(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("previous", "text", "answer"),
+    [
+        (
+            "Kingston.",
+            "Can you check the tracking status of that package? "
+            "I haven’t given you a carrier or tracking number.",
+            "Please provide the carrier and tracking number. I have not checked its status.",
+        ),
+        (
+            "Montreal.",
+            "Can you check the tracking status of that package? "
+            "I haven’t given you a carrier or tracking number.",
+            "Please provide the carrier and tracking number. I have not checked its status.",
+        ),
+        (
+            "The appointment is tomorrow.",
+            "Can you check the availability of that appointment? "
+            "I haven’t given you a clinic or booking reference.",
+            "Please provide the clinic and booking reference. I have not checked availability.",
+        ),
+    ],
+)
+async def test_new_lookup_with_missing_inputs_can_reach_normal_answer(
+    tmp_path, previous, text, answer
+):
+    # Supplied classifications and answers prove wiring, not native model behavior.
+    provider = SequenceLiteLLM([
+        _classifier_completion("not_history_followup"),
+        {"choices": [{"message": {"content": answer}}]},
+    ])
+    result, memory_store, runtime, _ = await _run_history_followup(
+        tmp_path,
+        text=text,
+        policy_status="not_applicable",
+        litellm_override=provider,
+        payload_overrides={"messages": [
+            {"role": "assistant", "content": previous},
+            {"role": "user", "content": text},
+        ]},
+    )
+
+    assert result["status"] == "ok"
+    assert result["answer"] == answer
+    assert memory_store.immediate_history_calls == []
+    assert len(provider.calls) == 2
+    classifier_call, answer_call = provider.calls
+    assert classifier_call["messages"] == [
+        {"role": "system", "content": orchestrate_service._HISTORY_CLASSIFIER_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+    prompt = classifier_call["messages"][0]["content"]
+    assert "A conversational referent is not itself a reference to an answer's evidence" in prompt
+    assert "Missing task inputs do not make a new lookup an ambiguous history follow-up" in prompt
+    assert "new_verification_request explicitly asks to freshly verify an earlier answer" in prompt
+    assert "For independent lookups, return not_history_followup" in prompt
+    assert classifier_call["max_completion_tokens"] == 512
+    assert classifier_call["reasoning_effort"] == "minimal"
+    assert "response_format" not in answer_call
+    candidate = runtime.interaction_governance_calls[-1]["history_followup_candidate"]
+    assert candidate["intent"] == "not_history_followup"
+    assert candidate["new_verification_requested"] is False
+    trace = memory_store.trace_calls[-1]["payload"]["prompt"]["history_followup"]
+    assert trace["classifier_call_count"] == 1
+    assert trace["bms_call_count"] == 0
+    assert trace["history_lookup_allowed"] is False
+    assert trace["clarification_required"] is False
+    # This counter covers history rendering; ordinary generation is checked above.
+    assert trace["answer_provider_call_count"] == 0
+
+
+@pytest.mark.asyncio
 async def test_provider_paths_use_independent_nondefault_timeouts(tmp_path):
     evidence_litellm = SequenceLiteLLM(
         [

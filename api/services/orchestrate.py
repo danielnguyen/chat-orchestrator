@@ -353,9 +353,20 @@ support_explanation asks what supported or justified the answer.
 acquisition_checked asks what was examined.
 acquisition_coverage asks whether available scope was covered.
 acquisition_gaps asks what may have been missed.
-new_verification_request explicitly asks for a fresh check.
+new_verification_request explicitly asks to freshly verify an earlier answer or claim.
+It does not mean every new request to check a fact or perform a lookup.
 ambiguous_history_followup is plausibly historical but its requested kind is unclear.
 not_history_followup is an ordinary question or instruction.
+First distinguish a task about a conversational subject from a task about an earlier answer.
+A conversational referent is not itself a reference to an answer's evidence.
+A request for new information about that subject is an independent lookup, even if the
+subject was mentioned earlier or the user has not supplied the inputs needed to check it.
+Missing task inputs do not make a new lookup an ambiguous history follow-up.
+For independent lookups, return not_history_followup with new_verification_requested false;
+use immediate_previous only as the schema's required target placeholder, not a history target.
+Reserve ambiguous_history_followup for uncertainty about a genuinely historical request,
+not uncertainty about how to carry out a new task. Explicit requests to recheck an earlier
+answer remain new_verification_request, even when the earlier evidence may be missing.
 Confidence measures how clearly the current wording identifies the intent and target mode.
 It does not certify retained evidence, source completeness, or historical truth.
 A clear request to list records examined for the preceding answer can be high confidence
@@ -367,7 +378,8 @@ raise confidence to obtain history access. Express target uncertainty through co
 and ambiguous_history_followup. Allowed target modes: immediate_previous, explicit_reference.
 Asking what was examined does not imply it supported the answer or covered all available
 sources. Asking about support, coverage, or gaps does not itself request fresh verification.
-Set new_verification_requested true only for an explicit fresh-check request."""
+Set new_verification_requested true only for an explicit fresh check of an earlier answer
+or claim, not for an independent lookup."""
 
 
 def _extract_last_user_text(messages: list[dict[str, str]]) -> str:
