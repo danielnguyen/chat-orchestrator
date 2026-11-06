@@ -492,8 +492,12 @@ def render_clarification_advisory(
         or excerpt != excerpt.strip()
         or len(excerpt.split()) > 8
         or any(not (character.isalpha() or character == " ") for character in excerpt)
-        or not re.search(r"(?<!\w)" + re.escape(excerpt) + r"(?!\w)", request_text[:1000])
     ):
+        return None
+    # Inspect one extra character only to reject a word cut by the provider window.
+    # The rendered excerpt must still end inside the original 1,000-character input.
+    match = re.search(r"(?<!\w)" + re.escape(excerpt) + r"(?!\w)", request_text[:1001])
+    if match is None or match.end() > 1000:
         return None
     return f"What specifically do you mean by “{excerpt}”?"
 

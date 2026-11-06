@@ -4291,7 +4291,22 @@ run_evidence_scope_reference_scenarios() {
   trace="$(fetch_trace "$request_id")"
   manifest="$(jq -c '.prompt.evidence_acquisition' <<<"$trace")"
   provider_calls="$(fetch_provider_calls "$request_id")"
-  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  if ! diagnostics="$(runtime_diagnostics_from_trace "$trace")"; then
+    printf 'Missing historical scope diagnostics unavailable: %s\n' "$(jq -nc \
+      --argjson response "$response" --argjson trace "$trace" '
+        {
+          response_ok: ($response.status == "ok"),
+          has_runtime_session: (
+            ($trace.prompt.runtime_session.runtime_session_id
+              // $trace.retrieval.prompt_assembly.runtime_session.runtime_session_id
+              // "") | length > 0
+          ),
+          has_acquisition: ($trace.prompt.evidence_acquisition != null),
+          has_reasoning: ($trace.prompt.general_evidence_reasoning != null)
+        }
+      ')" >&2
+    return 1
+  fi
   audit="$(fetch_dsa_audit)"
   claims="$(list_claim_records "$owner" "$conversation_id")"
   if ! jq -e --arg bounded "$bounded_claim" '
