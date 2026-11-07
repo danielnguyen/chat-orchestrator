@@ -46065,3 +46065,61 @@ async def test_external_evidence_signal_transport_and_receiver_authority(
     trace = json.dumps(memory.trace_calls[0]["payload"])
     assert "INVALID_SIGNAL_SENTINEL" not in trace
     assert "semantic_advisory" not in trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question", [
+    "The early shift packed 34 kits and the late shift packed 50. "
+    "Independently verify those counts against the unfamiliar packing ledger.",
+    "The east tank holds 40 litres and the west tank holds 65. "
+    "Independently verify those values against the unfamiliar inspection register.",
+    "Verify the reading against the source named <script>PRIVATE_SOURCE_SENTINEL</script>.",
+])
+async def test_verification_source_no_match_requests_record_without_acquisition(tmp_path, question):
+    """Fixed receiver/provider inputs exercise the real CO rendering boundary."""
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    def material_no_match(call):
+        response = _derived_shape_response(
+            request_id=call["request_id"],
+            question=" ".join(call["task_text"].split()),
+            task_shape="targeted_lookup",
+        )
+        response["result"]["source_match"] = {
+            "status": "no_match",
+            "matched_source_ids": [],
+            "reason_codes": ["no_source_specific_match"],
+        }
+        return response
+
+    runtime = FakeRuntime(evidence_shape_response=material_no_match, auto_source_match=False)
+    provider = SequenceLiteLLM([_evidence_interpreter_completion("no_match", "lookup", [])])
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources", "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    memory = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-verification-source-no-match",
+    )
+
+    assert out["answer"] == (
+        "I couldn't match the source needed for this check to an available source, "
+        "so I haven't independently verified it. Please provide the record, link, "
+        "or relevant excerpt from that source."
+    )
+    assert "What should I check?" not in out["answer"]
+    assert "PRIVATE_SOURCE_SENTINEL" not in out["answer"]
+    assert out["selected_model"] == "not_called"
+    assert len(provider.calls) == 1  # Existing source interpreter only; no answer call.
+    assert len(runtime.evidence_shape_calls) == 2
+    assert runtime.evidence_plan_calls == []
+    assert dsa.list_calls == [{}]
+    assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+    trace = memory.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
+    assert trace["status"] == "source_scope_no_match"
