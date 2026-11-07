@@ -65,6 +65,7 @@ from services.evidence_acquisition import (
     PlanResult,
     ProcessFailureObservation,
     SemanticInterpreterFailure,
+    ShapeResult,
     SufficiencyResult,
     _acquisition_premise_digest,
     evidence_reasoning_response_format,
@@ -23693,6 +23694,7 @@ async def test_evidence_interpreter_success_logs_only_structural_result(
     assert "interpretation_status=resolved" in logs
     assert "operation_hint=aggregate" in logs
     assert "candidate_count=1" in logs
+    assert "external_evidence_need=absent_or_invalid" in logs
     assert "elapsed_ms=" in logs
     assert all(
         record.levelno == logging.INFO
@@ -45973,6 +45975,16 @@ async def test_withheld_reasoning_clarification_is_request_bound(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("premise,question,answer", [
     (
+        "The lantern fair happens this weekend. ",
+        "When does the lantern fair happen?",
+        "This weekend.",
+    ),
+    (
+        "The selected mineral is quartz. ",
+        "Which mineral was selected?",
+        "Quartz.",
+    ),
+    (
         "Batch A takes about 12 hours and batch B about 18 hours. ",
         "Which batch takes longer?",
         "Batch B takes about 6 hours longer.",
@@ -45983,9 +45995,11 @@ async def test_withheld_reasoning_clarification_is_request_bound(
         "The west tank holds 25 litres more.",
     ),
 ])
+@pytest.mark.parametrize("operation", ["lookup", "comparison"])
 @pytest.mark.parametrize("variant,signal,governed", [
     ("supplied", "supplied_information_sufficient", False),
     ("implicit", "external_facts_needed", True),
+    ("current", "external_facts_needed", True),
     ("verify", "external_facts_needed", True),
     ("mixed", "external_facts_needed", True),
     ("verify", "supplied_information_sufficient", True),
@@ -45994,18 +46008,21 @@ async def test_withheld_reasoning_clarification_is_request_bound(
     ("supplied", {"private": "INVALID_SIGNAL_SENTINEL"}, False),
 ])
 async def test_external_evidence_signal_transport_and_receiver_authority(
-    tmp_path, premise, question, answer, variant, signal, governed,
+    tmp_path, caplog, premise, question, answer, operation, variant, signal, governed,
 ):
-    """Receiver results are fixtures; this proves CO transport, not CR routing."""
-    if variant != "implicit":
+    """Fixed decisions prove logging/transport, not live model quality or CR policy."""
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+    if variant not in {"implicit", "current"}:
         question = premise + question
+    if variant == "current":
+        question = "Find the latest inspection result in the equipment register."
     if variant == "verify":
         question += " Independently verify those values."
     elif variant == "mixed":
         question += " Also find the latest inspection result."
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
     candidates = ["household_schedule", "personal_schedule"]
-    completion = _evidence_interpreter_completion("ambiguous", "comparison", candidates)
+    completion = _evidence_interpreter_completion("ambiguous", operation, candidates)
     advice = json.loads(completion["choices"][0]["message"]["content"])
     expected_advice = dict(advice)
     if signal != "missing":
@@ -46066,6 +46083,19 @@ async def test_external_evidence_signal_transport_and_receiver_authority(
     assert "INVALID_SIGNAL_SENTINEL" not in trace
     assert "semantic_advisory" not in trace
 
+    logs = "\n".join(
+        record.getMessage() for record in caplog.records
+        if record.name == "uvicorn.error.chat_orchestrator.evidence"
+    )
+    expected_signal = expected_advice.get("external_evidence_need", "absent_or_invalid")
+    assert f"external_evidence_need={expected_signal}" in logs
+    shape = runtime.evidence_shape_response(runtime.evidence_shape_calls[-1])["result"]
+    assert f"shape_reason_codes={','.join(shape['reason_codes'])}" in logs
+    reasons = shape["source_match"]["reason_codes"]
+    assert f"source_match_reason_codes={','.join(reasons)}" in logs
+    for private_value in (question, premise, *candidates, "INVALID_SIGNAL_SENTINEL"):
+        assert private_value not in logs
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("question", [
@@ -46123,3 +46153,44 @@ async def test_verification_source_no_match_requests_record_without_acquisition(
     assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
     trace = memory.trace_calls[0]["payload"]["prompt"]["evidence_acquisition"]
     assert trace["status"] == "source_scope_no_match"
+
+
+@pytest.mark.parametrize("shape_reasons,source_reason", [
+    (["source_context_present", "external_verification_required"], "source_id_match"),
+    (["explicit_evidence_language", "targeted_lookup_derived"], "scope_reference_match"),
+    (["semantic_operation_hint", "targeted_lookup_derived"], "semantic_candidate_validated"),
+])
+def test_evidence_checkpoint_logs_typed_reasons_without_content(
+    caplog, shape_reasons, source_reason,
+):
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+    shape = ShapeResult.model_validate({
+        "derivation_id": "PRIVATE_DERIVATION",
+        "question_anchor": "PRIVATE_QUESTION",
+        "question_anchor_digest": "sha256:" + "0" * 64,
+        "derivation_status": "derived", "task_shape": "targeted_lookup",
+        "candidate_task_shapes": ["targeted_lookup"],
+        "evidence_scope_material": True, "clarification_required": False,
+        "reason_codes": shape_reasons, "user_safe_summary": "PRIVATE_SUMMARY",
+        "source_match": {
+            "status": "matched", "matched_source_ids": ["PRIVATE_SOURCE"],
+            "reason_codes": [source_reason],
+        },
+    })
+    state = EvidenceAcquisitionState(
+        enabled=True, attempted=True, status="acquisition_ready", shape=shape,
+    )
+    before = copy.deepcopy(state)
+    orchestrate_service._log_evidence_acquisition_checkpoint(request_id="rid-codes", state=state)
+    assert state == before
+    assert f"shape_reason_codes={','.join(shape_reasons)}" in caplog.text
+    assert f"source_match_reason_codes={source_reason}" in caplog.text
+    assert "PRIVATE_" not in caplog.text
+
+
+def test_evidence_checkpoint_without_shape_logs_absence(caplog):
+    caplog.set_level(logging.INFO, logger="uvicorn.error.chat_orchestrator.evidence")
+    state = EvidenceAcquisitionState(enabled=True, attempted=True, status="shape_failed")
+    orchestrate_service._log_evidence_acquisition_checkpoint(request_id="rid-no-shape", state=state)
+    assert "shape_reason_codes=none" in caplog.text
+    assert "source_match_reason_codes=none" in caplog.text
