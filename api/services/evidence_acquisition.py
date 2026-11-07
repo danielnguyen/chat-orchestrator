@@ -867,6 +867,11 @@ class DiagnosticAdvisory(StrictModel):
         return self
 
 
+ExternalEvidenceNeed = Literal[
+    "supplied_information_sufficient",
+    "external_facts_needed",
+    "uncertain",
+]
 SemanticInterpretationStatus = Literal["resolved", "ambiguous", "no_match"]
 SemanticOperationHint = Literal[
     "lookup",
@@ -911,6 +916,15 @@ class EvidenceInterpreterOutput(StrictModel):
     candidate_source_ids: list[Identifier] = Field(max_length=3)
     aggregate_function: AggregateFunction | None = None
     aggregate_field_name: AggregateFieldName | None = None
+    external_evidence_need: ExternalEvidenceNeed | None = None
+
+    @field_validator("external_evidence_need", mode="before")
+    @classmethod
+    def normalize_external_evidence_need(cls, value: Any) -> str | None:
+        # Legacy or malformed optional advice must not discard valid source advice.
+        if isinstance(value, str) and value in get_args(ExternalEvidenceNeed):
+            return value
+        return None
 
     @field_validator("aggregate_field_name")
     @classmethod
@@ -2761,6 +2775,10 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                 "type": "object",
                 "additionalProperties": False,
                 "properties": {
+                    "external_evidence_need": {
+                        "type": "string",
+                        "enum": list(get_args(ExternalEvidenceNeed)),
+                    },
                     "interpretation_status": {
                         "type": "string",
                         "enum": ["resolved", "ambiguous", "no_match"],
@@ -2818,6 +2836,7 @@ def evidence_interpreter_response_format() -> dict[str, Any]:
                     },
                 },
                 "required": [
+                    "external_evidence_need",
                     "interpretation_status",
                     "operation_hint",
                     "candidate_source_ids",
@@ -3543,6 +3562,19 @@ def evidence_interpreter_messages(
                 "supplied prior_supported_context to distinguish these cases; do not assume "
                 "unseen conversation contains missing source facts. This interpretation is "
                 "advisory: Cognitive Runtime decides evidence materiality and source scope. "
+                "Separately report external_evidence_need, independently of operation_hint "
+                "and whether a configured source matches. Use supplied_information_sufficient "
+                "when the requested answer follows from the supplied information at its "
+                "stated precision, without outside facts. Comparing or calculating supplied "
+                "values does not itself require external evidence; do not demand finer "
+                "precision than the request needs. Use external_facts_needed when any "
+                "material part of the request requires facts outside the supplied information, "
+                "including implicit comparisons with missing facts, mixed requests, current "
+                "state checks, and explicit independent verification even of supplied values. "
+                "Use uncertain when this distinction cannot be established from the allowed "
+                "input. Prior evidence use alone does not create a new external dependency, "
+                "and no matching source does not establish that supplied facts suffice. "
+                "This signal grants no retrieval, access, or conclusion authority. "
                 "The operation_hint guides acquisition scope; it does not "
                 "limit what downstream reasoning may do with acquired evidence. The "
                 "current request and current supplied inventory are primary. The "

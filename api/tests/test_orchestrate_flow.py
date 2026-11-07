@@ -23897,7 +23897,10 @@ async def test_ordinary_chat_uses_semantic_no_match_then_existing_provider_path(
         ),
     ],
 )
-async def test_conversational_followup_source_routing(tmp_path, history, question, proposes_source):
+@pytest.mark.parametrize("with_signal", [False, True])
+async def test_conversational_followup_source_routing(
+    tmp_path, history, question, proposes_source, with_signal,
+):
     """Fixed interpreter/CR fixtures prove wiring, not live interpretation quality."""
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
 
@@ -23924,12 +23927,19 @@ async def test_conversational_followup_source_routing(tmp_path, history, questio
         ),
         auto_source_match=False,
     )
+    completion = _evidence_interpreter_completion(
+        "resolved" if proposes_source else "no_match",
+        "lookup" if proposes_source else "unknown",
+        ["personal_schedule"] if proposes_source else [],
+    )
+    advice = json.loads(completion["choices"][0]["message"]["content"])
+    if with_signal:
+        advice["external_evidence_need"] = (
+            "external_facts_needed" if proposes_source else "supplied_information_sufficient"
+        )
+        completion["choices"][0]["message"]["content"] = json.dumps(advice)
     litellm = SequenceLiteLLM([
-        _evidence_interpreter_completion(
-            "resolved" if proposes_source else "no_match",
-            "lookup" if proposes_source else "unknown",
-            ["personal_schedule"] if proposes_source else [],
-        ),
+        completion,
         {"choices": [{"message": {"content": "Keep what helped, and reconsider the rest."}}]},
     ])
     dsa = FakeDSA(source_response={
@@ -23947,6 +23957,7 @@ async def test_conversational_followup_source_routing(tmp_path, history, questio
         request_id="rid-conversational-followup",
     )
 
+    assert runtime.evidence_shape_calls[-1]["task_context"]["semantic_advisory"] == advice
     assert len(runtime.evidence_shape_calls) == 2
     assert dsa.list_calls == [{}]
     assert dsa.fetch_calls == dsa.context_calls == []
@@ -45957,3 +45968,100 @@ async def test_withheld_reasoning_clarification_is_request_bound(
     assert "clarification_advisory" not in json.dumps(memory.claim_record_calls)
     assert "PRIVATE SOURCE SENTINEL" not in out["answer"]
     assert "The requested status is current." not in out["answer"] or supported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("premise,question,answer", [
+    (
+        "Batch A takes about 12 hours and batch B about 18 hours. ",
+        "Which batch takes longer?",
+        "Batch B takes about 6 hours longer.",
+    ),
+    (
+        "The east tank holds 40 litres and the west tank holds 65 litres. ",
+        "Which tank holds more?",
+        "The west tank holds 25 litres more.",
+    ),
+])
+@pytest.mark.parametrize("variant,signal,governed", [
+    ("supplied", "supplied_information_sufficient", False),
+    ("implicit", "external_facts_needed", True),
+    ("verify", "external_facts_needed", True),
+    ("mixed", "external_facts_needed", True),
+    ("verify", "supplied_information_sufficient", True),
+    ("supplied", "uncertain", False),
+    ("supplied", "missing", False),
+    ("supplied", {"private": "INVALID_SIGNAL_SENTINEL"}, False),
+])
+async def test_external_evidence_signal_transport_and_receiver_authority(
+    tmp_path, premise, question, answer, variant, signal, governed,
+):
+    """Receiver results are fixtures; this proves CO transport, not CR routing."""
+    if variant != "implicit":
+        question = premise + question
+    if variant == "verify":
+        question += " Independently verify those values."
+    elif variant == "mixed":
+        question += " Also find the latest inspection result."
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    candidates = ["household_schedule", "personal_schedule"]
+    completion = _evidence_interpreter_completion("ambiguous", "comparison", candidates)
+    advice = json.loads(completion["choices"][0]["message"]["content"])
+    expected_advice = dict(advice)
+    if signal != "missing":
+        advice["external_evidence_need"] = signal
+    if isinstance(signal, str) and signal != "missing":
+        expected_advice["external_evidence_need"] = signal
+    completion["choices"][0]["message"]["content"] = json.dumps(advice)
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(
+            call, second_status="comparison_probe" if governed else "no_match",
+        ),
+        evidence_plan_response=_targeted_plan_response(
+            request_id="rid-external-evidence-need", question=question,
+            task_shape="cross_source_comparison", eligible_source_ids=candidates,
+        ),
+        auto_source_match=False,
+    )
+    litellm = SequenceLiteLLM([
+        completion, {"choices": [{"message": {"content": answer}}]},
+    ])
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources", "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    memory = FakeMemoryStore()
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        memory_store=memory, litellm=litellm, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-external-evidence-need",
+    )
+    assert len(runtime.evidence_shape_calls) == 2
+    assert "semantic_advisory" not in runtime.evidence_shape_calls[0]["task_context"]
+    assert runtime.evidence_shape_calls[1]["task_context"]["semantic_advisory"] == (
+        expected_advice
+    )
+    assert len(litellm.calls) == (1 if governed else 2)
+    assert litellm.calls[0]["max_completion_tokens"] == 512
+    assert litellm.calls[0]["timeout_ms"] == 5000
+    assert litellm.calls[0].get("tools") in (None, [])
+    interpreter_input = json.loads(litellm.calls[0]["messages"][1]["content"])
+    assert set(interpreter_input) == {"request_text", "sources"}
+    assert interpreter_input["request_text"] == question
+    assert dsa.list_calls == [{}]
+    assert dsa.fetch_calls == dsa.context_calls == []
+    assert len(runtime.evidence_plan_calls) == len(dsa.calls) == int(governed)
+    if governed:
+        assert dsa.calls[0]["source_ids"] == candidates
+        assert "withholding the requested conclusion" in out["answer"]
+    else:
+        assert out["status"] == "ok"
+        assert out["answer"] == answer
+    assert runtime.capability_authority_calls == runtime.capability_flow_calls == []
+    assert out.get("pending_action") is None
+    trace = json.dumps(memory.trace_calls[0]["payload"])
+    assert "INVALID_SIGNAL_SENTINEL" not in trace
+    assert "semantic_advisory" not in trace
