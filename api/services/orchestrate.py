@@ -7173,6 +7173,9 @@ def _log_evidence_acquisition_checkpoint(
     semantic_reason = state.semantic_interpreter.get("reason", "not_eligible")
     candidate_count = state.semantic_interpreter.get("candidate_count", 0)
     strategies = list(plan.selected_strategies) if plan is not None else []
+    # These are bounded Literal codes from the validated CR response, not content.
+    shape_reasons = list(shape.reason_codes) if shape is not None else []
+    source_reasons = list(source_match.reason_codes) if source_match else []
     message = (
         "evidence_acquisition_checkpoint "
         "event=evidence_acquisition_checkpoint "
@@ -7183,7 +7186,9 @@ def _log_evidence_acquisition_checkpoint(
         f"semantic_interpreter_status={semantic_status} "
         f"semantic_interpreter_reason={semantic_reason} "
         f"task_shape={shape.task_shape if shape and shape.task_shape else 'none'} "
+        f"shape_reason_codes={','.join(shape_reasons) or 'none'} "
         f"source_match_status={source_match.status if source_match else 'none'} "
+        f"source_match_reason_codes={','.join(source_reasons) or 'none'} "
         f"candidate_count={candidate_count} "
         "clarification_required="
         f"{str(bool(shape and shape.clarification_required)).lower()} "
@@ -7427,7 +7432,7 @@ async def _interpret_evidence_request(
         "semantic_interpreter_completed event=semantic_interpreter_completed "
         "component=chat-orchestrator request_id=%s logical_route=%s model=%s "
         "provider=%s elapsed_ms=%s interpretation_status=%s operation_hint=%s "
-        "candidate_count=%s",
+        "candidate_count=%s external_evidence_need=%s",
         request_id,
         _EVIDENCE_INTERPRETER_ROUTE,
         route["model"],
@@ -7436,6 +7441,8 @@ async def _interpret_evidence_request(
         result["interpretation_status"],
         result["operation_hint"],
         len(result["candidate_source_ids"]),
+        # The parser omits both missing and invalid optional advice.
+        result.get("external_evidence_need", "absent_or_invalid"),
     )
     return result
 
