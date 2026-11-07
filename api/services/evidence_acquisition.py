@@ -241,7 +241,9 @@ SOURCE_AMBIGUITY_ANSWER = (
     "should I use?"
 )
 SOURCE_NO_MATCH_ANSWER = (
-    "I couldn't tell what information to use for this question. What should I check?"
+    "I couldn't match the source needed for this check to an available source, "
+    "so I haven't independently verified it. Please provide the record, link, "
+    "or relevant excerpt from that source."
 )
 SEMANTIC_INTERPRETER_FAILURE_ANSWER = (
     "I couldn't determine what information this question needs, so I can't answer "
