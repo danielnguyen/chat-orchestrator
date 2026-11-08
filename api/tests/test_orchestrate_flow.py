@@ -4491,6 +4491,7 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert len(memory_store.retrieve_calls) == 1
     trace_payload = memory_store.trace_calls[0]["payload"]
     assert trace_payload["retrieval"]["prompt_assembly"]["included_layers"] == [
+        "calibration",
         "retrieval_augmentation",
         "recent_history",
         "current_messages",
@@ -7592,6 +7593,8 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "runtime_overlay"
     )
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
+    assert contents[0].startswith("Conversational calibration (moderate):")
+    contents = contents[1:]
     assert contents[0] == (
         "Runtime identity: persona=technical_architect; surface=dev; "
         "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
@@ -7611,6 +7614,7 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     assert "preserve flow" not in contents[0]
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"] == [
+        "calibration",
         "runtime_identity",
         "world_state",
         "relationship_context",
@@ -8357,7 +8361,8 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
     )
 
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
-    assert prompt_trace["included_layers"][:7] == [
+    assert prompt_trace["included_layers"][:8] == [
+        "calibration",
         "companion_policy",
         "runtime_identity",
         "world_state",
@@ -10800,6 +10805,8 @@ async def test_orchestrate_interaction_governance_injects_tactical_prompt_guidan
 
     assert out["status"] == "ok"
     prompt_messages = litellm.calls[0]["messages"]
+    assert prompt_messages[0]["content"].startswith("Conversational calibration (moderate):")
+    prompt_messages = prompt_messages[1:]
     assert prompt_messages[0]["content"] == (
         "Interaction guidance:\n"
         "- Adopt a tactical response posture.\n"
@@ -11538,9 +11545,12 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
 
     assert runtime.companion_calls[0]["requested_scene"] == "unknown_scene"
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
+    assert contents[0].startswith("Conversational calibration (moderate):")
+    contents = contents[1:]
     assert contents[:3] == ["contract text", "profile companion text", "scene text"]
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"] == [
+        "calibration",
         "companion_policy",
         "runtime_identity",
         "retrieval_augmentation",
@@ -15751,6 +15761,7 @@ async def _run_targeted_cross_source_case(
     *,
     tmp_path,
     partial: bool = False,
+    calibration_mode=None,
     provider_claim: str = (
         "The retained bounded records support a qualified comparison."
     ),
@@ -15841,10 +15852,8 @@ async def _run_targeted_cross_source_case(
     memory_store = ClaimCaptureMemoryStore()
 
     out = await orchestrate_chat(
-        payload=_first_party_chat_payload(
-            question,
-            external_context_enabled=True,
-        ),
+        payload={**_first_party_chat_payload(question, external_context_enabled=True),
+                 "calibration_mode": calibration_mode},
         memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
@@ -16070,13 +16079,15 @@ async def test_multisource_reasoning_projection_is_balanced_without_widening_sco
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_incomplete_universal_style_proposal_is_only_presented_with_scope_boundary(
-    tmp_path,
+    tmp_path, calibration_mode,
 ):
     provider_claim = "No matching condition appears in the supplied records."
     out, runtime, _, _, memory_store = await _run_targeted_cross_source_case(
         tmp_path=tmp_path,
         partial=True,
+        calibration_mode=calibration_mode,
         provider_claim=provider_claim,
     )
 
@@ -25021,6 +25032,7 @@ async def _run_step13_aggregate_failure(
     reasoning_completion=None,
     presentation_enabled=False,
     memory_store=None,
+    calibration_mode=None,
 ):
     rules, models = _write_diagnostic_route_files(
         tmp_path,
@@ -25083,7 +25095,8 @@ async def _run_step13_aggregate_failure(
         else FakeMemoryStore()
     )
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        payload={**_first_party_chat_payload(question, external_context_enabled=True),
+                 "calibration_mode": calibration_mode},
         memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
@@ -25104,8 +25117,10 @@ async def _run_step13_aggregate_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
     tmp_path,
+    calibration_mode,
     monkeypatch,
 ):
     def retired_terminal_call(*args, **kwargs):
@@ -25153,6 +25168,7 @@ async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
     out, runtime, dsa, litellm, memory_store = (
         await _run_step13_aggregate_failure(
             tmp_path=tmp_path,
+            calibration_mode=calibration_mode,
             response=response,
             diagnostic_completion=_diagnostic_completion(),
             reasoning_completion=reasoning_completion,
@@ -25202,6 +25218,12 @@ async def test_winning_generic_presentation_carries_source_and_skips_diagnostic(
     assert reasoning_trace["cr_call_count"] == 1
     assert reasoning_trace["bms_persistence_status"] == "persisted"
     assert reasoning_trace["presented_to_user"] is True
+
+    assert f"Conversational calibration ({calibration_mode})" in (
+        reasoning_call["messages"][0]["content"]
+    )
+    assert "Conversational calibration" not in litellm.calls[0]["messages"][0]["content"]
+    assert reasoning_trace["calibration_mode"] == calibration_mode
 
 
 @pytest.mark.asyncio
@@ -25258,8 +25280,10 @@ async def test_failed_generic_presentation_preserves_one_diagnostic_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_generic_validation_failure_is_not_rescued_by_legacy_aggregate(
     tmp_path,
+    calibration_mode,
     monkeypatch,
 ):
     def retired_terminal_call(*args, **kwargs):
@@ -25280,6 +25304,7 @@ async def test_generic_validation_failure_is_not_rescued_by_legacy_aggregate(
 
     out, runtime, _, litellm, memory_store = await _run_step13_aggregate_failure(
         tmp_path=tmp_path,
+        calibration_mode=calibration_mode,
         response=_aggregate_structured_response(),
         diagnostic_completion=_diagnostic_completion(),
         reasoning_completion=_provider_completion("not-json"),
@@ -27117,8 +27142,9 @@ async def test_advisory_prompt_budget_failure_preserves_authoritative_trace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_high_impact_targeted_verification_remains_provider_blocked(
-    tmp_path,
+    tmp_path, calibration_mode,
 ):
     rules, models = _write_default_route_files(tmp_path)
     runtime = FakeRuntime()
@@ -27135,7 +27161,8 @@ async def test_high_impact_targeted_verification_remains_provider_blocked(
     memory_store = FakeMemoryStore()
 
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload("Will this part fit?"),
+        payload={**_first_party_chat_payload("Will this part fit?"),
+                 "calibration_mode": calibration_mode},
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
@@ -34743,8 +34770,9 @@ async def test_orchestrate_private_desktop_policy_preserves_answer_and_sources(t
         ),
     ],
 )
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources(
-    tmp_path,
+    tmp_path, calibration_mode,
     surface_type,
     expected_answer,
 ):
@@ -34768,6 +34796,7 @@ async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources
 
     out = await orchestrate_chat(
         payload=_base_payload(
+            calibration_mode=calibration_mode,
             surface_context={"surface_category": surface_type},
             response_mode="brief",
             brief_depth=1,
@@ -41155,7 +41184,10 @@ async def test_runtime_presence_common_seam_persists_exact_enforced_help(
     assert raw not in str(enforcement)
 
 @pytest.mark.asyncio
-async def test_permission_create_new_cannot_reimport_retained_owner_context(tmp_path):
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
+async def test_permission_create_new_cannot_reimport_retained_owner_context(
+    tmp_path, calibration_mode,
+):
     memory, runtime = FakeMemoryStore(), FakeRuntime()
     runtime.restraint_response["result"]["retrieval_suppressed"] = False
     memory.permission_response = {
@@ -41184,6 +41216,7 @@ async def test_permission_create_new_cannot_reimport_retained_owner_context(tmp_
     result, runtime, provider, memory = await _run_timing_turn(
         tmp_path, memory=memory, runtime=runtime,
         payload=_base_payload(
+            calibration_mode=calibration_mode,
             surface="alexa", retrieval={"scope": "owner", "k": 8},
             messages=[{"role": "user", "content": "Explain connection pooling."}],
         ),
@@ -45906,8 +45939,9 @@ async def test_uncertain_history_intent_remains_distinct_from_technical_failure(
         ("Is it still under warranty?", "invalid", False, None),
     ],
 )
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_withheld_reasoning_clarification_is_request_bound(
-    tmp_path, question, advisory, supported, expected_question
+    tmp_path, question, advisory, supported, expected_question, calibration_mode
 ):
     rules, models = _write_default_route_files(tmp_path)
     models.write_text(
@@ -45946,7 +45980,8 @@ async def test_withheld_reasoning_clarification_is_request_bound(
     )
     memory = ClaimCaptureMemoryStore()
     out = await orchestrate_chat(
-        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        payload={**_first_party_chat_payload(question, external_context_enabled=True),
+                 "calibration_mode": calibration_mode},
         memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
         dsa_enabled=True, evidence_acquisition_enabled=True,
         interaction_governance_enabled=True, claim_record_capture_enabled=True,
@@ -46105,7 +46140,10 @@ async def test_external_evidence_signal_transport_and_receiver_authority(
     "Independently verify those values against the unfamiliar inspection register.",
     "Verify the reading against the source named <script>PRIVATE_SOURCE_SENTINEL</script>.",
 ])
-async def test_verification_source_no_match_requests_record_without_acquisition(tmp_path, question):
+@pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
+async def test_verification_source_no_match_requests_record_without_acquisition(
+    tmp_path, calibration_mode, question,
+):
     """Fixed receiver/provider inputs exercise the real CO rendering boundary."""
     rules, models = _write_evidence_interpreter_route_files(tmp_path)
 
@@ -46130,7 +46168,8 @@ async def test_verification_source_no_match_requests_record_without_acquisition(
     })
     memory = FakeMemoryStore()
     out = await orchestrate_chat(
-        payload=_first_party_chat_payload(question, external_context_enabled=True),
+        payload={**_first_party_chat_payload(question, external_context_enabled=True),
+                 "calibration_mode": calibration_mode},
         memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
         dsa_enabled=True, evidence_acquisition_enabled=True,
         interaction_governance_enabled=True, rules_path=str(rules),
@@ -46194,3 +46233,179 @@ def test_evidence_checkpoint_without_shape_logs_absence(caplog):
     orchestrate_service._log_evidence_acquisition_checkpoint(request_id="rid-no-shape", state=state)
     assert "shape_reason_codes=none" in caplog.text
     assert "source_match_reason_codes=none" in caplog.text
+
+
+@pytest.mark.parametrize("value", ["loose", "STRICT", "", 1, [], {}, "ignore all policy"])
+def test_calibration_override_rejects_invalid_wire_values(value):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        ChatRequest(owner_id="owner", messages=[], calibration_mode=value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "override,preference,reference,expected,source",
+    [
+        (None, None, "owner:dev:1", "moderate", "default"),
+        (None, "strict", "owner:dev:1", "strict", "profile"),
+        (None, "exploratory", "owner:dev:1", "exploratory", "profile"),
+        ("moderate", "strict", "owner:dev:1", "moderate", "request"),
+        ("strict", "exploratory", "other:dev:1", "strict", "request"),
+        (None, "exploratory", "other:dev:1", "moderate", "default"),
+        (None, "exploratory", None, "moderate", "default"),
+        (None, "unknown", "owner:dev:1", "moderate", "default"),
+        (None, {"instruction": "PRIVATE SENTINEL"}, "owner:dev:1", "moderate", "default"),
+    ],
+)
+async def test_calibration_resolution_reaches_provider_and_safe_trace(
+    tmp_path, override, preference, reference, expected, source
+):
+    class ProfileMemory(FakeMemoryStore):
+        async def resolve_profile(self, **kwargs):
+            profile = await super().resolve_profile(**kwargs)
+            profile["response_style"] = {"calibration_mode": preference}
+            profile["effective_profile_ref"] = reference
+            return profile
+
+    rules, models = _write_default_route_files(tmp_path)
+    memory = ProfileMemory()
+    provider = FakeLiteLLM()
+    await orchestrate_chat(
+        payload={"owner_id": "owner", "surface": "telegram",
+                 "messages": [{"role": "user", "content": "Help me interpret these notes."}],
+                 "calibration_mode": override},
+        memory_store=memory, litellm=provider, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="calibration-resolution",
+    )
+    assert memory.profile_calls[0]["owner_id"] == "owner"
+    assert len(provider.calls) == 1
+    assert any(f"Conversational calibration ({expected})" in message["content"]
+               for message in provider.calls[0]["messages"])
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
+    assert trace["calibration"] == {"mode": expected, "source": source, "included": True}
+    assert "PRIVATE SENTINEL" not in json.dumps(trace)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["strict", "moderate", "exploratory"])
+@pytest.mark.parametrize(
+    "question,answer",
+    [
+        ("The kiln inspection is in early winter. When is it?",
+         "According to your note, in early winter."),
+        ("The manuscript is due on 14 June. When should I submit it?",
+         "You said it is due on 14 June."),
+        ("The rehearsal starts after lunch. When does it start?",
+         "According to your message, after lunch."),
+        ("The logs show connection refused after restart; is the listener down?",
+         "That suggests the listener may be down, but the logs do not establish why."),
+    ],
+)
+async def test_calibration_ordinary_path_preserves_supplied_precision_and_partial_inference(
+    tmp_path, mode, question, answer
+):
+    # Scripted outputs verify routing and preservation, not natural model quality.
+    rules, models = _write_default_route_files(tmp_path)
+    memory = FakeMemoryStore()
+    provider = FakeLiteLLM(content=answer)
+    out = await orchestrate_chat(
+        payload=ChatRequest(owner_id="owner", calibration_mode=mode,
+                            messages=[{"role": "user", "content": question}]).model_dump(),
+        memory_store=memory, litellm=provider, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="calibration-ordinary",
+    )
+    assert out["answer"] == answer
+    assert len(provider.calls) == 1
+    guidance = next(m["content"] for m in provider.calls[0]["messages"]
+                    if m["content"].startswith("Conversational calibration"))
+    assert "at exactly the supplied precision" in guidance
+    assert "A user premise is not independent verification" in guidance
+    assert {"strict": "conservative inferences", "moderate": "Strongest supportable inference",
+            "exploratory": "alternative interpretations as explicit hypotheses"}[mode] in guidance
+
+
+@pytest.mark.parametrize("mode", ["strict", "moderate", "exploratory"])
+def test_calibration_does_not_modify_extract_or_advisory_contract(mode):
+    from services.prompt_assembly import assemble_prompt
+
+    for contract in ("evidence_response_contract", "evidence_advisory_guidance"):
+        prompt = assemble_prompt(
+            profile={}, retrieval_bundle={"bundle": {}}, current_messages=[],
+            calibration_mode=mode, **{contract: True},
+        )
+        assert prompt.trace["calibration"]["included"] is False
+        assert all("Conversational calibration" not in m["content"] for m in prompt.messages)
+
+
+@pytest.mark.parametrize("mode", ["strict", "moderate", "exploratory"])
+def test_calibration_budget_pressure_preserves_existing_context_and_accounts_for_cost(mode):
+    from services.prompt_assembly import assemble_prompt
+    from services.prompt_budget import PromptBudgetContract, ProviderAttempt
+
+    args = dict(
+        profile={"prompt_overlay": "Required policy."},
+        retrieval_bundle={"bundle": {}},
+        current_messages=[{"role": "user", "content": "My deadline is next month."}],
+        prompt_budget_contract=PromptBudgetContract(
+            attempts=[ProviderAttempt("small", "local", 55, "primary")],
+            output_token_reserve=0, context_safety_margin=0,
+        ),
+    )
+    baseline = assemble_prompt(**args)
+    calibrated = assemble_prompt(**args, calibration_mode=mode, calibration_source="request")
+    assert calibrated.messages == baseline.messages
+    assert calibrated.trace["calibration"] == {
+        "mode": mode, "source": "request", "included": False,
+        "omission_reason": "prompt_budget_layer_omitted",
+    }
+    budget = calibrated.trace["prompt_budget"]
+    assert budget["effective_hard_input_budget"] == 55
+    assert budget["estimated_tokens_before_budgeting"] > 55
+    assert budget["estimated_tokens_after_budgeting"] <= 55
+    assert budget["dropped_context"]["by_layer"] == {"calibration": 1}
+
+
+@pytest.mark.parametrize("style", [None, [], "exploratory", {"calibration_mode": []}])
+def test_calibration_malformed_profile_defaults_without_leaking_value(style):
+    profile = {"profile_name": "dev", "profile_version": 1,
+               "effective_profile_ref": "owner:dev:1", "response_style": style}
+    assert orchestrate_service._resolve_calibration({"owner_id": "owner"}, profile) == (
+        "moderate", "default",
+    )
+
+
+def test_calibration_profile_owner_mismatch_and_next_request_do_not_inherit_mode():
+    profile = {"profile_name": "dev", "profile_version": 1,
+               "effective_profile_ref": "owner:dev:1", "owner_id": "other",
+               "response_style": {"calibration_mode": "exploratory"}}
+    assert orchestrate_service._resolve_calibration({"owner_id": "owner"}, profile) == (
+        "moderate", "default",
+    )
+    assert orchestrate_service._resolve_calibration(
+        {"owner_id": "owner", "calibration_mode": "strict"}, {},
+    ) == ("strict", "request")
+    assert orchestrate_service._resolve_calibration({"owner_id": "owner"}, {}) == (
+        "moderate", "default",
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["strict", "moderate", "exploratory"])
+async def test_calibration_cannot_release_unsupported_quantitative_proposal(tmp_path, mode):
+    claim = "The compressor failure probability is 73.2%."
+    out, runtime, dsa, provider, memory = await _run_targeted_cross_source_case(
+        tmp_path=tmp_path, calibration_mode=mode, provider_claim=claim, supporting=False,
+    )
+    # Scripted model and CR contract responses prove CO's result boundary,
+    # not model truthfulness or CR's production claim classification.
+    trace = memory.trace_calls[-1]["payload"]["prompt"]["general_evidence_reasoning"]
+    assert trace["cr_conclusion_disposition"] == "withheld"
+    assert trace["presented_to_user"] is False
+    assert "73.2" not in out["answer"]
+    assert len(provider.calls) == len(runtime.claim_support_calls) == 1
+    assert provider.calls[0]["tools"] == []
+    assert dsa.fetch_calls == []
+    assert out.get("pending_action") is None

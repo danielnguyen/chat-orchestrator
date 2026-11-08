@@ -48,8 +48,8 @@ from clients.runtime import (
     validate_timing_request,
     validate_timing_response,
 )
-from models import ChatRequest, ProcessingCueRecord
-from pydantic import ValidationError
+from models import CalibrationMode, ChatRequest, ProcessingCueRecord
+from pydantic import TypeAdapter, ValidationError
 from router.engine import evaluate_route
 from services.action_connectors import ActionConnectorRegistry
 from services.assistant_handoff import build_assistant_handoff
@@ -176,7 +176,7 @@ from services.privacy_context import (
     validate_privacy_runtime_response,
 )
 from services.profile_apply import apply_profile_to_request
-from services.prompt_assembly import PromptAssembly, assemble_prompt
+from services.prompt_assembly import PromptAssembly, assemble_prompt, calibration_guidance
 from services.prompt_assembly import restraint_trace as sanitize_restraint_trace
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
 from services.response_action import ResponseActionInput, apply_response_action
@@ -7850,6 +7850,34 @@ def _render_claim_for_presentation(
         return authoritative_claim
 
 
+def _resolve_calibration(
+    payload: dict[str, Any], profile: dict[str, Any]
+) -> tuple[CalibrationMode, str]:
+    # The authenticated resolve_profile call is owner scoped. Require its existing
+    # effective reference to match before consuming a saved preference; never
+    # infer an owner from an arbitrary profile name or reuse another turn's value.
+    validator = TypeAdapter(CalibrationMode)
+    override = payload.get("calibration_mode")
+    if override is not None:
+        return validator.validate_python(override), "request"
+    if not profile or not payload.get("owner_id"):
+        return "moderate", "default"
+    expected_ref = (
+        f"{payload['owner_id']}:{profile.get('profile_name')}:{profile.get('profile_version')}"
+    )
+    style = profile.get("response_style")
+    if (
+        profile.get("effective_profile_ref") == expected_ref
+        and profile.get("owner_id", payload["owner_id"]) == payload["owner_id"]
+        and isinstance(style, dict)
+    ):
+        try:
+            return validator.validate_python(style.get("calibration_mode")), "profile"
+        except ValidationError:
+            pass
+    return "moderate", "default"
+
+
 def _select_claim_support_presentation(
     *,
     enabled: bool,
@@ -8332,23 +8360,30 @@ async def _run_general_evidence_reasoning(
     )
     authorized_ref_ids = set(evidence_metadata)
     try:
+        reasoning_messages = evidence_reasoning_messages(
+            request_text=request_text,
+            evidence=evidence,
+            claim_scope_basis=claim_scope_basis,
+            continuation_context=continuation_context,
+            current_source_ids={
+                source.source_id
+                for source in (
+                    state.inventory.sources
+                    if state.inventory is not None
+                    else []
+                )
+            },
+        )
+        mode, _ = _resolve_calibration(effective_payload, {})
+        reasoning_messages[0] = {
+            **reasoning_messages[0],
+            "content": reasoning_messages[0]["content"] + "\n\n" + calibration_guidance(mode),
+        }
+        trace["calibration_mode"] = mode
         completion = await litellm.chat(
             request_id=request_id,
             model=route["model"],
-            messages=evidence_reasoning_messages(
-                request_text=request_text,
-                evidence=evidence,
-                claim_scope_basis=claim_scope_basis,
-                continuation_context=continuation_context,
-                current_source_ids={
-                    source.source_id
-                    for source in (
-                        state.inventory.sources
-                        if state.inventory is not None
-                        else []
-                    )
-                },
-            ),
+            messages=reasoning_messages,
             tools=[],
             response_format=evidence_reasoning_response_format(),
             max_completion_tokens=_EVIDENCE_REASONING_MAX_COMPLETION_TOKENS,
@@ -10781,6 +10816,8 @@ async def orchestrate_chat(
             client_id=payload.get("client_id"),
         )
         effective_payload = apply_profile_to_request(profile, payload)
+        calibration_mode, calibration_source = _resolve_calibration(payload, profile)
+        effective_payload["calibration_mode"] = calibration_mode
         if conversation_resolution_trace.get("mode") == "compatibility_create_new" or (
             conversation_resolution_trace.get("outcome") == "create_new" and any(
                 reason in conversation_resolution_trace.get("reason_codes", [])
@@ -12639,6 +12676,8 @@ async def orchestrate_chat(
 
         try:
             prompt = assemble_prompt(
+                calibration_mode=calibration_mode,
+                calibration_source=calibration_source,
                 runtime_timing_trace=timing_trace,
                 profile=profile,
                 retrieval_bundle=provider_retrieval_bundle,
@@ -12977,6 +13016,8 @@ async def orchestrate_chat(
                     )
                     try:
                         prompt = assemble_prompt(
+                            calibration_mode=calibration_mode,
+                            calibration_source=calibration_source,
                             runtime_timing_trace=timing_trace,
                             profile=profile,
                             retrieval_bundle=provider_retrieval_bundle,
@@ -13274,6 +13315,8 @@ async def orchestrate_chat(
                 }
                 try:
                     prompt = assemble_prompt(
+                        calibration_mode=calibration_mode,
+                        calibration_source=calibration_source,
                         runtime_timing_trace=timing_trace,
                         profile=profile,
                         retrieval_bundle=provider_retrieval_bundle,
@@ -13925,6 +13968,8 @@ async def orchestrate_chat(
                 )
                 try:
                     repair_prompt = assemble_prompt(
+                        calibration_mode=calibration_mode,
+                        calibration_source=calibration_source,
                         runtime_timing_trace=timing_trace,
                         profile=profile,
                         retrieval_bundle=provider_retrieval_bundle,

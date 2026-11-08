@@ -481,8 +481,11 @@ async def test_smoke_required_content_overflow_fails_without_false_truncation(tm
     assert (
         prompt_trace["prompt_budget"]["failure_reason"] == "required_prompt_content_exceeds_budget"
     )
-    assert prompt_trace["truncation"]["applied"] is False
-    assert prompt_trace["truncation"]["reason"] is None
+    # Only the new optional calibration preference was removed; required
+    # content still overflows and no provider call or unsafe truncation occurs.
+    assert prompt_trace["truncation"]["applied"] is True
+    assert prompt_trace["truncation"]["reason"] == "optional_context_reduced"
+    assert prompt_trace["prompt_budget"]["dropped_context"]["by_layer"] == {"calibration": 1}
     assert "REQUIRED_PROFILE_SENTINEL" not in _private_trace_text(prompt_trace)
     assert runtime.terminal_status == "abandoned"
 

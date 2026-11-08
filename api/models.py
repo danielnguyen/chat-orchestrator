@@ -21,6 +21,7 @@ BriefType = Literal[
     "general",
 ]
 ResponseMode = Literal["normal", "brief"]
+CalibrationMode = Literal["strict", "moderate", "exploratory"]
 BriefDepth = Literal[0, 1, 2, 3]
 InterruptPolicyMode = Literal["off", "evaluate_only", "enforce"]
 InteractionMode = Literal["text", "voice_mediated"]
@@ -227,6 +228,7 @@ class ChatRequest(BaseModel):
     sensitivity: Literal["public", "private", "local_only"] = "private"
     retrieval: Optional[RetrievalOptions] = None
     response_mode: ResponseMode = "normal"
+    calibration_mode: Optional[CalibrationMode] = None
     brief_depth: Optional[BriefDepth] = None
     brief_type: BriefType = "general"
     interrupt_policy_mode: InterruptPolicyMode = "off"
