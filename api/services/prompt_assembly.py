@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from models import CalibrationMode
 from services.assistant_handoff import AssistantHandoff
 from services.companion_presentation import CompanionPresentation
 from services.privacy_context import (
@@ -96,6 +97,28 @@ EVIDENCE_REPAIR_FAILURE_REASONS = {
     "excerpt_not_extractive",
     "excerpt_token_boundary_invalid",
 }
+
+
+def calibration_guidance(mode: CalibrationMode) -> str:
+    approaches = {
+        "strict": (
+            "Established observations and attributed premises first; conservative inferences."
+        ),
+        "moderate": "Strongest supportable inference first; explain its basis and uncertainty.",
+        "exploratory": (
+            "Explore alternative interpretations as explicit hypotheses and ways to test them."
+        ),
+    }
+    return (
+        f"Conversational calibration ({mode}): {approaches[mode]} "
+        "Answer supplied premises with attribution at exactly the supplied precision. "
+        "A user premise is not independent verification. Separate facts, inferences, "
+        "hypotheses and unknowns; give useful partial answers. External checks require "
+        "authorized evidence. Never invent dates, numbers, citations, completeness or actions. "
+        "Partial evidence cannot prove exhaustive or absence claims. Preserve privacy, "
+        "source/tool permissions, high-impact safeguards, qualifications, withheld conclusions "
+        "and output schemas. Reasoning proposals remain subject to runtime authorization."
+    )
 
 
 def grounded_evidence_repair_instruction(failure_reason: str) -> str:
@@ -403,6 +426,7 @@ def _apply_prompt_budget(
     contract: PromptBudgetContract,
     base_layers: list[dict[str, Any]],
     profile_messages: list[dict[str, str]],
+    calibration_messages: list[dict[str, str]],
     style_messages: list[dict[str, str]],
     response_shape_messages: list[dict[str, str]],
     timing_messages: list[dict[str, str]],
@@ -439,6 +463,8 @@ def _apply_prompt_budget(
     def build() -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
         ordered: list[tuple[str, list[dict[str, str]], dict[str, Any]]] = [
             ("profile_overlay", profile_messages, {}),
+            *([("calibration", [] if "calibration" in omitted_whole_layers
+                else calibration_messages, {})] if "calibration" in base_by_name else []),
             (
                 "style_guidance",
                 [] if "style_guidance" in omitted_whole_layers else style_messages,
@@ -646,7 +672,15 @@ def _apply_prompt_budget(
             )
 
         changed = False
-        if request_history:
+        # Prefer evidence and conversation context to this optional expression
+        # preference. Required authority instructions are never removed here.
+        if calibration_messages and "calibration" not in omitted_whole_layers:
+            omitted_whole_layers.add("calibration")
+            dropped.append({
+                "layer": "calibration", "reason": "prompt_budget_optional_layer_omitted",
+            })
+            changed = True
+        elif request_history:
             request_history.pop(0)
             dropped.append(
                 {"layer": "current_messages", "reason": "prompt_budget_request_history_omitted"}
@@ -1181,6 +1215,8 @@ def assemble_prompt(
     current_messages: list[dict[str, str]],
     handoff: AssistantHandoff | None = None,
     presentation: CompanionPresentation | None = None,
+    calibration_mode: CalibrationMode | None = None,
+    calibration_source: str = "default",
     style_guidance: str | None = None,
     style_trace: dict[str, Any] | None = None,
     response_shape_guidance: str | None = None,
@@ -1229,6 +1265,24 @@ def assemble_prompt(
     profile_messages = [{"role": "system", "content": system_prompt}] if system_prompt else []
     messages.extend(profile_messages)
     layers.append(_layer_trace("profile_overlay", profile_messages))
+
+    # Extractive and advisory contracts own their output; do not ask those
+    # providers to add new claims or hypotheses.
+    calibration_included = calibration_mode is not None and not (
+        evidence_response_contract or evidence_advisory_guidance
+    )
+    calibration_messages = (
+        [{"role": "system", "content": calibration_guidance(calibration_mode)}]
+        if calibration_included else []
+    )
+    calibration_trace = {
+        "mode": calibration_mode,
+        "source": calibration_source,
+        "included": calibration_included,
+    }
+    messages.extend(calibration_messages)
+    if calibration_mode is not None:
+        layers.append(_layer_trace("calibration", calibration_messages))
 
     style_trace_out = dict(style_trace or {})
     style_messages = [{"role": "system", "content": style_guidance}] if style_guidance else []
@@ -1889,6 +1943,7 @@ def assemble_prompt(
                 contract=prompt_budget_contract,
                 base_layers=layers,
                 profile_messages=profile_messages,
+                calibration_messages=calibration_messages,
                 style_messages=style_messages,
                 response_shape_messages=response_shape_messages,
                 timing_messages=timing_messages,
@@ -1931,6 +1986,11 @@ def assemble_prompt(
         layers = budget_result.layers
         prompt_budget_trace_out = budget_result.trace
         retained_source_ids = budget_result.retained_source_ids
+        calibration_trace["included"] = any(
+            layer["name"] == "calibration" and layer["included"] for layer in layers
+        )
+        if calibration_included and not calibration_trace["included"]:
+            calibration_trace["omission_reason"] = "prompt_budget_layer_omitted"
 
     trace = {
         "layers": layers,
@@ -1950,6 +2010,7 @@ def assemble_prompt(
         },
         "handoff": handoff.trace_summary() if handoff is not None else None,
         "presentation": presentation.trace_summary() if presentation is not None else None,
+        "calibration": calibration_trace,
         "style": style_trace_out or {"attempted": False, "status": "not_requested"},
         "runtime_timing": timing_trace_out,
         "response_shape": response_shape_trace_out
