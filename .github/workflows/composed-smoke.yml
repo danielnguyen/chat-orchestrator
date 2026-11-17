@@ -50,6 +50,102 @@ permissions:
   contents: read
 
 jobs:
+  controlled-latency-comparison:
+    name: single controlled baseline-candidate comparison
+    # This is the one unused #244 comparison, not a repeatable benchmark trigger.
+    if: >-
+      github.event_name == 'pull_request' && github.event.action == 'synchronize' &&
+      github.event.pull_request.number == 245 &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'openhands/issue-244' && github.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TRANSPORT_LATENCY_ONLY: "1"
+      COMPOSED_LATENCY_POLICY: enforce
+    steps:
+      - name: Checkout comparison workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: chat-orchestrator
+          fetch-depth: 0
+
+      - name: Verify single workflow-only continuation and prepare pinned arms
+        run: |
+          test "$(git -C chat-orchestrator rev-parse HEAD^)" = 45273cc5de0b3270eee3db7a05ed181c54c42ead
+          test "$(git -C chat-orchestrator diff --name-only HEAD^ HEAD)" = .github/workflows/composed-smoke.yml
+          git -C chat-orchestrator worktree add --detach ../baseline 67ffae95bfaf54f10a6080410a3b65315ccc3ba1
+          git -C chat-orchestrator worktree add --detach ../candidate 45273cc5de0b3270eee3db7a05ed181c54c42ead
+
+      - name: Checkout pinned Cognitive Runtime
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/cognitive-runtime
+          ref: f3871f5f9db1b859143669fbc0d7de4cfe310148
+          path: cognitive-runtime
+          fetch-depth: 0
+
+      - name: Checkout pinned Basic Memory Store
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/basic-memory-store
+          ref: 3a3ad6dd168c53aed5113263755218abae996042
+          path: basic-memory-store
+          fetch-depth: 0
+
+      - name: Checkout pinned Data Source Aggregator
+        uses: actions/checkout@v4
+        with:
+          repository: danielnguyen/data-source-aggregator
+          ref: 57389cab54481d1c768d403fb9213cc2748103d3
+          path: data-source-aggregator
+          fetch-depth: 0
+
+      - name: Establish pinned dependency refs
+        run: |
+          for repository in cognitive-runtime basic-memory-store data-source-aggregator; do
+            git -C "$repository" branch --force main HEAD
+            git -C "$repository" rev-parse HEAD
+          done
+
+      - name: Run each pinned arm once with existing build and cleanup
+        id: comparison
+        shell: bash
+        run: |
+          result=0
+          for arm in baseline candidate; do
+            export COMPOSED_SMOKE_LOG_DIR="$RUNNER_TEMP/controlled-latency/$arm"
+            mkdir -p "$COMPOSED_SMOKE_LOG_DIR"
+            printf '## Controlled comparison: %s\n\n' "$arm" >> "$GITHUB_STEP_SUMMARY"
+            # Keep errexit inside the unchanged harness; capture its failure here
+            # so a budget miss cannot suppress the other arm.
+            set +e
+            make -C "$arm" composed-smoke 2>&1 | tee "$COMPOSED_SMOKE_LOG_DIR/run.log"
+            statuses=("${PIPESTATUS[@]}")
+            set -e
+            printf 'harness_exit=%s\nlog_exit=%s\n' "${statuses[0]}" "${statuses[1]}" \
+              | tee "$COMPOSED_SMOKE_LOG_DIR/outcome.txt"
+            printf '\nHarness exit: %s; log capture exit: %s\n' "${statuses[0]}" "${statuses[1]}" >> "$GITHUB_STEP_SUMMARY"
+            if [ "${statuses[0]}" -ne 0 ] || [ "${statuses[1]}" -ne 0 ]; then result=1; fi
+          done
+          echo "result=$result" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve both comparison arms including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: controlled-latency-comparison
+          path: ${{ runner.temp }}/controlled-latency
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Enforce combined comparison outcome
+        if: always()
+        env:
+          COMPARISON_RESULT: ${{ steps.comparison.outputs.result }}
+        run: test "$COMPARISON_RESULT" = 0
+
   composed-smoke:
     name: actual-service-evidence-acquisition
     runs-on: ubuntu-latest
