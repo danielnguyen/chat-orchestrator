@@ -7267,6 +7267,7 @@ async def _interpret_evidence_request(
     routing_policy: dict[str, Any],
     effective_payload: dict[str, Any],
     continuation_context: dict[str, Any] | None = None,
+    conversation_messages: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     route = _load_logical_route(model_registry_path, _EVIDENCE_INTERPRETER_ROUTE)
     if route is None:
@@ -7303,6 +7304,12 @@ async def _interpret_evidence_request(
             source_list=source_list,
             continuation_context=continuation_context,
         )
+        if conversation_messages:
+            # Supply ordinary conversation as data to the existing interpreter. It
+            # remains advisory; CR still owns source scope and acquisition authority.
+            interpreter_input = json.loads(messages[1]["content"])
+            interpreter_input["conversation_messages"] = conversation_messages
+            messages[1]["content"] = json.dumps(interpreter_input, ensure_ascii=True)
         response_format = evidence_interpreter_response_format()
         schema_name = response_format.get("json_schema", {}).get("name", "unknown")
     except Exception as exc:
@@ -11560,6 +11567,7 @@ async def orchestrate_chat(
                 None if turn_policy_metadata is not None else turn_policy_omission_reason
             ),
         }
+        conversation_message_ids: set[str] = set()
         if suppression_reason or dependency_failure_reason:
             reason = suppression_reason or dependency_failure_reason or "retrieval_suppressed"
             retrieval_dispatch_trace.update(
@@ -11634,6 +11642,22 @@ async def orchestrate_chat(
                     request_id=request_id, conversation_id=conversation_id,
                     reason="retained_context_unavailable",
                 )
+            if (
+                isinstance(retrieval_bundle, dict)
+                and retrieval_bundle.get("request_id") == request_id
+                and retrieval_bundle.get("conversation_id") == conversation_id
+                and isinstance(retrieval_bundle.get("bundle"), dict)
+                and isinstance(retrieval_bundle["bundle"].get("recent"), list)
+            ):
+                # Check original scope before containment projects returned records.
+                conversation_message_ids = {
+                    item["message_id"]
+                    for item in retrieval_bundle.get("bundle", {}).get("recent", [])
+                    if isinstance(item, dict)
+                    and isinstance(item.get("message_id"), str)
+                    and item.get("owner_id") == payload["owner_id"]
+                    and item.get("conversation_id") == conversation_id
+                }
             retrieval_bundle, result_boundary_trace = _apply_persona_containment_result_boundary(
                 retrieval_bundle=retrieval_bundle,
                 request_id=request_id,
@@ -12103,6 +12127,32 @@ async def orchestrate_chat(
                 )
             else:
                 async def semantic_interpreter(**kwargs: Any) -> dict[str, Any]:
+                    # Use only current, same-thread messages that survived the
+                    # existing containment, hygiene and recall boundaries.
+                    conversation_messages = _bounded_recent_messages([
+                        item for item in retrieval_bundle.get("bundle", {}).get("recent", [])
+                        if isinstance(item, dict)
+                        and item.get("message_id") in conversation_message_ids
+                        and item.get("role") in {"user", "assistant"}
+                        and item.get("evidence_role") == "canonical"
+                        and item.get("freshness_state") == "active"
+                        and item.get("durable_status") == "active"
+                        and item.get("source_availability") in {"available", "not_applicable"}
+                        and item.get("_truth_framing", "current") in {
+                            "current", "corrected_replacement",
+                        }
+                    ])
+                    if conversation_messages and privacy_context_enabled:
+                        context_policy, _ = await _resolve_privacy_context(
+                            runtime=runtime, enabled=True, request_id=request_id,
+                            owner_id=payload["owner_id"], conversation_id=conversation_id,
+                            surface=surface, runtime_session_id=runtime_session_id,
+                            runtime_turn_id=runtime_turn_id, payload=effective_payload,
+                            retrieval_bundle=retrieval_bundle, runtime_identity=runtime_identity,
+                            world_state=world_state, relationship_context=relationship_context,
+                        )
+                        if privacy_policy_requires_suppression(context_policy):
+                            conversation_messages = []
                     return await _interpret_evidence_request(
                         **kwargs,
                         litellm=litellm,
@@ -12112,6 +12162,7 @@ async def orchestrate_chat(
                         routing_policy=routing_policy,
                         effective_payload=effective_payload,
                         continuation_context=reasoning_continuation_context,
+                        conversation_messages=conversation_messages,
                     )
 
                 evidence_acquisition = await begin_evidence_acquisition(

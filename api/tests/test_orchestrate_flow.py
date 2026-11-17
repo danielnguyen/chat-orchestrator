@@ -23974,8 +23974,8 @@ async def test_conversational_followup_source_routing(
     assert len(runtime.evidence_shape_calls) == 2
     assert dsa.list_calls == [{}]
     assert dsa.fetch_calls == dsa.context_calls == []
-    # Existing privacy projection: history reaches answer generation, not the interpreter.
-    assert history not in json.dumps(litellm.calls[0]["messages"])
+    # Eligible conversation now reaches routing as well as answer generation.
+    assert history in json.dumps(litellm.calls[0]["messages"])
     if proposes_source:
         assert len(runtime.evidence_plan_calls) == len(dsa.calls) == 1
         assert dsa.calls[0]["source_ids"] == ["personal_schedule"]
@@ -46101,7 +46101,7 @@ async def test_external_evidence_signal_transport_and_receiver_authority(
     assert litellm.calls[0]["timeout_ms"] == 5000
     assert litellm.calls[0].get("tools") in (None, [])
     interpreter_input = json.loads(litellm.calls[0]["messages"][1]["content"])
-    assert set(interpreter_input) == {"request_text", "sources"}
+    assert set(interpreter_input) == {"request_text", "sources", "conversation_messages"}
     assert interpreter_input["request_text"] == question
     assert dsa.list_calls == [{}]
     assert dsa.fetch_calls == dsa.context_calls == []
@@ -46409,3 +46409,191 @@ async def test_calibration_cannot_release_unsupported_quantitative_proposal(tmp_
     assert provider.calls[0]["tools"] == []
     assert dsa.fetch_calls == []
     assert out.get("pending_action") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("premise,question,answer", [
+    (
+        "Pick up the camera at 4 p.m. at the north entrance.",
+        "Actually, make that 4:30. What's the updated reminder?",
+        "Pick up the camera at 4:30 p.m. at the north entrance.",
+    ),
+    (
+        "Bring six ceramic tiles to the west workshop.",
+        "Change the quantity to eight; repeat the delivery plan.",
+        "Bring eight ceramic tiles to the west workshop.",
+    ),
+])
+@pytest.mark.parametrize("recall", [False, True])
+async def test_ordinary_conversation_context_reaches_source_routing(
+    tmp_path, premise, question, answer, recall,
+):
+    """Instrumented providers prove context transport, not live model reasoning."""
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    retained = answer if recall else premise
+    if recall:
+        question = "Remind me of the plan we agreed on."
+
+    class ConversationMemory(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            bundle = await super().retrieve_bundle(**kwargs)
+            template = bundle["bundle"]["recent"][0]
+            bundle["bundle"]["recent"] = [
+                {**template, "message_id": "plan-user", "role": "user", "content": retained},
+                {**template, "message_id": "plan-assistant", "content": retained},
+            ]
+            return bundle
+
+    class ContextProvider(FakeLiteLLM):
+        async def chat(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                data = json.loads(kwargs["messages"][1]["content"])
+                assert data["request_text"] == question
+                assert data["conversation_messages"] == [
+                    {"role": "user", "content": retained},
+                    {"role": "assistant", "content": retained},
+                ]
+                assert "prior_supported_context" not in data
+                return _evidence_interpreter_completion("no_match", "unknown", [])
+            assert retained in json.dumps(kwargs["messages"])
+            assert question in json.dumps(kwargs["messages"])
+            return {"choices": [{"message": {"content": answer}}]}
+
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(call, second_status="no_match"),
+        auto_source_match=False,
+    )
+    provider, memory = ContextProvider(), ConversationMemory()
+    if recall:
+        # A reconstructed adapter sends only its new message, with no cached thread ID.
+        memory.list_conversation_response = {
+            "conversations": [_conversation_projection(conversation_id="conv-1")],
+            "next_cursor": None,
+        }
+        runtime.continuation_selection_response = _selection_response(
+            "resume", request_id="rid-conversation-context", surface="node_red",
+            selected_conversation_id="conv-1", selected_thread_revision=7,
+            candidate_count=1, eligible_candidate_count=1,
+        )
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources", "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    out = await orchestrate_chat(
+        payload=_first_party_chat_payload(
+            question, **({} if recall else {"conversation_id": "conv-1"}),
+        ),
+        memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-conversation-context",
+    )
+    assert out["answer"] == answer
+    assert out["conversation_id"] == "conv-1"
+    assert out["status"] == "ok"
+    assert len(provider.calls) == 2
+    assert len(runtime.evidence_shape_calls) == 2
+    assert runtime.evidence_plan_calls == []
+    assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+    assert memory.retrieve_calls[0]["conversation_id"] == "conv-1"
+    if recall:
+        assert len(runtime.continuation_selection_calls) == 1
+        assert memory.create_conversation_calls == []
+    else:
+        assert memory.exact_conversation_calls
+    assert len(memory.added_messages) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["owner", "conversation", "stale", "missing", "envelope"])
+async def test_source_routing_excludes_ineligible_conversation_context(tmp_path, invalid):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+
+    class IneligibleMemory(FakeMemoryStore):
+        async def retrieve_bundle(self, **kwargs):
+            bundle = await super().retrieve_bundle(**kwargs)
+            item = bundle["bundle"]["recent"][0]
+            item["content"] = "INELIGIBLE_CONVERSATION_SENTINEL"
+            if invalid == "owner":
+                item["owner_id"] = "foreign-owner"
+            elif invalid == "conversation":
+                item["conversation_id"] = "foreign-conversation"
+            elif invalid == "stale":
+                item["freshness_state"] = "stale"
+            elif invalid == "envelope":
+                bundle["conversation_id"] = "foreign-conversation"
+            else:
+                bundle["bundle"]["recent"] = []
+            return bundle
+
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(call, second_status="no_match"),
+        auto_source_match=False,
+    )
+    provider = SequenceLiteLLM([
+        _evidence_interpreter_completion("no_match", "unknown", []),
+        {"choices": [{"message": {"content": "Which plan do you mean?"}}]},
+    ])
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources", "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    await orchestrate_chat(
+        payload=_first_party_chat_payload("What's the updated plan?"),
+        memory_store=IneligibleMemory(), litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-conversation-ineligible",
+    )
+    assert "INELIGIBLE_CONVERSATION_SENTINEL" not in json.dumps(provider.calls[0])
+    assert "conversation_messages" not in json.loads(provider.calls[0]["messages"][1]["content"])
+    assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("privacy", ["allowed", "suppressed", "unavailable"])
+async def test_conversation_routing_applies_privacy_before_provider(tmp_path, privacy):
+    rules, models = _write_evidence_interpreter_route_files(tmp_path)
+    runtime = FakeRuntime(
+        evidence_shape_response=lambda call: _semantic_test_shape(call, second_status="no_match"),
+        auto_source_match=False,
+    )
+
+    async def privacy_policy(**scope):
+        runtime.privacy_context_calls.append(scope)
+        if privacy == "unavailable":
+            raise RuntimeError("unavailable")
+        return _privacy_runtime_response(
+            **{key: scope[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )},
+            surface_type=scope["surface_category"], sensitivity_level=scope["sensitivity_level"],
+            sensitive_detail_allowed=privacy == "allowed",
+            redaction_required=privacy == "suppressed",
+        )
+
+    runtime.evaluate_privacy_context = privacy_policy
+    provider = SequenceLiteLLM([
+        _evidence_interpreter_completion("no_match", "unknown", []),
+        {"choices": [{"message": {"content": "Which plan do you mean?"}}]},
+    ])
+    dsa = FakeDSA(source_response={
+        "inventory_scope": "configured_sources", "inventory_status": "complete",
+        "sources": _neutral_schedule_sources(),
+    })
+    await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"),
+        memory_store=FakeMemoryStore(), litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True, privacy_context_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="rid-context-privacy",
+    )
+    context = json.loads(provider.calls[0]["messages"][1]["content"])
+    assert ("conversation_messages" in context) == (privacy == "allowed")
+    assert len(runtime.privacy_context_calls) == 2
+    assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
