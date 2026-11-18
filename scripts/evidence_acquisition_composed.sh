@@ -903,7 +903,12 @@ assert_history_request_boundaries() {
     and .prompt.claim_explanation.storage_call_count == 1
     and .prompt.claim_explanation.provider_call_count == 0
     and .prompt.claim_explanation.manifest_resolution_status == $resolution
-    and (.prompt | has("evidence_acquisition") | not)
+    and .prompt.evidence_acquisition.attempted == false
+    and .prompt.evidence_acquisition.status == "ineligible"
+    and .prompt.evidence_acquisition.manifest_id == null
+    and .prompt.evidence_acquisition.shape == {}
+    and .prompt.evidence_acquisition.plan == {}
+    and .prompt.evidence_acquisition.sufficiency == {}
   ' <<<"$trace" >/dev/null
   assert_provider_free_trace "$trace"
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
@@ -5285,7 +5290,12 @@ assert_ordinary_history_case() {
     and .prompt.history_followup.fresh_verification_entry_status == "not_requested"
     and (.model_calls | length) == 1
     and .references == []
-    and (.prompt | has("evidence_acquisition") | not)
+    and .prompt.evidence_acquisition.attempted == false
+    and .prompt.evidence_acquisition.status == "ineligible"
+    and .prompt.evidence_acquisition.manifest_id == null
+    and .prompt.evidence_acquisition.shape == {}
+    and .prompt.evidence_acquisition.plan == {}
+    and .prompt.evidence_acquisition.sufficiency == {}
   '
   assert_jq "history.ordinary_followup.provider" "$calls" '
     [.calls[] | select(.kind == "chat")] as $answers
