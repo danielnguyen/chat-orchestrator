@@ -5142,9 +5142,6 @@ run_evidence_structured_answer_recovery_scenarios() {
   echo "Evidence structured answer recovery: structured_primary=1 structured_fallback=1 unsupported_route=1 repair_success=1 repair_exhausted=6 freeform_rejected=1 forged_reference_rejected=1 content_fallbacks=0"
 }
 
-readonly HISTORY_FOLLOWUP_CLARIFICATION="Are you asking what supported the immediately previous answer, what I checked, what may have been missed, or whether you want a new verification?"
-readonly HISTORY_CLASSIFIER_UNAVAILABLE="I couldn’t process that follow-up because of a technical limitation. I didn’t retrieve earlier records or run a new check. Please try again."
-readonly HISTORY_CLASSIFIER_SYSTEM_PROMPT="Classify only the current user message. Return exactly one JSON object matching the supplied schema. Do not answer the user or explain your classification.  First identify what the user wants examined: an earlier assistant answer and its basis, or a subject in the world. Classify the requested operation, not merely the presence of conversational references such as \"that\", \"you\", or \"check\".  Previous-answer targeting applies when the message asks about an earlier answer's support, records examined, coverage, omissions, or explicitly asks to verify that answer or claim again. The reference may be implicit in wording such as \"Which records did you consult?\" It need not say \"previous answer\". Do not invent a previous claim from a reference to a conversational subject.  A request for new information or a new lookup about that subject is not_history_followup. This remains true when the subject was mentioned earlier, its identity is unclear, or the user has not supplied the inputs needed for the lookup. Missing lookup inputs are not omissions in an earlier evidence search. An independent lookup may need clarification by the ordinary answer path; that does not make it ambiguous_history_followup.  Examples: \"Can you check the tracking status of that package? I haven't given you a carrier or tracking number.\" => not_history_followup; new_verification_requested false. \"What evidence supported your previous answer about that package?\" => support_explanation; new_verification_requested false. \"Please check fresh sources to verify your previous answer about that package.\" => new_verification_request; new_verification_requested true. \"Can you check whether that appointment is confirmed? I haven't supplied a booking reference.\" => not_history_followup; new_verification_requested false. \"Which records did you consult for your last answer?\" => acquisition_checked; new_verification_requested false. \"What might you have missed when checking sources for your last answer?\" => acquisition_gaps; new_verification_requested false. \"What about that evidence?\" => ambiguous_history_followup; new_verification_requested false. \"What would you recommend for that situation?\" => not_history_followup; new_verification_requested false.  For requests about an earlier answer, choose the requested kind: support_explanation: what supported or justified the answer. acquisition_checked: what was examined. acquisition_coverage: whether the available scope was covered. acquisition_gaps: what may have been missed in the earlier examination. new_verification_request: an explicit fresh check of an earlier answer or claim. ambiguous_history_followup: a plausibly historical evidence request whose kind or target is genuinely uncertain. not_history_followup: an ordinary question, instruction, or independent lookup.  Choose target_mode after intent: Use immediate_previous for an unquoted request about the immediately previous answer. Use explicit_reference only when the current text itself explicitly selects an earlier target. For not_history_followup, use immediate_previous solely as the required schema placeholder; it does not assert a historical target. Allowed target modes are immediate_previous and explicit_reference.  Set new_verification_requested true only when the user explicitly requests a fresh check of an earlier answer or claim. Questions about support, checked records, coverage, or gaps do not by themselves request fresh verification. For not_history_followup and ambiguous_history_followup, set it false.  Confidence measures clarity of the current wording's intent and target mode, not whether retained evidence exists, sources are complete, or a claim is true. A clear request to list records consulted can be high confidence without seeing the records or answer. A clear independent lookup can be high confidence even when required lookup inputs are missing. Use high confidence (>=0.85) when intent and target mode are clear; medium (0.60-<0.85) when a plausible interpretation has meaningful uncertainty; low (<0.60) when poorly supported. Preserve competing interpretations. Express historical target uncertainty through confidence and ambiguous_history_followup. Never raise confidence to obtain history access.  Classifying a request does not establish that anything was checked, supported, covered, missed, or verified. Do not reconstruct history or select record IDs."
 readonly HISTORY_TRACE_KEYS='["answer_provider_call_count","bms_call_count","bms_reason_code","bms_resolution_status","candidate_intent","candidate_source","candidate_target_mode","clarification_required","classifier_call_count","classifier_eligibility","classifier_logical_route","classifier_status","confidence_band","cr_history_policy_call_count","cr_policy_status","deterministic_match_status","explicit_verification_requested","feature_enabled","fresh_verification_entry_status","history_lookup_allowed","lineage_dereference_count","lineage_result","render_status","resolution_source","resolved_record_kind","verification_after_history_allowed"]'
 
 restart_orchestrator_with_history_followup() {
@@ -5176,15 +5173,6 @@ run_history_current_turn() {
         else {external_context_enabled:true,external_context:$external_context}
         end
     ')"
-}
-
-queue_history_classifier() {
-  local intent="$1" confidence="$2" verify="$3"
-  queue_provider_answer "$(jq -nc \
-    --arg intent "$intent" \
-    --argjson confidence "$confidence" \
-    --argjson verify "$verify" \
-    '{intent:$intent,confidence:$confidence,target_mode:"immediate_previous",new_verification_requested:$verify}')"
 }
 
 create_history_original() {
@@ -5272,36 +5260,55 @@ assert_history_runtime_policy() {
     ' <<<"$diagnostics" >/dev/null
 }
 
-assert_classifier_request() {
-  local calls="$1" question="$2" expected_count="${3:-1}"
-  assert_jq "history.classifier.request" "$calls" '
-    .request_id as $request_id
-    | [.calls[] | select(.kind == "chat" and .model == "gpt-5-mini")] as $classifier
-    | ($classifier | length) == $expected
-    and all($classifier[];
-      .request_id == $request_id
-      and
-      .tool_count == 0
-      and .response_format_type == "json_schema"
-      and .response_schema_name == "history_followup_classification"
-      and .response_schema_strict == true
-      and .response_schema_additional_properties == false
-      and .response_schema_required == ["intent","confidence","target_mode","new_verification_requested"]
-      and .max_completion_tokens == 512
-      and .reasoning_effort == "minimal"
-      and .message_count == 2
-      and .normalized_messages == [
-        {role:"system",content:$system},
-        {role:"user",content:$question}
-      ]
-    )
-    and all($classifier[] | .normalized_messages[]; .role != "assistant")
-    and all($classifier[] | .normalized_messages[] | .content;
-      (contains("owner-") or contains("client-") or contains("conversation_id")
-       or contains("claim_id") or contains("trace_id") or contains("manifest_id")
-       or contains("history_root_lineage") or contains("root_assistant_message_id")
-       or contains("source_ref") or contains("records_primary") or contains("google_sheets:")) | not)
-  ' --argjson expected "$expected_count" --arg system "$HISTORY_CLASSIFIER_SYSTEM_PROMPT" --arg question "$question"
+assert_ordinary_history_case() {
+  local conversation_id="$1" response="$2" question="$3" expected_answer="$4"
+  local request_id trace calls diagnostics audit
+  request_id="$(jq -er '.request_id' <<<"$response")"
+  trace="$(fetch_trace "$request_id")"
+  calls="$(fetch_provider_calls "$request_id")"
+  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+  audit="$(fetch_dsa_audit)"
+  assert_jq "history.ordinary_followup.response" "$response" '
+    .status == "ok" and .selected_model != "not_called"
+    and .answer == $answer and .sources == [] and .pending_action == null
+  ' --arg answer "$expected_answer"
+  assert_jq "history.ordinary_followup.trace" "$trace" '
+    .prompt.history_followup.deterministic_match_status == "not_matched"
+    and .prompt.history_followup.classifier_call_count == 0
+    and .prompt.history_followup.classifier_status == "not_called"
+    and .prompt.history_followup.candidate_source == null
+    and .prompt.history_followup.cr_history_policy_call_count == 0
+    and .prompt.history_followup.history_lookup_allowed == false
+    and .prompt.history_followup.bms_call_count == 0
+    and .prompt.history_followup.render_status == "not_attempted"
+    and .prompt.history_followup.clarification_required == false
+    and .prompt.history_followup.fresh_verification_entry_status == "not_requested"
+    and (.model_calls | length) == 1
+    and .references == []
+    and (.prompt | has("evidence_acquisition") | not)
+  '
+  assert_jq "history.ordinary_followup.provider" "$calls" '
+    [.calls[] | select(.kind == "chat")] as $answers
+    | ($answers | length) == 1
+    and $answers[0].model != "gpt-5-mini"
+    and $answers[0].tool_count == 0
+    and $answers[0].response_schema_name != "history_followup_classification"
+    and any($answers[0].normalized_messages[]; .role == "user" and .content == $question)
+    and all($answers[0].normalized_messages[].content;
+      (contains("history_root_lineage") or contains("root_assistant_message_id")
+       or contains("records_primary") or contains("google_sheets:")) | not)
+  ' --arg question "$question"
+  assert_history_runtime_policy "$diagnostics" "$request_id" 1 ignored ignored
+  assert_evidence_runtime_events "$diagnostics" "$request_id" 0 0 0 0
+  assert_dsa_operation_counts "$audit" 0 0 0
+  assert_history_trace_privacy "$trace" "$question" "$HISTORY_ORIGINAL_ANSWER"
+  assert_persisted_answer_matches "$conversation_id" "$request_id" "$expected_answer"
+  assert_request_persistence_counts "$conversation_id" "$request_id" 0
+  test "$(psql_exec -At -c "
+    SELECT metadata ? 'history_root_lineage' FROM messages
+    WHERE conversation_id = '$conversation_id' AND role = 'assistant'
+      AND metadata->>'request_id' = '$request_id';
+  ")" = "f"
 }
 
 assert_pure_history_case() {
@@ -5531,7 +5538,7 @@ INVALID_LINEAGE_CASES
 run_history_followup_composed_suite() {
   local owner client conversation_id response trace calls diagnostics audit request_id answer
   local external claims status_code unauthorized original_trace original_manifest final_manifest
-  local intent question case_name assistant_message_id expected_digest
+  local intent question explicit_question kind case_name assistant_message_id expected_digest
   local first_history_request first_history_lineage root_message_id second_history_lineage
   local v1_probe v2_probe probe_conversation
   external='{"enabled":true,"source_ids":["records_primary"],"allowed_sensitivity":"medium","max_results":5}'
@@ -5803,42 +5810,39 @@ run_history_followup_composed_suite() {
   first_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
-  question="Where did that conclusion come from?"
-  queue_history_classifier support_explanation 0.91 false
+  question="What supported that?"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" classifier support_explanation support 1 root_lineage 1
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" deterministic support_explanation support 0 root_lineage 1
   calls="$(fetch_provider_calls "$HISTORY_REQUEST_ID")"
-  assert_classifier_request "$calls" "$question"
   second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   test "$first_history_lineage" = "$second_history_lineage"
   echo "H2 chained support lineage passed"
 
-  # H3: each natural paraphrase uses one bounded classifier call and a fresh conversation.
-  while IFS='|' read -r case_name question intent; do
+  # H3: ordinary paraphrases use one answer call, without historical lookup.
+  while IFS='|' read -r case_name question explicit_question intent kind; do
     owner="owner-history-h3-$case_name"
     client="client-history-h3-$case_name"
     conversation_id="$(resolve_conversation "$owner" "$client" "history-h3-$case_name")"
     create_history_original "$owner" "$client" "$conversation_id" "Verify the migration record for $case_name."
     provider_post "/fixture/reset" '{}'
     reset_dsa_audit
-    queue_history_classifier "$intent" 0.91 false
+    response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$explicit_question")"
+    assert_pure_history_case "$owner" "$conversation_id" "$response" "$explicit_question" deterministic "$intent" "$kind" 0
+    provider_post "/fixture/reset" '{}'
+    reset_dsa_audit
+    answer="Ordinary answer for $case_name."
+    queue_provider_answer "$answer"
     response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-    case "$intent" in
-      support_explanation) kind="support" ;;
-      *) kind="acquisition" ;;
-    esac
-    assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" classifier "$intent" "$kind" 1
-    calls="$(fetch_provider_calls "$HISTORY_REQUEST_ID")"
-    assert_classifier_request "$calls" "$question"
+    assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer"
   done <<'MATRIX'
-support|Where did that conclusion come from?|support_explanation
-checked|Which records did you look at?|acquisition_checked
-coverage|Did you cover everything available?|acquisition_coverage
-gaps|Anything you may have skipped?|acquisition_gaps
+support|Where did that conclusion come from?|What supported that?|support_explanation|support
+checked|Which records did you look at?|What did you check?|acquisition_checked|acquisition
+coverage|Did you cover everything available?|Did you look at everything relevant?|acquisition_coverage|acquisition
+gaps|Anything you may have skipped?|What might you have missed?|acquisition_gaps|acquisition
 MATRIX
   echo "H3 natural paraphrase matrix passed"
 
-  # H4: malformed classifier output and cloud-disallowed local-only input fail closed.
+  # H4: plain-text answers need no classifier JSON; local-only forbids cloud calls.
   owner="owner-history-h4-malformed"
   client="client-history-h4-malformed"
   conversation_id="$(resolve_conversation "$owner" "$client" "history-h4-malformed")"
@@ -5848,29 +5852,7 @@ MATRIX
   queue_provider_answer 'not-json'
   question="Where did that conclusion come from?"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-  request_id="$(jq -er '.request_id' <<<"$response")"
-  answer="$(jq -er '.answer' <<<"$response")"
-  trace="$(fetch_trace "$request_id")"
-  calls="$(fetch_provider_calls "$request_id")"
-  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
-  audit="$(fetch_dsa_audit)"
-  test "$answer" = "$HISTORY_CLASSIFIER_UNAVAILABLE"
-  assert_jq "history.h4.malformed" "$trace" '
-    .prompt.history_followup.classifier_call_count == 1
-    and .prompt.history_followup.classifier_status == "failed"
-    and .prompt.history_followup.render_status == "failure"
-    and .prompt.history_followup.clarification_required == false
-    and .prompt.history_followup.cr_history_policy_call_count == 0
-    and .prompt.history_followup.bms_call_count == 0
-    and .prompt.history_followup.answer_provider_call_count == 0
-    and .model_calls == []
-  '
-  assert_classifier_request "$calls" "$question"
-  assert_history_runtime_policy "$diagnostics" "$request_id" 1 ignored ignored
-  assert_dsa_operation_counts "$audit" 0 0 0
-  case "$(jq -c . <<<"$trace")$(jq -c . <<<"$response")" in
-    *not-json*) echo "malformed classifier output escaped the boundary" >&2; return 1 ;;
-  esac
+  assert_ordinary_history_case "$conversation_id" "$response" "$question" 'not-json'
 
   owner="owner-history-h4-local"
   client="client-history-h4-local"
@@ -5878,73 +5860,66 @@ MATRIX
   create_history_original "$owner" "$client" "$conversation_id" "Verify the migration record for local policy."
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
+  answer="Ordinary local-only answer."
+  queue_provider_answer "$answer"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question" local_only)"
+  assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer"
   request_id="$(jq -er '.request_id' <<<"$response")"
-  trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
-  diagnostics="$(runtime_diagnostics_from_trace "$trace")"
-  audit="$(fetch_dsa_audit)"
-  test "$(jq -r '.answer' <<<"$response")" = "$HISTORY_CLASSIFIER_UNAVAILABLE"
-  assert_jq "history.h4.local" "$trace" '
-    .prompt.history_followup.classifier_call_count == 0
-    and .prompt.history_followup.classifier_status == "provider_disallowed"
-    and .prompt.history_followup.render_status == "failure"
-    and .prompt.history_followup.clarification_required == false
-    and .prompt.history_followup.cr_history_policy_call_count == 0
-    and .prompt.history_followup.bms_call_count == 0
-    and .model_calls == []
+  assert_jq "history.h4.local" "$calls" '
+    all(.calls[] | select(.kind == "chat"); .model | startswith("chat_local_"))
   '
-  jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' <<<"$calls" >/dev/null
-  assert_history_runtime_policy "$diagnostics" "$request_id" 1 ignored ignored
-  assert_dsa_operation_counts "$audit" 0 0 0
-  echo "H4 classifier failure and privacy gate passed"
+  echo "H4 plain-text answer and privacy gate passed"
 
-  # H5: CR confidence policy is authoritative before history lookup.
+  # H5: retain CR confidence denials at its API boundary. CO no longer produces
+  # classifier candidates; these explicit fixtures must not invoke any provider.
+  local admission scope policy confidence expected_status session turn
   for case_name in medium low; do
     owner="owner-history-h5-$case_name"
     client="client-history-h5-$case_name"
     conversation_id="$(resolve_conversation "$owner" "$client" "history-h5-$case_name")"
-    create_history_original "$owner" "$client" "$conversation_id" "Verify the migration record for $case_name confidence."
     provider_post "/fixture/reset" '{}'
     reset_dsa_audit
-    if [ "$case_name" = "medium" ]; then
-      queue_history_classifier support_explanation 0.70 false
+    request_id="history-confidence-$case_name"
+    admission="$(cr_post /v1/runtime/turns/start "$(jq -nc \
+      --arg request "$request_id" --arg owner "$owner" --arg conversation "$conversation_id" '
+      {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:"chat"}')")"
+    session="$(jq -er '.runtime_session.runtime_session_id' <<<"$admission")"
+    turn="$(jq -er '.runtime_turn.runtime_turn_id' <<<"$admission")"
+    scope="$(jq -nc --arg request "$request_id" --arg owner "$owner" \
+      --arg conversation "$conversation_id" --arg session "$session" --arg turn "$turn" '
+      {request_id:$request,owner_id:$owner,conversation_id:$conversation,surface:"chat",
+       runtime_session_id:$session,runtime_turn_id:$turn}')"
+    if [ "$case_name" = medium ]; then
+      confidence=0.70
+      expected_status=clarification_required
     else
-      queue_history_classifier support_explanation 0.50 false
-      queue_provider_answer "ordinary low-confidence response"
+      confidence=0.50
+      expected_status=rejected
     fi
-    response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-    request_id="$(jq -er '.request_id' <<<"$response")"
-    trace="$(fetch_trace "$request_id")"
+    policy="$(cr_post /v1/runtime/interaction-governance/evaluate "$(jq -c \
+      --argjson confidence "$confidence" '. + {
+        current_user_text:"Where did that conclusion come from?",
+        history_followup_candidate:{source:"classifier",intent:"support_explanation",
+          confidence:$confidence,target_mode:"immediate_previous",new_verification_requested:false}
+      }' <<<"$scope")")"
+    assert_jq "history.h5.denied" "$policy" '
+      .result.history_followup_policy as $p
+      | $p.status == $status and $p.confidence_band == $band
+      and $p.history_lookup_allowed == false
+      and $p.new_verification_allowed_after_history_resolution == false
+      and $p.clarification_required == ($band == "medium")
+    ' --arg status "$expected_status" --arg band "$case_name"
+    diagnostics="$(fetch_runtime_diagnostics "$session")"
+    assert_history_runtime_policy "$diagnostics" "$request_id" 1 "$expected_status" support_explanation
     calls="$(fetch_provider_calls "$request_id")"
-    diagnostics="$(runtime_diagnostics_from_trace "$trace")"
+    assert_jq "history.h5.no_provider" "$calls" '.calls == []'
     audit="$(fetch_dsa_audit)"
-    assert_classifier_request "$calls" "$question"
-    if [ "$case_name" = "medium" ]; then
-      test "$(jq -r '.answer' <<<"$response")" = "$HISTORY_FOLLOWUP_CLARIFICATION"
-      assert_jq "history.h5.medium" "$trace" '
-        .prompt.history_followup.cr_policy_status == "clarification_required"
-        and .prompt.history_followup.confidence_band == "medium"
-        and .prompt.history_followup.bms_call_count == 0
-        and .model_calls == []
-      '
-      assert_history_runtime_policy "$diagnostics" "$request_id" 2 clarification_required support_explanation
-    else
-      assert_jq "history.h5.low" "$trace" '
-        .prompt.history_followup.cr_policy_status == "rejected"
-        and .prompt.history_followup.confidence_band == "low"
-        and .prompt.history_followup.bms_call_count == 0
-        and .prompt.history_followup.fresh_verification_entry_status == "not_requested"
-        and (.model_calls | length) == 1
-        and all(.model_calls[]; .model != "gpt-5-mini")
-      '
-      assert_jq "history.h5.low.provider_separation" "$calls" '
-        ([.calls[] | select(.kind == "chat" and .model == "gpt-5-mini")] | length) == 1
-        and ([.calls[] | select(.kind == "chat" and .model != "gpt-5-mini")] | length) == 1
-      '
-      assert_history_runtime_policy "$diagnostics" "$request_id" 2 rejected support_explanation
-    fi
     assert_dsa_operation_counts "$audit" 0 0 0
+    test "$(psql_exec -At -c "SELECT count(*) FROM messages WHERE conversation_id = '$conversation_id';")" = 0
+    cr_post /v1/runtime/turns/complete "$(jq -c '
+      {request_id,runtime_session_id,runtime_turn_id} + {turn_status:"abandoned"}
+    ' <<<"$scope")" >/dev/null
   done
   echo "H5 CR confidence boundary passed"
 
@@ -6024,17 +5999,15 @@ MATRIX
   first_history_request="$(jq -er '.request_id' <<<"$response")"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
-  question="Where did that conclusion come from?"
-  queue_history_classifier support_explanation 0.91 false
+  question="What supported that?"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" classifier support_explanation support 1 root_lineage 1
+  assert_pure_history_case "$owner" "$conversation_id" "$response" "$question" deterministic support_explanation support 0 root_lineage 1
   second_history_lineage="$HISTORY_PERSISTED_LINEAGE"
   test "$first_history_lineage" = "$second_history_lineage"
   provider_post "/fixture/reset" '{}'
   reset_source_fixture
   reset_dsa_audit
-  question="Can you verify that again now?"
-  queue_history_classifier new_verification_request 0.91 true
+  question="Verify that again?"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question" private "$external")"
   request_id="$(jq -er '.request_id' <<<"$response")"
   answer="$(jq -er '.answer' <<<"$response")"
@@ -6043,7 +6016,6 @@ MATRIX
   diagnostics="$(runtime_diagnostics_from_trace "$trace")"
   audit="$(fetch_dsa_audit)"
   final_manifest="$(jq -ec '.prompt.evidence_acquisition' <<<"$trace")"
-  assert_classifier_request "$calls" "$question"
   if ! assert_jq "history.h7.response" "$response" '
     (.status == "ok" or .status == "degraded")
     and (.answer | startswith("Original support:\n"))
@@ -6080,7 +6052,8 @@ MATRIX
     return 1
   fi
   assert_jq "history.h7.trace" "$trace" '
-    .prompt.history_followup.classifier_call_count == 1
+    .prompt.history_followup.classifier_call_count == 0
+    and .prompt.history_followup.candidate_source == "deterministic"
     and .prompt.history_followup.cr_history_policy_call_count == 1
     and .prompt.history_followup.cr_policy_status == "accepted"
     and .prompt.history_followup.bms_call_count == 1
@@ -6099,7 +6072,7 @@ MATRIX
     and .prompt.claim_capture.reason_code == "compound_verification_response"
   '
   assert_jq "history.h7.provider" "$calls" '
-    ([.calls[] | select(.kind == "chat" and .model == "gpt-5-mini")] | length) == 1
+    ([.calls[] | select(.kind == "chat" and .model == "gpt-5-mini")] | length) == 0
     and ([.calls[] | select(.kind == "chat" and .model != "gpt-5-mini")] | length) == 1
   '
   assert_dsa_operation_counts "$audit" 1 0 0
