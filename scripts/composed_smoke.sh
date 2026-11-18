@@ -1365,7 +1365,7 @@ Treat this as a working direction, not a confirmed result."
 
 run_evidence_advisory_scenario() {
   local owner client conversation question response request_id trace provider_calls diagnostics audit
-  local ordinary_answer high_impact_answer source_calls private_projection
+  local ordinary_answer high_impact_answer source_calls private_projection before_dsa
   local grounded_request_id grounded_trace grounded_provider_calls
 
   provider_post "/fixture/reset" '{}'
@@ -1377,6 +1377,7 @@ run_evidence_advisory_scenario() {
   ordinary_answer="A climate control module regulates temperature and airflow."
   queue_provider_answer "$ordinary_answer" >/dev/null
   conversation="$(resolve_conversation "$owner" "$client" "evidence ordinary bypass")"
+  before_dsa="$(dsa_request_count)"
   response="$(run_policy_admitted_chat "$owner" "$client" "$conversation" "$question")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -1392,33 +1393,21 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_equal \
     "ordinary" "provider_mode" "ordinary" \
     "$(jq -r '.retrieval.prompt_assembly.evidence_provider_mode.mode // "missing"' <<<"$trace")"
-  assert_evidence_advisory_equal \
-    "ordinary" "shape_derivation_status" "not_applicable" \
-    "$(jq -r '.prompt.evidence_acquisition.shape.derivation_status // "missing"' <<<"$trace")"
-  assert_evidence_advisory_equal \
-    "ordinary" "manifest_status" "not_applicable" \
-    "$(jq -r '.prompt.evidence_acquisition.status // "missing"' <<<"$trace")"
   assert_evidence_advisory_jq \
-    "ordinary" "shape_task_absent" "$trace" \
-    '.prompt.evidence_acquisition.shape.task_shape == null'
-  assert_evidence_advisory_equal \
-    "ordinary" "plan_status" "not_compiled" \
-    "$(jq -r '.prompt.evidence_acquisition.plan.plan_status // "missing"' <<<"$trace")"
-  assert_evidence_advisory_equal \
-    "ordinary" "sufficiency_status" "not_evaluated" \
-    "$(jq -r '.prompt.evidence_acquisition.sufficiency.status // "missing"' <<<"$trace")"
-  assert_evidence_advisory_equal \
-    "ordinary" "dsa_called" "true" \
-    "$(jq -r 'if .retrieval.prompt_assembly.dsa.called == true then "true" elif .retrieval.prompt_assembly.dsa.called == false then "false" else "missing" end' <<<"$trace")"
-  assert_evidence_advisory_jq \
-    "ordinary" "dsa_inventory_only" "$trace" '
-      .retrieval.prompt_assembly.dsa.status == "inventory_only"
-      and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
-      and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
+    "ordinary" "evidence_not_attempted" "$trace" '
+      .prompt.evidence_acquisition.attempted == false
+      and .prompt.evidence_acquisition.status == "ineligible"
+      and .prompt.evidence_acquisition.manifest_id == null
+      and .prompt.evidence_acquisition.shape == {}
+      and .prompt.evidence_acquisition.plan == {}
+      and .prompt.evidence_acquisition.sufficiency == {}
     '
-  assert_evidence_advisory_equal \
-    "ordinary" "dsa_activation_source" "evidence_policy" \
-    "$(jq -r '.retrieval.prompt_assembly.dsa.activation_source // "missing"' <<<"$trace")"
+  assert_evidence_advisory_jq \
+    "ordinary" "dsa_not_called" "$trace" '
+      .retrieval.prompt_assembly.dsa.called == false
+      and .retrieval.prompt_assembly.dsa.activation_source == "not_requested"
+      and (.retrieval.prompt_assembly.dsa.inventory_discovery // null) == null
+    '
   assert_evidence_advisory_equal \
     "ordinary" "advisory_layer_count" "0" \
     "$(jq -r '[.retrieval.prompt_assembly.included_layers[]? | select(. == "evidence_advisory_guidance")] | length' <<<"$trace")"
@@ -1431,13 +1420,15 @@ run_evidence_advisory_scenario() {
   assert_evidence_advisory_jq \
     "ordinary" "provider_tool_count_sanity" "$provider_calls" \
     '[.calls[] | select(.kind == "chat")] | all(.tool_count >= 0)'
-  assert_semantic_interpreter_calls "$provider_calls" 1
+  assert_semantic_interpreter_calls "$provider_calls" 0
   assert_evidence_advisory_runtime_events \
-    "ordinary" "$diagnostics" "$request_id" 2 0 0 0
+    "ordinary" "$diagnostics" "$request_id" 0 0 0 0
   assert_evidence_advisory_dsa_counts "ordinary" "$audit" 0 0 0
+  assert_evidence_advisory_equal \
+    "ordinary" "dsa_request_count" "$before_dsa" "$(dsa_request_count)"
   assert_evidence_advisory_persistence \
     "ordinary" "$owner" "$conversation" "$request_id" "$ordinary_answer" 0
-  echo "Evidence ordinary bypass: shape=not_applicable inventory_calls=1 content_calls=0 provider_calls=1 durable_messages=2"
+  echo "Evidence ordinary bypass: shape_calls=0 inventory_calls=0 content_calls=0 provider_calls=1 durable_messages=2"
 
   assert_advisory_service_case primary false
   assert_advisory_service_case fallback true
@@ -1741,21 +1732,18 @@ run_claim_traceability_scenario() {
   jq -e '
     ([.calls[] | select(.kind == "chat")] | length) == 1
   ' <<<"$provider_g1" >/dev/null
-  assert_semantic_interpreter_calls "$provider_g1" 1
+  assert_semantic_interpreter_calls "$provider_g1" 0
 
   trace_g1="$(fetch_trace "$request_g1")"
   jq -e '
-    .prompt.evidence_acquisition.status == "not_applicable"
-    and .prompt.evidence_acquisition.shape.derivation_status == "not_applicable"
-    and .prompt.evidence_acquisition.shape.task_shape == null
-    and .prompt.evidence_acquisition.plan.plan_status == "not_compiled"
-    and .prompt.evidence_acquisition.sufficiency.status == "not_evaluated"
-    and (.prompt.evidence_acquisition.next_steps.selections | length) == 0
-    and .retrieval.prompt_assembly.dsa.called == true
-    and .retrieval.prompt_assembly.dsa.status == "inventory_only"
-    and .retrieval.prompt_assembly.dsa.inventory_discovery.called == true
-    and .retrieval.prompt_assembly.dsa.inventory_discovery.outcome == "success"
-    and .retrieval.prompt_assembly.dsa.activation_source == "evidence_policy"
+    .prompt.evidence_acquisition.attempted == false
+    and .prompt.evidence_acquisition.status == "ineligible"
+    and .prompt.evidence_acquisition.manifest_id == null
+    and .prompt.evidence_acquisition.shape == {}
+    and .prompt.evidence_acquisition.plan == {}
+    and .prompt.evidence_acquisition.sufficiency == {}
+    and .retrieval.prompt_assembly.dsa.called == false
+    and .retrieval.prompt_assembly.dsa.activation_source == "not_requested"
     and .retrieval.prompt_assembly.evidence_provider_mode.mode == "ordinary"
     and ([.retrieval.prompt_assembly.included_layers[]?
       | select(. == "evidence_advisory_guidance")] | length) == 0
@@ -1792,14 +1780,7 @@ run_claim_traceability_scenario() {
       | select(.event_type == "evidence_shape_derived")
       | select(.event_payload_json.request_id == $request_id)
       | .event_payload_json] as $events
-    | ($events | length) == 2
-    and all($events[];
-      .source_match_status == "no_match"
-      and ((. | has("matched_source_ids")) | not)
-    )
-    and ($events[0]
-      | .derivation_status == "not_applicable"
-        and .task_shape == null)
+    | ($events | length) == 0
     and ([.events[]
       | select(.event_type == "evidence_plan_compiled")
       | select(.event_payload_json.request_id == $request_id)] | length) == 0
