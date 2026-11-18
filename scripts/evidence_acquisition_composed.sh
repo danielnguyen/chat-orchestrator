@@ -5262,7 +5262,7 @@ assert_history_runtime_policy() {
 
 assert_ordinary_history_case() {
   local conversation_id="$1" response="$2" question="$3" expected_answer="$4"
-  local request_id trace calls diagnostics audit
+  local owner="$5" request_id trace calls diagnostics audit message_ids
   request_id="$(jq -er '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   calls="$(fetch_provider_calls "$request_id")"
@@ -5284,14 +5284,24 @@ assert_ordinary_history_case() {
     and .prompt.history_followup.clarification_required == false
     and .prompt.history_followup.fresh_verification_entry_status == "not_requested"
     and (.model_calls | length) == 1
-    and .references == []
-    and .prompt.evidence_acquisition.attempted == false
+  '
+  assert_jq "history.ordinary_followup.inactive_evidence" "$trace" '
+    .prompt.evidence_acquisition.attempted == false
     and .prompt.evidence_acquisition.status == "ineligible"
     and .prompt.evidence_acquisition.manifest_id == null
     and .prompt.evidence_acquisition.shape == {}
     and .prompt.evidence_acquisition.plan == {}
     and .prompt.evidence_acquisition.sufficiency == {}
   '
+  # Ordinary context may cite canonical messages, but never invented or foreign records.
+  message_ids="$(psql_exec -At -c "
+    SELECT COALESCE(json_agg(id::text), '[]'::json) FROM messages
+    WHERE conversation_id = '$conversation_id' AND owner_id = '$owner';
+  ")"
+  assert_jq "history.ordinary_followup.references" "$trace" '
+    all(.references[]; .ref_type == "message"
+      and (.ref_id as $id | $ids | index($id) != null))
+  ' --argjson ids "$message_ids"
   assert_jq "history.ordinary_followup.provider" "$calls" '
     [.calls[] | select(.kind == "chat")] as $answers
     | ($answers | length) == 1
@@ -5838,7 +5848,7 @@ run_history_followup_composed_suite() {
     answer="Ordinary answer for $case_name."
     queue_provider_answer "$answer"
     response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-    assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer"
+    assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer" "$owner"
   done <<'MATRIX'
 support|Where did that conclusion come from?|What supported that?|support_explanation|support
 checked|Which records did you look at?|What did you check?|acquisition_checked|acquisition
@@ -5857,7 +5867,7 @@ MATRIX
   queue_provider_answer 'not-json'
   question="Where did that conclusion come from?"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question")"
-  assert_ordinary_history_case "$conversation_id" "$response" "$question" 'not-json'
+  assert_ordinary_history_case "$conversation_id" "$response" "$question" 'not-json' "$owner"
 
   owner="owner-history-h4-local"
   client="client-history-h4-local"
@@ -5868,7 +5878,7 @@ MATRIX
   answer="Ordinary local-only answer."
   queue_provider_answer "$answer"
   response="$(run_history_current_turn "$owner" "$client" "$conversation_id" "$question" local_only)"
-  assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer"
+  assert_ordinary_history_case "$conversation_id" "$response" "$question" "$answer" "$owner"
   request_id="$(jq -er '.request_id' <<<"$response")"
   calls="$(fetch_provider_calls "$request_id")"
   assert_jq "history.h4.local" "$calls" '
