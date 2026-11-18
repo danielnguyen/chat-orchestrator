@@ -9296,7 +9296,8 @@ class ResultBoundaryMemoryStore(FakeMemoryStore):
 
 
 @pytest.mark.asyncio
-async def test_result_boundary_filters_messages_artifacts_and_sources(tmp_path):
+@pytest.mark.parametrize("evidence_enabled", [False, True])
+async def test_result_boundary_filters_messages_artifacts_and_sources(tmp_path, evidence_enabled):
     rules, models = _write_default_route_files(tmp_path)
     memory_store = ResultBoundaryMemoryStore()
     litellm = FakeLiteLLM()
@@ -9318,6 +9319,10 @@ async def test_result_boundary_filters_messages_artifacts_and_sources(tmp_path):
         rules_path=str(rules),
         model_registry_path=str(models),
         allow_manual_override=True,
+        dsa=FakeDSA(),
+        dsa_enabled=True,
+        evidence_acquisition_enabled=evidence_enabled,
+        interaction_governance_enabled=True,
         persona_containment_enabled=True,
         restraint_enabled=True,
         request_id="rid-result-boundary",
@@ -21192,7 +21197,7 @@ async def test_source_match_ambiguity_is_inventory_only_and_provider_free(tmp_pa
     memory_store = FakeMemoryStore()
 
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload(question),
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
@@ -23127,7 +23132,9 @@ async def test_inventory_failure_is_ordinary_only_when_shape_is_not_applicable(
     memory_store = FakeMemoryStore()
 
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload("Explain the current record."),
+        payload=_first_party_chat_payload(
+            "Explain the current record.", external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
@@ -26522,7 +26529,7 @@ async def test_evidence_acquisition_exact_fetch_plan_without_references_fails_cl
 
 
 @pytest.mark.asyncio
-async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_policy(
+async def test_evidence_acquisition_without_external_opt_in_bypasses_shape_policy(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -26572,11 +26579,10 @@ async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_poli
     )
 
     assert out["answer"] == "Ordinary answer."
-    assert len(runtime.evidence_shape_calls) == 1
-    assert runtime.evidence_shape_calls[0]["task_text"] == question
+    assert runtime.evidence_shape_calls == []
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
-    assert dsa.list_calls == [{}]
+    assert dsa.list_calls == []
     assert dsa.calls == []
     assert len(litellm.calls) == 1
 
@@ -26590,7 +26596,7 @@ async def test_evidence_acquisition_without_external_opt_in_defers_to_shape_poli
         "Tell me a joke about incompatible components.",
     ],
 )
-async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
+async def test_ordinary_turns_bypass_inventory_and_shape_without_opt_in(
     tmp_path,
     question,
 ):
@@ -26618,11 +26624,11 @@ async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
     )
 
     assert result["answer"] == "Ordinary answer."
-    assert len(runtime.evidence_shape_calls) == 1
+    assert runtime.evidence_shape_calls == []
     assert runtime.evidence_plan_calls == []
     assert runtime.evidence_sufficiency_calls == []
     assert runtime.evidence_next_step_calls == []
-    assert dsa.list_calls == [{}]
+    assert dsa.list_calls == []
     assert dsa.calls == []
     assert dsa.fetch_calls == []
     assert dsa.context_calls == []
@@ -26633,15 +26639,8 @@ async def test_ordinary_turns_use_inventory_only_shape_gate_without_opt_in(
     assert "Evidence advisory guidance:" not in prompt_text
     assert "Governed evidence response contract:" not in prompt_text
     trace = memory_store.trace_calls[-1]["payload"]
-    assert trace["dsa"]["activation_source"] == "evidence_policy"
-    assert trace["dsa"]["called"] is True
-    assert trace["dsa"]["status"] == "inventory_only"
-    assert trace["dsa"]["inventory_discovery"] == {
-        "called": True,
-        "outcome": "success",
-        "inventory_status": "unknown",
-        "source_count": 1,
-    }
+    assert trace["dsa"]["activation_source"] == "not_requested"
+    assert trace["dsa"]["called"] is False
 
 
 def _route_files_with_fallback(tmp_path):
@@ -26678,7 +26677,7 @@ def _text_completion(content: str) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
+async def test_verification_dependent_request_with_opt_in_uses_grounded_path(
     tmp_path,
 ):
     rules, models = _write_default_route_files(tmp_path)
@@ -26695,7 +26694,7 @@ async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
     memory_store = FakeMemoryStore()
 
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload(question),
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
@@ -26725,7 +26724,7 @@ async def test_verification_dependent_request_without_opt_in_uses_grounded_path(
     assert "Governed evidence response contract:" in prompt_text
     assert "Evidence advisory guidance:" not in prompt_text
     trace = memory_store.trace_calls[-1]["payload"]
-    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert trace["dsa"]["activation_source"] == "client_request"
     assert trace["retrieval"]["prompt_assembly"]["evidence_provider_mode"][
         "mode"
     ] == "grounded"
@@ -26843,7 +26842,7 @@ async def _run_advisory_evidence_case(
         content=provider_content,
     )
     result = await orchestrate_chat(
-        payload=_first_party_chat_payload(question),
+        payload=_first_party_chat_payload(question, external_context_enabled=True),
         memory_store=memory_store,
         litellm=provider,
         runtime=runtime,
@@ -26874,7 +26873,7 @@ async def _run_advisory_evidence_case(
         ("unknown", "It is definitely compatible and confirmed."),
     ],
 )
-async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_useful(
+async def test_advisory_evidence_mode_with_client_opt_in_is_bounded_and_useful(
     tmp_path,
     monkeypatch,
     sufficiency_status,
@@ -26940,7 +26939,7 @@ async def test_advisory_evidence_mode_without_client_opt_in_is_bounded_and_usefu
     trace = memory_store.trace_calls[-1]["payload"]
     prompt_trace = trace["retrieval"]["prompt_assembly"]
     manifest = prompt_trace["evidence_acquisition"]
-    assert trace["dsa"]["activation_source"] == "evidence_policy"
+    assert trace["dsa"]["activation_source"] == "client_request"
     assert prompt_trace["evidence_provider_mode"] == {
         "mode": "advisory",
         "advisory_rebuild_count": 1,
@@ -27161,7 +27160,7 @@ async def test_high_impact_targeted_verification_remains_provider_blocked(
     memory_store = FakeMemoryStore()
 
     result = await orchestrate_chat(
-        payload={**_first_party_chat_payload("Will this part fit?"),
+        payload={**_first_party_chat_payload("Will this part fit?", external_context_enabled=True),
                  "calibration_mode": calibration_mode},
         memory_store=memory_store,
         litellm=provider,
@@ -27683,7 +27682,9 @@ async def test_not_applicable_evidence_history_preserves_ordinary_claim_persiste
     )
 
     result = await orchestrate_chat(
-        payload=_base_payload(messages=[{"role": "user", "content": question}]),
+        payload=_base_payload(
+            messages=[{"role": "user", "content": question}], external_context_enabled=True,
+        ),
         memory_store=memory_store,
         litellm=litellm,
         runtime=runtime,
@@ -37160,7 +37161,7 @@ async def test_ordinary_dsa_answer_manifest_resolves_thin_client_history_followu
 
     original = await orchestrate_chat(
         payload=_first_party_chat_payload(
-            question,
+            question, external_context_enabled=True,
             conversation_id="conv-1",
             messages=[{"role": "user", "content": question}],
         ),
@@ -46425,7 +46426,7 @@ async def test_calibration_cannot_release_unsupported_quantitative_proposal(tmp_
     ),
 ])
 @pytest.mark.parametrize("recall", [False, True])
-async def test_ordinary_conversation_context_reaches_source_routing(
+async def test_ordinary_conversation_context_reaches_answer_without_source_routing(
     tmp_path, premise, question, answer, recall,
 ):
     """Instrumented providers prove context transport, not live model reasoning."""
@@ -46447,15 +46448,6 @@ async def test_ordinary_conversation_context_reaches_source_routing(
     class ContextProvider(FakeLiteLLM):
         async def chat(self, **kwargs):
             self.calls.append(kwargs)
-            if len(self.calls) == 1:
-                data = json.loads(kwargs["messages"][1]["content"])
-                assert data["request_text"] == question
-                assert data["conversation_messages"] == [
-                    {"role": "user", "content": retained},
-                    {"role": "assistant", "content": retained},
-                ]
-                assert "prior_supported_context" not in data
-                return _evidence_interpreter_completion("no_match", "unknown", [])
             assert retained in json.dumps(kwargs["messages"])
             assert question in json.dumps(kwargs["messages"])
             return {"choices": [{"message": {"content": answer}}]}
@@ -46493,10 +46485,10 @@ async def test_ordinary_conversation_context_reaches_source_routing(
     assert out["answer"] == answer
     assert out["conversation_id"] == "conv-1"
     assert out["status"] == "ok"
-    assert len(provider.calls) == 2
-    assert len(runtime.evidence_shape_calls) == 2
+    assert len(provider.calls) == 1
+    assert runtime.evidence_shape_calls == []
     assert runtime.evidence_plan_calls == []
-    assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+    assert dsa.list_calls == dsa.calls == dsa.fetch_calls == dsa.context_calls == []
     assert memory.retrieve_calls[0]["conversation_id"] == "conv-1"
     if recall:
         assert len(runtime.continuation_selection_calls) == 1
@@ -46541,7 +46533,9 @@ async def test_source_routing_excludes_ineligible_conversation_context(tmp_path,
         "sources": _neutral_schedule_sources(),
     })
     await orchestrate_chat(
-        payload=_first_party_chat_payload("What's the updated plan?"),
+        payload=_first_party_chat_payload(
+            "What's the updated plan?", external_context_enabled=True,
+        ),
         memory_store=IneligibleMemory(), litellm=provider, runtime=runtime, dsa=dsa,
         dsa_enabled=True, evidence_acquisition_enabled=True,
         interaction_governance_enabled=True, rules_path=str(rules),
@@ -46586,7 +46580,7 @@ async def test_conversation_routing_applies_privacy_before_provider(tmp_path, pr
         "sources": _neutral_schedule_sources(),
     })
     await orchestrate_chat(
-        payload=_base_payload(conversation_id="conv-1"),
+        payload=_base_payload(conversation_id="conv-1", external_context_enabled=True),
         memory_store=FakeMemoryStore(), litellm=provider, runtime=runtime, dsa=dsa,
         dsa_enabled=True, evidence_acquisition_enabled=True, privacy_context_enabled=True,
         interaction_governance_enabled=True, rules_path=str(rules),
@@ -46597,3 +46591,121 @@ async def test_conversation_routing_applies_privacy_before_provider(tmp_path, pr
     assert ("conversation_messages" in context) == (privacy == "allowed")
     assert len(runtime.privacy_context_calls) == 2
     assert dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("external_request", [{}, {"external_context_enabled": False},
+                                            {"external_context": {"enabled": False}}])
+async def test_ordinary_telegram_dialogue_bypasses_automatic_evidence(
+    tmp_path, external_request,
+):
+    rules, models = _write_default_route_files(tmp_path)
+    memory = FakeMemoryStore()
+    runtime = FakeRuntime()
+    dsa = FakeDSA()
+    provider = FakeLiteLLM()
+    client = MemoryStoreClient("http://memory.local", "synthetic-key")
+    saved = []
+    original_retrieve = memory.retrieve_bundle
+    original_profile = memory.resolve_profile
+
+    async def post(path, *, request_id=None, json):
+        assert json["owner_id"] == "owner"
+        if path == "/v1/conversations/conv-1/messages":
+            message = {**json, "message_id": json.get("message_id", f"m-{len(saved)}")}
+            saved.append(message)
+            return {"message_id": message["message_id"]}
+        assert path == "/v2/conversations/conv-1/retrieve"
+        bundle = await original_retrieve(
+            request_id=request_id, conversation_id="conv-1",
+        )
+        bundle["bundle"]["artifact_refs"] = []
+        template = bundle["bundle"]["recent"][0]
+        bundle["bundle"]["recent"] = [
+            {**template, **item, "conversation_id": "conv-1"}
+            for item in saved[:-1]
+        ]
+        return bundle
+
+    async def profile(**kwargs):
+        return {**await original_profile(**kwargs),
+                "prompt_overlay": "Be a playful, thoughtful companion."}
+
+    client._post = post
+    memory.add_message = client.add_message
+    memory.retrieve_bundle = client.retrieve_bundle
+    memory.resolve_profile = profile
+    turns = [
+        ("Invent a moon gardener for our story.", "The moon gardener is called Luma."),
+        ("Change of topic: suggest a rainy afternoon activity.", "Try sketching clouds."),
+        ("Bring our gardener back into the story.", "Luma plants a silver seed."),
+        ("Correction: call the gardener Neri from now on.", "Neri tends the silver seed."),
+    ]
+    for index, (question, answer) in enumerate(turns):
+        provider.content = answer
+        out = await orchestrate_chat(
+            payload=_first_party_chat_payload(
+                question, surface="telegram", client_id="telegram:synthetic",
+                surface_context={"surface_type": "telegram", "interaction_mode": "text"},
+                **external_request,
+            ),
+            memory_store=memory, runtime=runtime, litellm=provider, dsa=dsa,
+            dsa_enabled=True, evidence_acquisition_enabled=True,
+            interaction_governance_enabled=True,
+            general_evidence_reasoning_enabled=True,
+            general_evidence_reasoning_presentation_enabled=True,
+            rules_path=str(rules), model_registry_path=str(models),
+            allow_manual_override=True, request_id=f"ordinary-{index}",
+        )
+        assert out["answer"] == answer
+        assert out["status"] == "ok"
+        assert len(provider.calls) == index + 1
+        messages = provider.calls[-1]["messages"]
+        assert {"role": "user", "content": question} in messages
+        assert "Be a playful, thoughtful companion." in str(messages)
+        assert "semantic note" in str(messages)
+        if index:
+            assert turns[index - 1][1] in str(messages)
+        assert saved[-1]["content"] == answer
+        assert [item["role"] for item in saved] == ["user", "assistant"] * (index + 1)
+        assert runtime.evidence_shape_calls == runtime.evidence_plan_calls == []
+        assert runtime.evidence_sufficiency_calls == runtime.evidence_next_step_calls == []
+        assert dsa.list_calls == dsa.calls == dsa.fetch_calls == dsa.context_calls == []
+        assert not provider.calls[-1].get("tools")
+        assert out.get("sources", []) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("privacy", ["suppressed", "unavailable"])
+async def test_ordinary_evidence_bypass_preserves_privacy_before_provider(tmp_path, privacy):
+    rules, models = _write_default_route_files(tmp_path)
+    runtime, memory, provider, dsa = FakeRuntime(), FakeMemoryStore(), FakeLiteLLM(), FakeDSA()
+
+    async def privacy_policy(**scope):
+        if privacy == "unavailable":
+            raise RuntimeError("unavailable")
+        return _privacy_runtime_response(
+            **{key: scope[key] for key in (
+                "request_id", "owner_id", "conversation_id", "surface",
+                "runtime_session_id", "runtime_turn_id",
+            )},
+            surface_type=scope["surface_category"], sensitivity_level=scope["sensitivity_level"],
+            sensitive_detail_allowed=False, redaction_required=True,
+        )
+
+    runtime.evaluate_privacy_context = privacy_policy
+    result = await orchestrate_chat(
+        payload=_base_payload(conversation_id="conv-1"),
+        memory_store=memory, litellm=provider, runtime=runtime, dsa=dsa,
+        dsa_enabled=True, evidence_acquisition_enabled=True, privacy_context_enabled=True,
+        interaction_governance_enabled=True, rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="ordinary-privacy",
+    )
+    assert "prior history" not in str(provider.calls)
+    assert "semantic note" not in str(provider.calls)
+    assert "def entrypoint" not in str(provider.calls)
+    assert result["sources"] == []
+    assert memory.added_messages[-1]["content"] == result["answer"]
+    assert runtime.evidence_shape_calls == []
+    assert dsa.list_calls == dsa.calls == []
