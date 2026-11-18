@@ -11714,6 +11714,10 @@ async def orchestrate_chat(
         )
         governed_evidence_eligible = bool(
             evidence_acquisition_enabled
+            # Ordinary dialogue must not acquire a semantic evidence requirement.
+            # Keep source work opt-in through the existing request contract or
+            # an explicitly requested, validated historical recheck.
+            and (external_context_enabled or compound_verification_requested)
             and dsa_enabled
             and not local_only
             and effective_payload.get("response_mode", "normal") == "normal"
