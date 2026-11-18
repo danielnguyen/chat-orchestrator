@@ -5093,7 +5093,7 @@ run_transport_latency_regression() {
         question="How are you sure?"; expected_calls=0; expected_timing=0
         recognizer=deterministic
         if [ "$scenario" = history_classified ]; then
-          question="Where did that conclusion come from?"; expected_calls=1; recognizer=classifier
+          question="Where did that conclusion come from?"; expected_calls=1
         fi
       fi
       provider_post /fixture/reset '{}'
@@ -5104,7 +5104,7 @@ run_transport_latency_regression() {
           question="Verify the migration record."; expected_timing=0
           queue_evidence_candidate supports google_sheets:records_primary:Records!A2:C2 \
             "The migration record confirms the bounded setting." ;;
-        history_classified) queue_history_classifier support_explanation 0.91 false ;;
+        history_classified) queue_provider_answer "That was an earlier conversational answer." ;;
         history_deterministic) ;;
         provider_fallback)
           provider_post /fixture/fail-next-primary '{}'
@@ -5157,10 +5157,18 @@ run_transport_latency_regression() {
               and .next_steps.selections[0].selected_next_step=="answer_within_declared_scope")' <<<"$trace" >/dev/null
           assert_dsa_operation_counts "$(fetch_dsa_audit)" 1 0 0
           assert_evidence_runtime_events "$diagnostics" "$request" 1 1 1 1 ;;
-        history_*)
+        history_classified)
+          # Keep the historical scenario name and budget; this now takes the ordinary path.
+          jq -e '.status=="ok" and .selected_model!="not_called"
+            and .answer=="That was an earlier conversational answer."' <<<"$response" >/dev/null
+          jq -e '.prompt.history_followup.classifier_call_count==0
+            and .prompt.history_followup.cr_history_policy_call_count==0
+            and .prompt.history_followup.bms_call_count==0
+            and .fallback.triggered==false' <<<"$trace" >/dev/null
+          assert_dsa_operation_counts "$(fetch_dsa_audit)" 0 0 0 ;;
+        history_deterministic)
           assert_pure_history_case "$owner" "$conversation" "$response" "$question" \
-            "$recognizer" support_explanation support "$expected_calls"
-          if [ "$scenario" = history_classified ]; then assert_classifier_request "$calls" "$question"; fi ;;
+            "$recognizer" support_explanation support "$expected_calls" ;;
       esac
       turn="$(jq -er .latest_turn.runtime_turn_id <<<"$diagnostics")"
       jq -e --arg turn "$turn" --argjson timing "$expected_timing" '
