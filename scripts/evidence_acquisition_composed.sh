@@ -903,12 +903,7 @@ assert_history_request_boundaries() {
     and .prompt.claim_explanation.storage_call_count == 1
     and .prompt.claim_explanation.provider_call_count == 0
     and .prompt.claim_explanation.manifest_resolution_status == $resolution
-    and .prompt.evidence_acquisition.attempted == false
-    and .prompt.evidence_acquisition.status == "ineligible"
-    and .prompt.evidence_acquisition.manifest_id == null
-    and .prompt.evidence_acquisition.shape == {}
-    and .prompt.evidence_acquisition.plan == {}
-    and .prompt.evidence_acquisition.sufficiency == {}
+    and (.prompt | has("evidence_acquisition") | not)
   ' <<<"$trace" >/dev/null
   assert_provider_free_trace "$trace"
   jq -e '([.calls[] | select(.kind == "chat")] | length) == 0' \
