@@ -1266,10 +1266,13 @@ def assemble_prompt(
     messages.extend(profile_messages)
     layers.append(_layer_trace("profile_overlay", profile_messages))
 
+    # Only explicit request or authenticated profile preferences select calibration.
     # Extractive and advisory contracts own their output; do not ask those
     # providers to add new claims or hypotheses.
-    calibration_included = calibration_mode is not None and not (
-        evidence_response_contract or evidence_advisory_guidance
+    calibration_included = (
+        calibration_mode is not None
+        and calibration_source in {"request", "profile"}
+        and not (evidence_response_contract or evidence_advisory_guidance)
     )
     calibration_messages = (
         [{"role": "system", "content": calibration_guidance(calibration_mode)}]

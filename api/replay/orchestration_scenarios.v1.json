@@ -1089,13 +1089,13 @@
                 },
                 "trace": {
                     "prompt_budget": {
-                        "status": "optional_context_reduced",
+                        "status": "not_required",
                         "final_within_budget": true,
-                        "omission_or_truncation_occurred": true,
-                        "dropped_by_layer": {"calibration": 1}
+                        "omission_or_truncation_occurred": false,
+                        "dropped_by_layer": {"calibration": null}
                     },
                     "truncation": {
-                        "applied": true
+                        "applied": false
                     }
                 },
                 "provider_attempt_count": 1,
@@ -1450,11 +1450,11 @@
                     "status": "failed",
                     "prompt_budget": {
                         "failure_reason": "required_prompt_content_exceeds_budget",
-                        "dropped_by_layer": {"calibration": 1}
+                        "dropped_by_layer": {"calibration": null}
                     },
                     "truncation": {
-                        "applied": true,
-                        "reason": "optional_context_reduced"
+                        "applied": false,
+                        "reason": null
                     }
                 },
                 "provider_attempt_count": 0,

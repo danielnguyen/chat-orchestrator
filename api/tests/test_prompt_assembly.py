@@ -2098,3 +2098,37 @@ def test_timing_is_distinct_required_prompt_layer_and_survives_budget_and_repair
         assert sum("Timing guidance:" in message["content"] for message in out.messages) == 1
         assert "Preserve required core content" in str(out.messages)
         assert "question" not in str(out.trace["runtime_timing"])
+
+
+@pytest.mark.parametrize("mode", ["strict", "moderate", "exploratory"])
+@pytest.mark.parametrize("source", ["default", "request", "profile"])
+@pytest.mark.parametrize(
+    "contract", [None, "evidence_response_contract", "evidence_advisory_guidance"],
+)
+def test_calibration_requires_selection_and_preserves_source_contracts(mode, source, contract):
+    out = assemble_prompt(
+        profile={"prompt_overlay": "Be a playful companion."},
+        retrieval_bundle={"bundle": {
+            "recent": [{"role": "assistant", "content": "The kite is violet."}],
+            "semantic": [{"role": "user", "content": "Our fictional town is Bellwick."}],
+        }},
+        current_messages=[{"role": "user", "content": "Give the kite a name."}],
+        calibration_mode=mode,
+        calibration_source=source,
+        **({contract: True} if contract else {}),
+    )
+    included = source != "default" and contract is None
+    assert out.trace["calibration"] == {
+        "mode": mode, "source": source, "included": included,
+    }
+    contents = "\n".join(message["content"] for message in out.messages)
+    assert (f"Conversational calibration ({mode})" in contents) is included
+    assert ("withheld conclusions" in contents) is included
+    assert "Be a playful companion." in contents
+    assert "The kite is violet." in contents
+    assert "Our fictional town is Bellwick." in contents
+    assert out.messages[-1] == {"role": "user", "content": "Give the kite a name."}
+    if contract == "evidence_response_contract":
+        assert EVIDENCE_RESPONSE_CONTRACT in contents
+    elif contract == "evidence_advisory_guidance":
+        assert EVIDENCE_ADVISORY_GUIDANCE in contents
