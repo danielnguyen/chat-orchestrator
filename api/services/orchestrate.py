@@ -87,11 +87,8 @@ from services.claim_capture import (
 )
 from services.claim_explanation import (
     ClaimExplanationOutcome,
-    classifier_eligible_history_followup,
     deterministic_history_followup_candidate,
-    history_classifier_response_format,
     parse_claim_explanation_intent,
-    parse_history_classifier_completion,
     resolve_claim_explanation,
     resolve_immediate_claim_explanation,
     resolve_reasoning_continuation_context,
@@ -273,12 +270,6 @@ _RETIREMENT_POLICY_UNAVAILABLE = (
     "I couldn’t safely determine whether that conversation can continue. "
     "No retained conversation content was used. Please try again."
 )
-_HISTORY_CLASSIFIER_ROUTE = "intent_classifier"
-_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS = 512
-_HISTORY_CLASSIFIER_UNAVAILABLE = (
-    "I couldn’t process that follow-up because of a technical limitation. "
-    "I didn’t retrieve earlier records or run a new check. Please try again."
-)
 _EVIDENCE_INTERPRETER_ROUTE = "evidence_interpreter"
 _EVIDENCE_INTERPRETER_MAX_COMPLETION_TOKENS = 512
 _EVIDENCE_INTERPRETER_REASONING_EFFORT = "medium"
@@ -344,61 +335,6 @@ _COMPOUND_VERIFICATION_LABEL_LINE_RE = re.compile(
     rf"(?:{_COMPOUND_VERIFICATION_LABEL_ALTERNATION})"
     r"(?:\*\*|__|\*|_)?:(?:\*\*|__|\*|_)?(?=$|[ \t])",
     re.IGNORECASE | re.MULTILINE,
-)
-_HISTORY_CLASSIFIER_SYSTEM_PROMPT = (
-    "Classify only the current user message. Return exactly one JSON object matching the "
-    "supplied schema. Do not answer the user or explain your classification.  First identify "
-    "what the user wants examined: an earlier assistant answer and its basis, or a subject in"
-    " the world. Classify the requested operation, not merely the presence of conversational "
-    "references such as \"that\", \"you\", or \"check\".  Previous-answer targeting applies when "
-    "the message asks about an earlier answer's support, records examined, coverage, "
-    "omissions, or explicitly asks to verify that answer or claim again. The reference may be"
-    " implicit in wording such as \"Which records did you consult?\" It need not say \"previous "
-    "answer\". Do not invent a previous claim from a reference to a conversational subject.  A"
-    " request for new information or a new lookup about that subject is not_history_followup."
-    " This remains true when the subject was mentioned earlier, its identity is unclear, or "
-    "the user has not supplied the inputs needed for the lookup. Missing lookup inputs are "
-    "not omissions in an earlier evidence search. An independent lookup may need "
-    "clarification by the ordinary answer path; that does not make it "
-    "ambiguous_history_followup.  Examples: \"Can you check the tracking status of that "
-    "package? I haven't given you a carrier or tracking number.\" => not_history_followup; "
-    "new_verification_requested false. \"What evidence supported your previous answer about "
-    "that package?\" => support_explanation; new_verification_requested false. \"Please check "
-    "fresh sources to verify your previous answer about that package.\" => "
-    "new_verification_request; new_verification_requested true. \"Can you check whether that "
-    "appointment is confirmed? I haven't supplied a booking reference.\" => "
-    "not_history_followup; new_verification_requested false. \"Which records did you consult "
-    "for your last answer?\" => acquisition_checked; new_verification_requested false. \"What "
-    "might you have missed when checking sources for your last answer?\" => acquisition_gaps; "
-    "new_verification_requested false. \"What about that evidence?\" => "
-    "ambiguous_history_followup; new_verification_requested false. \"What would you recommend "
-    "for that situation?\" => not_history_followup; new_verification_requested false.  For "
-    "requests about an earlier answer, choose the requested kind: support_explanation: what "
-    "supported or justified the answer. acquisition_checked: what was examined. "
-    "acquisition_coverage: whether the available scope was covered. acquisition_gaps: what "
-    "may have been missed in the earlier examination. new_verification_request: an explicit "
-    "fresh check of an earlier answer or claim. ambiguous_history_followup: a plausibly "
-    "historical evidence request whose kind or target is genuinely uncertain. "
-    "not_history_followup: an ordinary question, instruction, or independent lookup.  Choose "
-    "target_mode after intent: Use immediate_previous for an unquoted request about the "
-    "immediately previous answer. Use explicit_reference only when the current text itself "
-    "explicitly selects an earlier target. For not_history_followup, use immediate_previous "
-    "solely as the required schema placeholder; it does not assert a historical target. "
-    "Allowed target modes are immediate_previous and explicit_reference.  Set "
-    "new_verification_requested true only when the user explicitly requests a fresh check of "
-    "an earlier answer or claim. Questions about support, checked records, coverage, or gaps "
-    "do not by themselves request fresh verification. For not_history_followup and "
-    "ambiguous_history_followup, set it false.  Confidence measures clarity of the current "
-    "wording's intent and target mode, not whether retained evidence exists, sources are "
-    "complete, or a claim is true. A clear request to list records consulted can be high "
-    "confidence without seeing the records or answer. A clear independent lookup can be high "
-    "confidence even when required lookup inputs are missing. Use high confidence (>=0.85) "
-    "when intent and target mode are clear; medium (0.60-<0.85) when a plausible "
-    "interpretation has meaningful uncertainty; low (<0.60) when poorly supported. Preserve "
-    "competing interpretations. Express historical target uncertainty through confidence and "
-    "ambiguous_history_followup. Never raise confidence to obtain history access.  "
-    "Classifying a request does not establish that anything was checked, supported, covered, "
-    "missed, or verified. Do not reconstruct history or select record IDs."
 )
 
 
@@ -7002,7 +6938,7 @@ def _history_trace(*, enabled: bool) -> dict[str, Any]:
         "feature_enabled": enabled,
         "deterministic_match_status": "not_evaluated",
         "classifier_eligibility": "not_evaluated",
-        "classifier_logical_route": _HISTORY_CLASSIFIER_ROUTE,
+        "classifier_logical_route": None,
         "classifier_call_count": 0,
         "classifier_status": "not_called",
         "candidate_source": None,
@@ -7204,55 +7140,6 @@ def _log_evidence_acquisition_checkpoint(
         else _EVIDENCE_LOGGER.info
     )
     log("%s", message)
-
-
-async def _classify_history_followup(
-    *,
-    current_user_text: str,
-    request_id: str,
-    litellm: Any,
-    model_registry_path: str,
-    timeout_ms: int,
-    local_only: bool,
-    routing_policy: dict[str, Any],
-    effective_payload: dict[str, Any],
-    trace: dict[str, Any],
-) -> dict[str, Any] | None:
-    route = _load_logical_route(model_registry_path, _HISTORY_CLASSIFIER_ROUTE)
-    if route is None:
-        trace["classifier_status"] = "route_unavailable"
-        return None
-    if not _classifier_cloud_allowed(
-        provider=route["provider"],
-        local_only=local_only,
-        routing_policy=routing_policy,
-        effective_payload=effective_payload,
-    ):
-        trace["classifier_status"] = "provider_disallowed"
-        return None
-    if litellm is None or not callable(getattr(litellm, "chat", None)):
-        trace["classifier_status"] = "client_unavailable"
-        return None
-    trace["classifier_call_count"] = 1
-    try:
-        completion = await litellm.chat(
-            request_id=request_id,
-            model=route["model"],
-            messages=[
-                {"role": "system", "content": _HISTORY_CLASSIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": current_user_text},
-            ],
-            response_format=history_classifier_response_format(),
-            max_completion_tokens=_HISTORY_CLASSIFIER_MAX_COMPLETION_TOKENS,
-            reasoning_effort="minimal",
-            timeout_ms=timeout_ms,
-        )
-        candidate = parse_history_classifier_completion(completion)
-    except Exception:
-        trace["classifier_status"] = "failed"
-        return None
-    trace["classifier_status"] = "accepted"
-    return candidate
 
 
 async def _interpret_evidence_request(
@@ -11131,32 +11018,6 @@ async def orchestrate_chat(
                 history_followup_trace["classifier_status"] = "not_called_deterministic"
             else:
                 history_followup_trace["deterministic_match_status"] = "not_matched"
-                eligible = classifier_eligible_history_followup(last_user_text)
-                history_followup_trace["classifier_eligibility"] = (
-                    "eligible" if eligible else "ineligible"
-                )
-                if eligible:
-                    candidate = await _classify_history_followup(
-                        current_user_text=last_user_text,
-                        request_id=request_id,
-                        litellm=litellm,
-                        model_registry_path=model_registry_path,
-                        timeout_ms=intent_classifier_timeout_ms,
-                        local_only=local_only,
-                        routing_policy=routing_policy,
-                        effective_payload=effective_payload,
-                        trace=history_followup_trace,
-                    )
-                    if candidate is None:
-                        history_followup_trace["render_status"] = "failure"
-                        claim_explanation = ClaimExplanationOutcome(
-                            True,
-                            _HISTORY_CLASSIFIER_UNAVAILABLE,
-                            "degraded",
-                            {},
-                        )
-                else:
-                    history_followup_trace["classifier_status"] = "not_called_ineligible"
 
             if candidate is not None:
                 history_followup_trace["candidate_source"] = candidate["source"]

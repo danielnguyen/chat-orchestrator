@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
@@ -66,17 +65,6 @@ _QUOTED_COMPOUND_ACQUISITION_INTENT_RE = re.compile(
 )
 _PARAGRAPH_SEPARATOR = re.compile(r"\r?\n[ \t]*\r?\n")
 _RESPONSE_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-_CLASSIFIER_MAX_CHARACTERS = 320
-_CLASSIFIER_MAX_WORDS = 48
-_HISTORY_CLASSIFIER_INTENTS = {
-    "not_history_followup",
-    "support_explanation",
-    "acquisition_checked",
-    "acquisition_coverage",
-    "acquisition_gaps",
-    "new_verification_request",
-    "ambiguous_history_followup",
-}
 
 _TARGET_UNAVAILABLE = (
     "I can’t safely identify which earlier statement you mean from the supplied "
@@ -487,34 +475,6 @@ class AcquisitionHistoryResolveResponse(BaseModel):
         return self
 
 
-class HistoryFollowupClassifierOutput(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    intent: Literal[
-        "not_history_followup",
-        "support_explanation",
-        "acquisition_checked",
-        "acquisition_coverage",
-        "acquisition_gaps",
-        "new_verification_request",
-        "ambiguous_history_followup",
-    ]
-    confidence: float = Field(ge=0.0, le=1.0)
-    target_mode: Literal["immediate_previous", "explicit_reference"]
-    new_verification_requested: bool
-
-    @model_validator(mode="after")
-    def validate_consistency(self):
-        if self.intent == "new_verification_request" and not self.new_verification_requested:
-            raise ValueError("new_verification_intent_requires_explicit_request")
-        if (
-            self.intent in {"not_history_followup", "ambiguous_history_followup"}
-            and self.new_verification_requested
-        ):
-            raise ValueError("nonactionable_intent_forbids_verification")
-        return self
-
-
 class ImmediateHistoryRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -749,93 +709,6 @@ def normalize_text(value: str) -> str:
     return " ".join(value.split())
 
 
-def history_classifier_response_format() -> dict[str, Any]:
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "history_followup_classification",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "intent": {
-                        "type": "string",
-                        "enum": sorted(_HISTORY_CLASSIFIER_INTENTS),
-                    },
-                    "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-                    "target_mode": {
-                        "type": "string",
-                        "enum": ["immediate_previous", "explicit_reference"],
-                    },
-                    "new_verification_requested": {"type": "boolean"},
-                },
-                "required": [
-                    "intent",
-                    "confidence",
-                    "target_mode",
-                    "new_verification_requested",
-                ],
-            },
-        },
-    }
-
-
-def parse_history_classifier_completion(value: Any) -> dict[str, Any]:
-    allowed_fields = {
-        "choices",
-        "usage",
-        "id",
-        "object",
-        "created",
-        "model",
-        "system_fingerprint",
-        "service_tier",
-    }
-    if not isinstance(value, dict) or set(value) - allowed_fields:
-        raise ValueError("classifier_completion_invalid")
-    if value.get("service_tier") is not None and not isinstance(value["service_tier"], str):
-        raise ValueError("classifier_metadata_invalid")
-    choices = value.get("choices")
-    if not isinstance(choices, list) or len(choices) != 1:
-        raise ValueError("classifier_choices_invalid")
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        raise ValueError("classifier_choice_invalid")
-    if choice.get("finish_reason", "stop") != "stop":
-        raise ValueError("classifier_finish_reason_invalid")
-    message = choice.get("message")
-    if not isinstance(message, dict) or message.get("tool_calls") not in (None, []):
-        raise ValueError("classifier_tool_call_forbidden")
-    if message.get("refusal") not in (None, ""):
-        raise ValueError("classifier_refusal_invalid")
-    if set(message) - {
-        "role", "content", "refusal", "tool_calls", "annotations", "provider_specific_fields"
-    }:
-        raise ValueError("classifier_message_invalid")
-    # Provider metadata is inert: only content may supply the typed classification.
-    annotations = message.get("annotations")
-    if annotations is not None and (
-        not isinstance(annotations, list)
-        or any(not isinstance(annotation, dict) for annotation in annotations)
-    ):
-        raise ValueError("classifier_metadata_invalid")
-    provider_fields = message.get("provider_specific_fields")
-    if provider_fields is not None and not isinstance(provider_fields, dict):
-        raise ValueError("classifier_metadata_invalid")
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("classifier_content_invalid")
-    try:
-        decoded = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise ValueError("classifier_json_invalid") from exc
-    if not isinstance(decoded, dict):
-        raise ValueError("classifier_json_object_required")
-    output = HistoryFollowupClassifierOutput.model_validate(decoded)
-    return {"source": "classifier", **output.model_dump()}
-
-
 def deterministic_history_followup_candidate(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, str):
         return None
@@ -868,47 +741,6 @@ def deterministic_history_followup_candidate(value: Any) -> dict[str, Any] | Non
         "target_mode": "immediate_previous",
         "new_verification_requested": intent.new_verification_requested,
     }
-
-
-def classifier_eligible_history_followup(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    text = normalize_text(value)
-    if (
-        not text
-        or len(text) > _CLASSIFIER_MAX_CHARACTERS
-        or len(text.split()) > _CLASSIFIER_MAX_WORDS
-    ):
-        return False
-    normalized = text.casefold()
-    if re.search(r"\b(?:should\s+(?:i|we|you)|how\s+(?:do|can)\s+i)\b", normalized):
-        return False
-    if re.search(r"\bwhat\s+did\s+(?!you\b)[a-z][a-z'-]*\s+(?:check|review|examine)", normalized):
-        return False
-    deictic = re.search(
-        r"\b(?:that|this|previous|earlier|prior|your answer|this answer|that answer|conclusion)\b",
-        normalized,
-    ) is not None
-    second_person = re.search(
-        r"\b(?:you|your)\b",
-        normalized,
-    ) is not None
-    concept = re.search(
-        r"\b(?:support|supported|basis|based|evidence|source|sources|sure|"
-        r"conclusion|record|records|check|checked|review|reviewed|examine|examined|"
-        r"consult|consulted|cover|covered|everything|miss|missed|skip|skipped|gap|"
-        r"gaps|verify|verification|recheck)\b",
-        normalized,
-    ) is not None
-    interrogative = (
-        "?" in text
-        or re.match(
-            r"^(?:how|what|where|which|did|do|can|could|would|anything|was|were)\b",
-            normalized,
-        )
-        is not None
-    )
-    return bool(interrogative and concept and (deictic or second_person))
 
 
 def parse_claim_explanation_intent(value: Any) -> ClaimExplanationIntent | None:

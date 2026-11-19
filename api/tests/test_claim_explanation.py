@@ -17,12 +17,9 @@ from services.claim_explanation import (
     _diagnose_acquisition_history_projection,
     _project_acquisition_history,
     _render_acquisition,
-    classifier_eligible_history_followup,
     deterministic_history_followup_candidate,
-    history_classifier_response_format,
     is_claim_explanation_intent,
     parse_claim_explanation_intent,
-    parse_history_classifier_completion,
     resolve_claim_explanation,
     resolve_immediate_claim_explanation,
     resolve_reasoning_continuation_context,
@@ -3751,117 +3748,6 @@ def test_deterministic_history_candidate_matrix(text, intent, question, verify):
     }.get(intent)
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        "Where did that conclusion come from?",
-        "Which records did you look at?",
-        "Did you cover everything available?",
-        "Anything you may have skipped?",
-        "Can you verify that again now?",
-    ],
-)
-def test_natural_history_paraphrases_are_classifier_eligible(text):
-    assert classifier_eligible_history_followup(text) is True
-
-
-@pytest.mark.parametrize(
-    "text",
-    [
-        "What should I check on my car?",
-        "What did John check?",
-        "How do I verify a checksum?",
-        "Which records should I bring to the appointment?",
-        "What is the weather?",
-        "What is a confidence interval?",
-        "unrelated " * 60 + "evidence",
-    ],
-)
-def test_ordinary_or_long_turns_are_not_classifier_eligible(text):
-    assert classifier_eligible_history_followup(text) is False
-
-
-def test_classifier_contract_is_strict_and_adds_source_only_after_parsing():
-    payload = {
-        "intent": "support_explanation",
-        "confidence": 0.91,
-        "target_mode": "immediate_previous",
-        "new_verification_requested": False,
-    }
-    completion = {"choices": [{"message": {"content": json.dumps(payload)}}]}
-    assert parse_history_classifier_completion(completion) == {
-        "source": "classifier",
-        **payload,
-    }
-    schema = history_classifier_response_format()["json_schema"]
-    assert schema["strict"] is True
-    assert schema["schema"]["additionalProperties"] is False
-
-
-@pytest.mark.parametrize(
-    "completion",
-    [
-        {"choices": []},
-        {"choices": [{"message": {"content": "```json\n{}\n```"}}]},
-        {"choices": [{"message": {"content": "before {}"}}]},
-        {"choices": [{"message": {"content": "{}"}}]},
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "intent": "support_explanation",
-                                "confidence": 0.9,
-                                "target_mode": "immediate_previous",
-                                "new_verification_requested": False,
-                                "reasoning": "PRIVATE",
-                            }
-                        )
-                    }
-                }
-            ]
-        },
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "intent": "new_verification_request",
-                                "confidence": 0.9,
-                                "target_mode": "immediate_previous",
-                                "new_verification_requested": False,
-                            }
-                        )
-                    }
-                }
-            ]
-        },
-        {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "intent": "support_explanation",
-                                "confidence": 0.9,
-                                "target_mode": "immediate_previous",
-                                "new_verification_requested": False,
-                            }
-                        ),
-                        "tool_calls": [{"id": "forbidden"}],
-                    }
-                }
-            ]
-        },
-    ],
-)
-def test_classifier_completion_rejects_malformed_or_inconsistent_output(completion):
-    with pytest.raises(ValueError):
-        parse_history_classifier_completion(completion)
-
-
 class _ImmediateMemoryStore:
     def __init__(self, response):
         self.response = response
@@ -4934,63 +4820,3 @@ async def test_memory_store_message_append_omits_null_lineage():
     )
 
     assert "history_root_lineage" not in payloads[0]
-
-
-@pytest.mark.parametrize("populated", [False, True])
-def test_classifier_observed_provider_metadata_is_inert(populated):
-    payload = {
-        "intent": "acquisition_checked",
-        "confidence": 0.95,
-        "target_mode": "immediate_previous",
-        "new_verification_requested": False,
-    }
-    metadata = {"intent": "new_verification_request", "record_id": "PRIVATE"}
-    completion = {
-        "service_tier": "default",
-        "choices": [{
-            "finish_reason": "stop",
-            "message": {
-                "role": "assistant",
-                "content": json.dumps(payload),
-                "annotations": [metadata] if populated else [],
-                "provider_specific_fields": metadata if populated else {},
-            },
-        }],
-    }
-    assert parse_history_classifier_completion(completion) == {
-        "source": "classifier", **payload,
-    }
-
-
-@pytest.mark.parametrize(
-    ("level", "field", "value"),
-    [
-        ("completion", "service_tier", {}),
-        ("completion", "unexpected", "PRIVATE"),
-        ("message", "annotations", {}),
-        ("message", "annotations", ["PRIVATE"]),
-        ("message", "provider_specific_fields", []),
-        ("message", "function_call", {"name": "forbidden"}),
-        ("message", "tool_calls", [{"function": {"name": "forbidden"}}]),
-        ("message", "refusal", "PRIVATE"),
-        ("message", "content", ""),
-        ("message", "content", None),
-        ("choice", "finish_reason", "length"),
-        ("choice", "finish_reason", "content_filter"),
-        ("choice", "finish_reason", "tool_calls"),
-        ("choice", "finish_reason", "function_call"),
-        ("choice", "finish_reason", None),
-    ],
-)
-def test_classifier_rejects_invalid_metadata_and_incomplete_or_tool_output(level, field, value):
-    message = {"content": json.dumps({
-        "intent": "acquisition_checked",
-        "confidence": 0.95,
-        "target_mode": "immediate_previous",
-        "new_verification_requested": False,
-    })}
-    choice = {"message": message, "finish_reason": "stop"}
-    completion = {"choices": [choice]}
-    {"completion": completion, "choice": choice, "message": message}[level][field] = value
-    with pytest.raises(ValueError):
-        parse_history_classifier_completion(completion)
