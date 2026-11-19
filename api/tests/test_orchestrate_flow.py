@@ -4491,7 +4491,6 @@ async def test_orchestrate_chat_happy_path(tmp_path):
     assert len(memory_store.retrieve_calls) == 1
     trace_payload = memory_store.trace_calls[0]["payload"]
     assert trace_payload["retrieval"]["prompt_assembly"]["included_layers"] == [
-        "calibration",
         "retrieval_augmentation",
         "recent_history",
         "current_messages",
@@ -7593,8 +7592,7 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
         "runtime_overlay"
     )
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
-    assert contents[0].startswith("Conversational calibration (moderate):")
-    contents = contents[1:]
+    assert all("Conversational calibration" not in content for content in contents)
     assert contents[0] == (
         "Runtime identity: persona=technical_architect; surface=dev; "
         "capability_domain=software_architecture; advisory_memory_scope=technical_context; "
@@ -7614,7 +7612,6 @@ async def test_orchestrate_includes_runtime_overlay_and_trace(tmp_path):
     assert "preserve flow" not in contents[0]
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"] == [
-        "calibration",
         "runtime_identity",
         "world_state",
         "relationship_context",
@@ -8362,7 +8359,6 @@ async def test_orchestrate_relationship_context_layer_order_when_all_relevant_la
 
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"][:8] == [
-        "calibration",
         "companion_policy",
         "runtime_identity",
         "world_state",
@@ -10810,8 +10806,7 @@ async def test_orchestrate_interaction_governance_injects_tactical_prompt_guidan
 
     assert out["status"] == "ok"
     prompt_messages = litellm.calls[0]["messages"]
-    assert prompt_messages[0]["content"].startswith("Conversational calibration (moderate):")
-    prompt_messages = prompt_messages[1:]
+    assert all("Conversational calibration" not in m["content"] for m in prompt_messages)
     assert prompt_messages[0]["content"] == (
         "Interaction guidance:\n"
         "- Adopt a tactical response posture.\n"
@@ -11550,12 +11545,10 @@ async def test_orchestrate_includes_companion_policy_and_trace(tmp_path):
 
     assert runtime.companion_calls[0]["requested_scene"] == "unknown_scene"
     contents = [msg["content"] for msg in litellm.calls[0]["messages"]]
-    assert contents[0].startswith("Conversational calibration (moderate):")
-    contents = contents[1:]
+    assert all("Conversational calibration" not in content for content in contents)
     assert contents[:3] == ["contract text", "profile companion text", "scene text"]
     prompt_trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert prompt_trace["included_layers"] == [
-        "calibration",
         "companion_policy",
         "runtime_identity",
         "retrieval_augmentation",
@@ -45759,10 +45752,11 @@ async def test_calibration_resolution_reaches_provider_and_safe_trace(
     )
     assert memory.profile_calls[0]["owner_id"] == "owner"
     assert len(provider.calls) == 1
+    included = source in {"request", "profile"}
     assert any(f"Conversational calibration ({expected})" in message["content"]
-               for message in provider.calls[0]["messages"])
+               for message in provider.calls[0]["messages"]) is included
     trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]
-    assert trace["calibration"] == {"mode": expected, "source": source, "included": True}
+    assert trace["calibration"] == {"mode": expected, "source": source, "included": included}
     assert "PRIVATE SENTINEL" not in json.dumps(trace)
 
 
@@ -45812,7 +45806,7 @@ def test_calibration_does_not_modify_extract_or_advisory_contract(mode):
     for contract in ("evidence_response_contract", "evidence_advisory_guidance"):
         prompt = assemble_prompt(
             profile={}, retrieval_bundle={"bundle": {}}, current_messages=[],
-            calibration_mode=mode, **{contract: True},
+            calibration_mode=mode, calibration_source="request", **{contract: True},
         )
         assert prompt.trace["calibration"]["included"] is False
         assert all("Conversational calibration" not in m["content"] for m in prompt.messages)
@@ -46145,6 +46139,12 @@ async def test_ordinary_telegram_dialogue_bypasses_automatic_evidence(
         assert {"role": "user", "content": question} in messages
         assert "Be a playful, thoughtful companion." in str(messages)
         assert "semantic note" in str(messages)
+        assert "Conversational calibration" not in str(messages)
+        assert "withheld conclusions" not in str(messages)
+        calibration = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+            "calibration"
+        ]
+        assert calibration == {"mode": "moderate", "source": "default", "included": False}
         if index:
             assert turns[index - 1][1] in str(messages)
         assert saved[-1]["content"] == answer
