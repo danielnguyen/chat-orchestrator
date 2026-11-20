@@ -46245,9 +46245,20 @@ async def test_evidence_interpreter_uses_nondefault_timeout(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expose_attribution", [True, False])
-async def test_recent_speaker_two_turn_wire_roundtrip(tmp_path, expose_attribution):
+@pytest.mark.parametrize("profile_source", ["requested", "surface_default", "global_default"])
+async def test_recent_speaker_wire_roundtrip(tmp_path, expose_attribution, profile_source):
     """Exercise CO append/retrieve HTTP contracts against old and new BMS shapes."""
     saved = []
+    profiles = {
+        "star_trek_q": {"profile_name": "star_trek_q",
+                        "effective_profile_ref": "owner:star_trek_q:1",
+                        "prompt_overlay": "You are Q."},
+        "picard": {"profile_name": "picard", "effective_profile_ref": "owner:picard:1",
+                   "prompt_overlay": "You are Picard."},
+    }
+    speakers = ["star_trek_q", "picard", "star_trek_q"]
+    answers = ["The moon is made of imaginary marmalade.", "Q made that moon joke.",
+               "Picard correctly credited me."]
     conversation_id = "00000000-0000-4000-8000-000000000255"
 
     def bms(request):
@@ -46289,20 +46300,22 @@ async def test_recent_speaker_two_turn_wire_roundtrip(tmp_path, expose_attributi
 
         async def resolve_profile(self, **kwargs):
             profile = await super().resolve_profile(**kwargs)
-            name = kwargs["requested_profile"]
-            return {**profile, "profile_name": name, "source": "requested",
-                    "effective_profile_ref": f"owner:{name}:1",
-                    "prompt_overlay": f"You are {name}."}
+            name = speakers[len(self.profile_calls) - 1]
+            assert kwargs["requested_profile"] == (name if profile_source == "requested" else None)
+            return {**profile, **profiles[name], "source": profile_source}
 
     rules, models = _write_default_route_files(tmp_path)
     memory = SpeakerMemory()
     provider = FakeLiteLLM(content="The moon is made of imaginary marmalade.")
-    questions = ["Tell me a harmless moon joke.", "Who made that moon joke?"]
+    questions = ["Tell me a harmless moon joke.", "Who made that moon joke?",
+                 "What did Picard say?"]
     try:
-        for index, name in enumerate(["star_trek_q", "star_trek_picard"]):
+        for index, name in enumerate(speakers):
+            provider.content = answers[index]
             out = await orchestrate_chat(
                 payload={"owner_id": "owner", "conversation_id": conversation_id,
-                         "surface": "telegram", "requested_profile": name,
+                         "surface": "telegram",
+                         "requested_profile": name if profile_source == "requested" else None,
                          "messages": [{"role": "user", "content": questions[index]}]},
                 memory_store=memory, litellm=provider, rules_path=str(rules),
                 model_registry_path=str(models), allow_manual_override=True,
@@ -46312,15 +46325,19 @@ async def test_recent_speaker_two_turn_wire_roundtrip(tmp_path, expose_attributi
             assert out["conversation_id"] == conversation_id
             assert saved[-1]["metadata"]["speaker_profile_ref"] == f"owner:{name}:1"
             assert saved[-1]["content"] == provider.content
-        assert len(provider.calls) == 2
-        assert len(memory.profile_calls) == 2
+        assert len(provider.calls) == 3
+        assert len(memory.profile_calls) == 3
         messages = provider.calls[1]["messages"]
         prefix = '[Assistant speaker: "Q"]\n' if expose_attribution else ""
-        assert {"role": "assistant", "content": prefix + provider.content} in messages
-        assert {"role": "system", "content": "You are star_trek_picard."} in messages
-        assert {"role": "system", "content": "You are star_trek_q."} not in messages
+        assert {"role": "assistant", "content": prefix + answers[0]} in messages
+        assert {"role": "system", "content": "You are Picard."} in messages
+        assert {"role": "system", "content": "You are Q."} not in messages
+        later_messages = provider.calls[2]["messages"]
+        picard_prefix = '[Assistant speaker: "Picard"]\n' if expose_attribution else ""
+        assert {"role": "assistant", "content": picard_prefix + answers[1]} in later_messages
+        assert {"role": "system", "content": "You are Q."} in later_messages
         for question in questions:
-            assert {"role": "user", "content": question} in messages
+            assert {"role": "user", "content": question} in later_messages
         assert [m["content"] for m in saved if m["role"] == "user"] == questions
         assert all("speaker_profile_ref" not in (m["metadata"] or {})
                    for m in saved if m["role"] == "user")
@@ -46329,12 +46346,13 @@ async def test_recent_speaker_two_turn_wire_roundtrip(tmp_path, expose_attributi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested_profile", [None, "star_trek_q"])
 @pytest.mark.parametrize("reference,name", [
-    (None, "dev"), ("other:dev:1", "dev"), ("owner:default:1", "default"),
+    ("owner:dev:1", "dev"), (None, "dev"), ("other:dev:1", "dev"), ("owner:default:1", "default"),
     ("owner:neutral:1", "neutral"), ("owner:unresolved:1", "unresolved"),
     ({"name": "Q"}, "dev"), ("owner:dev:2", "dev"),
 ])
-async def test_unresolved_speaker_not_persisted(tmp_path, reference, name):
+async def test_unresolved_speaker_not_persisted(tmp_path, reference, name, requested_profile):
     class SpeakerMemory(FakeMemoryStore):
         async def resolve_profile(self, **kwargs):
             profile = await super().resolve_profile(**kwargs)
@@ -46343,7 +46361,7 @@ async def test_unresolved_speaker_not_persisted(tmp_path, reference, name):
     rules, models = _write_default_route_files(tmp_path)
     memory = SpeakerMemory()
     out = await orchestrate_chat(
-        payload={"owner_id": "owner", "requested_profile": "star_trek_q",
+        payload={"owner_id": "owner", "requested_profile": requested_profile,
                  "messages": [{"role": "user", "content": "Hello."}]},
         memory_store=memory, litellm=FakeLiteLLM(), rules_path=str(rules),
         model_registry_path=str(models), allow_manual_override=True,

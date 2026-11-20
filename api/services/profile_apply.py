@@ -23,7 +23,8 @@ def apply_profile_to_request(profile: dict[str, Any], payload: dict[str, Any]) -
 _SPEAKER_REFERENCE = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9_.-]{0,119}):([a-z][a-z0-9_-]{0,63}):([1-9][0-9]{0,8})"
 )
-_GENERIC_SPEAKERS = {"default", "generic", "neutral", "assistant", "unresolved"}
+# BMS uses dev for its unnamed seed/fallback, not a speaker identity.
+_GENERIC_SPEAKERS = {"dev", "default", "generic", "neutral", "assistant", "unresolved"}
 
 
 def speaker_label(reference: Any) -> str | None:
@@ -34,7 +35,7 @@ def speaker_label(reference: Any) -> str | None:
     if not match or match[2] in _GENERIC_SPEAKERS:
         return None
     name = match[2]
-    return {"star_trek_q": "Q", "star_trek_picard": "Picard"}.get(name, name)
+    return {"star_trek_q": "Q", "picard": "Picard", "star_trek_picard": "Picard"}.get(name, name)
 
 
 def resolved_speaker_reference(profile: dict[str, Any], *, owner_id: str) -> str | None:

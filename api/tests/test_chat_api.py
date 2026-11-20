@@ -565,7 +565,7 @@ async def _delivery_post(main, **overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_id", ["node-red", None])
-@pytest.mark.parametrize("speaker", ["star_trek_q", "star_trek_picard"])
+@pytest.mark.parametrize("speaker", ["star_trek_q", "picard"])
 async def test_slow_delivery_preserves_one_canonical_execution(
     delivery_flow, client_id, speaker, monkeypatch,
 ):

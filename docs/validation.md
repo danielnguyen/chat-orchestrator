@@ -458,12 +458,14 @@ The composed commands clean up their Docker resources on exit. If a run is inter
 
 ## Recent assistant speaker continuity
 
-The deterministic `test_recent_speaker_two_turn_wire_roundtrip` fixture runs the
-normal CO orchestration twice in one conversation. It exercises the actual BMS
-client append and retrieval HTTP contracts, saves Q's resolved profile reference,
+The deterministic `test_recent_speaker_wire_roundtrip` fixture runs the
+normal CO orchestration across Q, Picard, and Q again in one conversation. It
+exercises the actual BMS client append and retrieval HTTP contracts, saves Q's resolved profile reference,
 and verifies that Picard's provider prompt contains Q's attributed assistant
-message plus Picard's current overlay. Its older-BMS variant omits the optional
-retrieval field and verifies ordinary untagged history. Deferred HTTP delivery,
+message plus Picard's current overlay. The third turn verifies Picard's own
+historical label. Named profiles selected through surface/global defaults retain
+attribution; the unnamed `dev` fallback stays untagged. Its older-BMS variant
+omits the optional retrieval field and verifies ordinary untagged history. Deferred HTTP delivery,
 unknown/generic references, malformed attribution, unchanged user text, and
 assistant-role preservation have separate regression assertions. These fixtures
 verify transport and prompt behavior, not actual-model recognition or a live BMS
@@ -478,7 +480,7 @@ owner, private surface context, and explicit conversation ID for both turns:
 1. Select `star_trek_q` and ask: “Tell me a harmless one-sentence moon joke.”
 2. Check the saved canonical assistant message has the server-resolved
    `speaker_profile_ref` (for example, `daniel:star_trek_q:1`) and unchanged text.
-3. Select `star_trek_picard` in that same conversation and ask: “Who made that
+3. Select `picard` in that same conversation and ask: “Who made that
    moon joke, and what did they say?” Confirm the response recognizes Q as the
    previous speaker while answering as Picard. Check the new saved assistant
    reference identifies Picard and recent retrieval exposes Q's optional field.

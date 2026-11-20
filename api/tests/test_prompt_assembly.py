@@ -2136,6 +2136,7 @@ def test_calibration_requires_selection_and_preserves_source_contracts(mode, sou
 
 @pytest.mark.parametrize("reference,label", [
     ("owner:star_trek_q:1", "Q"), ("owner:star_trek_picard:2", "Picard"),
+    ("owner:picard:1", "Picard"), ("owner:dev:1", None),
     ("owner:helpful_editor:1", "helpful_editor"),
     (None, None), ("", None), ([], None), ({"name": "Q"}, None),
     ("owner:default:1", None), ("owner:generic:1", None),
