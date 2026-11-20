@@ -565,9 +565,21 @@ async def _delivery_post(main, **overrides):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_id", ["node-red", None])
-async def test_slow_delivery_preserves_one_canonical_execution(delivery_flow, client_id):
+@pytest.mark.parametrize("speaker", ["star_trek_q", "star_trek_picard"])
+async def test_slow_delivery_preserves_one_canonical_execution(
+    delivery_flow, client_id, speaker, monkeypatch,
+):
     main, memory, provider, entered, release, locators, _ = delivery_flow
-    response = await _delivery_post(main, client_id=client_id)
+    resolve = memory.resolve_profile
+
+    async def resolve_speaker(**kwargs):
+        profile = await resolve(**kwargs)
+        assert kwargs["requested_profile"] == speaker
+        return {**profile, "profile_name": speaker,
+                "effective_profile_ref": f"owner:{speaker}:1"}
+
+    monkeypatch.setattr(memory, "resolve_profile", resolve_speaker)
+    response = await _delivery_post(main, client_id=client_id, requested_profile=speaker)
     try:
         assert response.status_code == 202
         result = response.json()
@@ -591,6 +603,8 @@ async def test_slow_delivery_preserves_one_canonical_execution(delivery_flow, cl
     assert memory.work["assistant_message_id"] == "00000000-0000-4000-8000-000000000002"
     assert [c[0] for c in memory.work_calls] == ["create", "running", "completed"]
     assert [m["role"] for m in memory.added_messages] == ["user", "assistant"]
+    assert memory.added_messages[-1]["metadata"]["speaker_profile_ref"] == f"owner:{speaker}:1"
+    assert "speaker_profile_ref" not in (memory.added_messages[0].get("metadata") or {})
     assert len(provider.calls) == 1
 
 

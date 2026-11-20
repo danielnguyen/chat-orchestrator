@@ -46241,3 +46241,114 @@ async def test_evidence_interpreter_uses_nondefault_timeout(tmp_path):
     assert provider.calls[0]["timeout_ms"] == 4321
     assert provider.calls[0]["max_completion_tokens"] == 512
     assert provider.calls[0]["reasoning_effort"] == "medium"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expose_attribution", [True, False])
+async def test_recent_speaker_two_turn_wire_roundtrip(tmp_path, expose_attribution):
+    """Exercise CO append/retrieve HTTP contracts against old and new BMS shapes."""
+    saved = []
+    conversation_id = "00000000-0000-4000-8000-000000000255"
+
+    def bms(request):
+        body = json.loads(request.content)
+        assert body["owner_id"] == "owner"
+        if request.url.path == f"/v1/conversations/{conversation_id}/messages":
+            # Existing append schema already accepts arbitrary metadata.
+            assert set(body) <= {
+                "owner_id", "role", "content", "client_id", "metadata", "message_id",
+                "policy_metadata", "history_root_lineage",
+            }
+            saved.append(body)
+            return httpx.Response(200, json={
+                "message_id": body.get("message_id", f"message-{len(saved)}"),
+            })
+        assert request.url.path == f"/v2/conversations/{conversation_id}/retrieve"
+        recent = []
+        for index, message in enumerate(saved):
+            item = {"message_id": f"message-{index + 1}", "owner_id": "owner",
+                    "conversation_id": conversation_id, "role": message["role"],
+                    "content": message["content"], "evidence_role": "canonical"}
+            reference = (message["metadata"] or {}).get("speaker_profile_ref")
+            if expose_attribution and reference:
+                item["speaker_profile_ref"] = reference
+            recent.append(item)
+        return httpx.Response(200, json={
+            "request_id": body["request_id"], "conversation_id": conversation_id,
+            "bundle": {"recent": recent, "semantic": [], "artifact_refs": [],
+                       "observed_metadata": {}},
+        })
+
+    client = MemoryStoreClient("http://bms.test", "fixture-key")
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(bms))
+    await client.open()
+
+    class SpeakerMemory(FakeMemoryStore):
+        add_message = client.add_message
+        retrieve_bundle = client.retrieve_bundle
+
+        async def resolve_profile(self, **kwargs):
+            profile = await super().resolve_profile(**kwargs)
+            name = kwargs["requested_profile"]
+            return {**profile, "profile_name": name, "source": "requested",
+                    "effective_profile_ref": f"owner:{name}:1",
+                    "prompt_overlay": f"You are {name}."}
+
+    rules, models = _write_default_route_files(tmp_path)
+    memory = SpeakerMemory()
+    provider = FakeLiteLLM(content="The moon is made of imaginary marmalade.")
+    questions = ["Tell me a harmless moon joke.", "Who made that moon joke?"]
+    try:
+        for index, name in enumerate(["star_trek_q", "star_trek_picard"]):
+            out = await orchestrate_chat(
+                payload={"owner_id": "owner", "conversation_id": conversation_id,
+                         "surface": "telegram", "requested_profile": name,
+                         "messages": [{"role": "user", "content": questions[index]}]},
+                memory_store=memory, litellm=provider, rules_path=str(rules),
+                model_registry_path=str(models), allow_manual_override=True,
+                request_id=f"speaker-turn-{index}", runtime=FakeRuntime(),
+            )
+            assert out["status"] == "ok", (out, memory.trace_calls)
+            assert out["conversation_id"] == conversation_id
+            assert saved[-1]["metadata"]["speaker_profile_ref"] == f"owner:{name}:1"
+            assert saved[-1]["content"] == provider.content
+        assert len(provider.calls) == 2
+        assert len(memory.profile_calls) == 2
+        messages = provider.calls[1]["messages"]
+        prefix = '[Assistant speaker: "Q"]\n' if expose_attribution else ""
+        assert {"role": "assistant", "content": prefix + provider.content} in messages
+        assert {"role": "system", "content": "You are star_trek_picard."} in messages
+        assert {"role": "system", "content": "You are star_trek_q."} not in messages
+        for question in questions:
+            assert {"role": "user", "content": question} in messages
+        assert [m["content"] for m in saved if m["role"] == "user"] == questions
+        assert all("speaker_profile_ref" not in (m["metadata"] or {})
+                   for m in saved if m["role"] == "user")
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reference,name", [
+    (None, "dev"), ("other:dev:1", "dev"), ("owner:default:1", "default"),
+    ("owner:neutral:1", "neutral"), ("owner:unresolved:1", "unresolved"),
+    ({"name": "Q"}, "dev"), ("owner:dev:2", "dev"),
+])
+async def test_unresolved_speaker_not_persisted(tmp_path, reference, name):
+    class SpeakerMemory(FakeMemoryStore):
+        async def resolve_profile(self, **kwargs):
+            profile = await super().resolve_profile(**kwargs)
+            return {**profile, "profile_name": name, "effective_profile_ref": reference}
+
+    rules, models = _write_default_route_files(tmp_path)
+    memory = SpeakerMemory()
+    out = await orchestrate_chat(
+        payload={"owner_id": "owner", "requested_profile": "star_trek_q",
+                 "messages": [{"role": "user", "content": "Hello."}]},
+        memory_store=memory, litellm=FakeLiteLLM(), rules_path=str(rules),
+        model_registry_path=str(models), allow_manual_override=True,
+        request_id="speaker-unknown",
+    )
+    assert out["status"] == "ok"
+    assert all("speaker_profile_ref" not in (m.get("metadata") or {})
+               for m in memory.added_messages)

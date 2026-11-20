@@ -13,6 +13,7 @@ from services.privacy_context import (
     PRIVACY_SURFACE_CATEGORIES,
     PRIVACY_ZONES,
 )
+from services.profile_apply import speaker_label
 from services.prompt_budget import (
     PromptBudgetContract,
     PromptBudgetError,
@@ -201,7 +202,12 @@ def build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str
         role = item.get("role")
         content = item.get("content", "")
         if role in VALID_ROLES and content:
-            messages.append({"role": role, "content": f"{_memory_hygiene_prefix(item)}{content}"})
+            label = speaker_label(item.get("speaker_profile_ref")) if role == "assistant" else None
+            attribution = f'[Assistant speaker: "{label}"]\n' if label else ""
+            messages.append({
+                "role": role,
+                "content": f"{attribution}{_memory_hygiene_prefix(item)}{content}",
+            })
     return messages
 
 

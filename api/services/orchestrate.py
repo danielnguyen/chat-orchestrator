@@ -172,7 +172,7 @@ from services.privacy_context import (
     sanitize_prompt_trace_for_privacy,
     validate_privacy_runtime_response,
 )
-from services.profile_apply import apply_profile_to_request
+from services.profile_apply import apply_profile_to_request, resolved_speaker_reference
 from services.prompt_assembly import PromptAssembly, assemble_prompt, calibration_guidance
 from services.prompt_assembly import restraint_trace as sanitize_restraint_trace
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
@@ -14720,6 +14720,10 @@ async def orchestrate_chat(
             runtime_turn_id=turn_state_trace.get("runtime_turn_id") or "",
         )
 
+        assistant_metadata = {"request_id": request_id, "selected_model": selected_model}
+        speaker_ref = resolved_speaker_reference(profile, owner_id=payload["owner_id"])
+        if speaker_ref is not None and selected_model != "not_called":
+            assistant_metadata["speaker_profile_ref"] = speaker_ref
         work.failure_code = "dependency_unavailable"
         assistant_message_ack = await memory_store.add_message(
             conversation_id=conversation_id,
@@ -14727,7 +14731,7 @@ async def orchestrate_chat(
             role="assistant",
             content=answer,
             client_id=payload.get("client_id"),
-            metadata={"request_id": request_id, "selected_model": selected_model},
+            metadata=assistant_metadata,
             policy_metadata=turn_policy_metadata,
         )
         work.failure_code = "execution_failed"
