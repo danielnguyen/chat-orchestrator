@@ -455,3 +455,37 @@ Validation output and traces must remain bounded:
 - treat malformed or unavailable optional dependencies as bounded degradation rather than a source of raw diagnostics.
 
 The composed commands clean up their Docker resources on exit. If a run is interrupted, use the matching Compose file to remove its containers and volumes before retrying.
+
+## Recent assistant speaker continuity
+
+The deterministic `test_recent_speaker_wire_roundtrip` fixture runs the
+normal CO orchestration across Q, Picard, and Q again in one conversation. It
+exercises the actual BMS client append and retrieval HTTP contracts, saves Q's resolved profile reference,
+and verifies that Picard's provider prompt contains Q's attributed assistant
+message plus Picard's current overlay. The third turn verifies Picard's own
+historical label. Named profiles selected through surface/global defaults retain
+attribution; the unnamed `dev` fallback stays untagged. Its older-BMS variant
+omits the optional retrieval field and verifies ordinary untagged history. Deferred HTTP delivery,
+unknown/generic references, malformed attribution, unchanged user text, and
+assistant-role preservation have separate regression assertions. These fixtures
+verify transport and prompt behavior, not actual-model recognition or a live BMS
+release. Attribution applies only to canonical recent history, not semantic or
+long-term memory, historical backfill, or trace joins.
+
+Owner-run live validation remains **pending** until reviewed CO and companion
+BMS releases are authorized and deployed. Using the established owner-approved
+local direct-API path from CO #248 (or the existing Telegram bot), retain the same
+owner, private surface context, and explicit conversation ID for both turns:
+
+1. Select `star_trek_q` and ask: “Tell me a harmless one-sentence moon joke.”
+2. Check the saved canonical assistant message has the server-resolved
+   `speaker_profile_ref` (for example, `daniel:star_trek_q:1`) and unchanged text.
+3. Select `picard` in that same conversation and ask: “Who made that
+   moon joke, and what did they say?” Confirm the response recognizes Q as the
+   previous speaker while answering as Picard. Check the new saved assistant
+   reference identifies Picard and recent retrieval exposes Q's optional field.
+
+Keep the transcript private and record the deployed revisions and bounded
+outcome. This procedure does not authorize worker inference, release, deployment,
+or operational-host access. Run the existing API suite and composed CI before
+merge; the live check is a later owner-run acceptance step.
