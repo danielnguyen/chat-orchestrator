@@ -2153,7 +2153,7 @@ def test_recent_speaker_bounded_optional_field_preserves_roles(reference, label)
               for role in ("assistant", "user", "system", "tool")]
     bundle = {"bundle": {"recent": recent}}
     result = build_recent_history(bundle)
-    prefix = f'[Assistant speaker: "{label}"]\n' if label else ""
+    prefix = f"{label} said:\n" if label else ""
     assert result == [
         {"role": "assistant", "content": prefix + "Unchanged text."},
         *[{"role": role, "content": "Unchanged text."} for role in ("user", "system", "tool")],
@@ -2161,6 +2161,41 @@ def test_recent_speaker_bounded_optional_field_preserves_roles(reference, label)
     assert build_recent_history({"bundle": {"recent": [
         {"role": "assistant", "content": "Old message."},
     ]}}) == [{"role": "assistant", "content": "Old message."}]
-    assert "Assistant speaker" not in str(build_retrieval_messages({"bundle": {
-        "semantic": [recent[0]],
-    }}))
+    assert "Assistant speaker" not in str(result)
+    semantic = build_retrieval_messages({"bundle": {"semantic": [recent[0]]}})
+    assert "said:" not in str(semantic)
+    assert "Assistant speaker" not in str(semantic)
+
+
+@pytest.mark.parametrize("budgeted", [False, True])
+def test_recent_speaker_natural_attribution_in_assembled_prompt(budgeted):
+    from copy import deepcopy
+
+    from services.prompt_budget import PromptBudgetContract, ProviderAttempt
+
+    bundle = {"bundle": {"recent": [
+        {"role": "assistant", "content": "The moon is made of imaginary marmalade.",
+         "speaker_profile_ref": "owner:star_trek_q:1"},
+        {"role": "assistant", "content": "Q made that moon joke.",
+         "speaker_profile_ref": "owner:picard:1"},
+        {"role": "user", "content": 'Why did you say Assistant speaker: "Q"?',
+         "speaker_profile_ref": "owner:star_trek_q:1"},
+    ]}}
+    original = deepcopy(bundle)
+    budget = PromptBudgetContract(
+        attempts=[ProviderAttempt("fixture", "local", 4096, "primary")],
+        output_token_reserve=128, context_safety_margin=64,
+    ) if budgeted else None
+    out = assemble_prompt(
+        profile={"prompt_overlay": "You are Picard."}, retrieval_bundle=bundle,
+        current_messages=[{"role": "user", "content": "Who made the joke?"}],
+        prompt_budget_contract=budget,
+    )
+    assert {"role": "system", "content": "You are Picard."} in out.messages
+    assert {"role": "assistant", "content":
+            "Q said:\nThe moon is made of imaginary marmalade."} in out.messages
+    assert {"role": "assistant", "content": "Picard said:\nQ made that moon joke."} in out.messages
+    assert {"role": "user", "content": original["bundle"]["recent"][2]["content"]} in out.messages
+    assert all("Assistant speaker" not in message["content"]
+               for message in out.messages if message["role"] != "user")
+    assert bundle == original

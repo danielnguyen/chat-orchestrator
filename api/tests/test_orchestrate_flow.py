@@ -46404,15 +46404,17 @@ async def test_recent_speaker_wire_roundtrip(tmp_path, expose_attribution, profi
             assert out["conversation_id"] == conversation_id
             assert saved[-1]["metadata"]["speaker_profile_ref"] == f"owner:{name}:1"
             assert saved[-1]["content"] == provider.content
+        assert "Assistant speaker" not in str(provider.calls)
+        assert [m["content"] for m in saved if m["role"] == "assistant"] == answers
         assert len(provider.calls) == 3
         assert len(memory.profile_calls) == 3
         messages = provider.calls[1]["messages"]
-        prefix = '[Assistant speaker: "Q"]\n' if expose_attribution else ""
+        prefix = "Q said:\n" if expose_attribution else ""
         assert {"role": "assistant", "content": prefix + answers[0]} in messages
         assert {"role": "system", "content": "You are Picard."} in messages
         assert {"role": "system", "content": "You are Q."} not in messages
         later_messages = provider.calls[2]["messages"]
-        picard_prefix = '[Assistant speaker: "Picard"]\n' if expose_attribution else ""
+        picard_prefix = "Picard said:\n" if expose_attribution else ""
         assert {"role": "assistant", "content": picard_prefix + answers[1]} in later_messages
         assert {"role": "system", "content": "You are Q."} in later_messages
         for question in questions:
