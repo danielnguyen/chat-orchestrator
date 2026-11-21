@@ -46243,6 +46243,64 @@ async def test_evidence_interpreter_uses_nondefault_timeout(tmp_path):
     assert provider.calls[0]["reasoning_effort"] == "medium"
 
 
+@pytest.mark.parametrize("reference", [
+    "owner:star_trek_q:1", "owner:picard:2", "owner:custom_speaker:1",
+    None, "", {}, [], 1, True, "other:star_trek_q:1", "owner2:star_trek_q:1",
+    "owner:star_trek_q:0", "owner:star_trek_q:1\n", "owner:Q:1",
+    "owner:dev:1", "owner:neutral:1", "owner:bad speaker:1",
+])
+@pytest.mark.parametrize("variant", [
+    "recent", "semantic", "user", "untagged", "derived", "blocked",
+    "other_owner", "other_conversation",
+])
+def test_containment_projects_only_authorized_recent_speaker(reference, variant):
+    item = _co2_message(
+        "speaker-message", "Unchanged moon joke.", evidence_role="canonical",
+        speaker_profile_ref=reference, unexpected_metadata={"speaker": "injected"},
+    )
+    collection = "semantic" if variant == "semantic" else "recent"
+    if variant == "user":
+        item["role"] = "user"
+    elif variant == "untagged":
+        item.pop("evidence_role")
+    elif variant == "derived":
+        item["evidence_role"] = "derived"
+    elif variant == "blocked":
+        item["policy_metadata"] = _co2_policy_metadata(sensitivity="restricted")
+    elif variant == "other_owner":
+        item["owner_id"] = "other"
+    elif variant == "other_conversation":
+        item["conversation_id"] = "other-conversation"
+    bundle = {"recent": [], "semantic": [], "artifact_refs": []}
+    bundle[collection] = [item]
+    filtered, trace = _apply_persona_containment_result_boundary(
+        retrieval_bundle={"request_id": "speaker-test", "conversation_id": "conv-1",
+                          "bundle": bundle},
+        request_id="speaker-test", conversation_id="conv-1", owner_id="owner",
+        retrieval={"scope": "owner"}, containment_policy=_mandatory_project_policy(),
+        relationship_projection=None,
+    )
+    assert trace["validation_status"] == "filtered"
+    rows = filtered["bundle"][collection]
+    if variant in {"blocked", "other_owner"}:
+        assert rows == []
+        assert trace["omission_counts_by_reason"] == {
+            "restricted_sensitivity" if variant == "blocked" else "owner_mismatch": 1,
+        }
+        return
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["role"] == item["role"]
+    assert row["content"] == item["content"]
+    assert "unexpected_metadata" not in row
+    if variant == "recent" and reference in (
+        "owner:star_trek_q:1", "owner:picard:2", "owner:custom_speaker:1",
+    ):
+        assert row["speaker_profile_ref"] == reference
+    else:
+        assert "speaker_profile_ref" not in row
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expose_attribution", [True, False])
 @pytest.mark.parametrize("profile_source", ["requested", "surface_default", "global_default"])
@@ -46275,14 +46333,19 @@ async def test_recent_speaker_wire_roundtrip(tmp_path, expose_attribution, profi
                 "message_id": body.get("message_id", f"message-{len(saved)}"),
             })
         assert request.url.path == f"/v2/conversations/{conversation_id}/retrieve"
+        assert body["containment_policy"]["enforcement_mode"] == "mandatory"
         recent = []
         for index, message in enumerate(saved):
             item = {"message_id": f"message-{index + 1}", "owner_id": "owner",
                     "conversation_id": conversation_id, "role": message["role"],
-                    "content": message["content"], "evidence_role": "canonical"}
+                    "content": message["content"], "evidence_role": "canonical",
+                    "source_ref": {"ref_type": "message", "ref_id": f"message-{index + 1}"},
+                    "policy_metadata": _co2_policy_metadata()}
             reference = (message["metadata"] or {}).get("speaker_profile_ref")
             if expose_attribution and reference:
                 item["speaker_profile_ref"] = reference
+            if expose_attribution and message["role"] == "assistant" and index == 1:
+                assert item["speaker_profile_ref"] == "owner:star_trek_q:1"
             recent.append(item)
         return httpx.Response(200, json={
             "request_id": body["request_id"], "conversation_id": conversation_id,
@@ -46312,6 +46375,7 @@ async def test_recent_speaker_wire_roundtrip(tmp_path, expose_attribution, profi
     try:
         for index, name in enumerate(speakers):
             provider.content = answers[index]
+            runtime = FakeRuntime(relationship_response=_scoped_relationship_response())
             out = await orchestrate_chat(
                 payload={"owner_id": "owner", "conversation_id": conversation_id,
                          "surface": "telegram",
@@ -46319,9 +46383,24 @@ async def test_recent_speaker_wire_roundtrip(tmp_path, expose_attribution, profi
                          "messages": [{"role": "user", "content": questions[index]}]},
                 memory_store=memory, litellm=provider, rules_path=str(rules),
                 model_registry_path=str(models), allow_manual_override=True,
-                request_id=f"speaker-turn-{index}", runtime=FakeRuntime(),
+                request_id=f"speaker-turn-{index}", runtime=runtime,
+                interaction_governance_enabled=True, persona_containment_enabled=True,
             )
             assert out["status"] == "ok", (out, memory.trace_calls)
+            assert len(runtime.persona_containment_calls) == 1
+            boundary = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+                "result_boundary"
+            ]
+            dispatch = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"][
+                "retrieval_dispatch"
+            ]
+            assert dispatch["policy_validation_status"] == "valid"
+            assert dispatch["bms_retrieval_call_issued"] is True
+            assert boundary["enforcement_mode"] == "mandatory"
+            assert boundary["validation_status"] == "filtered"
+            assert boundary["omission_counts_by_reason"] == {}
+            assert boundary["retained_counts"]["recent"] == boundary["input_counts"]["recent"]
+            assert boundary["retained_counts"]["recent"] >= index * 2
             assert out["conversation_id"] == conversation_id
             assert saved[-1]["metadata"]["speaker_profile_ref"] == f"owner:{name}:1"
             assert saved[-1]["content"] == provider.content

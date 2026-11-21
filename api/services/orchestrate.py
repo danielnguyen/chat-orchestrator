@@ -172,7 +172,11 @@ from services.privacy_context import (
     sanitize_prompt_trace_for_privacy,
     validate_privacy_runtime_response,
 )
-from services.profile_apply import apply_profile_to_request, resolved_speaker_reference
+from services.profile_apply import (
+    apply_profile_to_request,
+    resolved_speaker_reference,
+    speaker_label,
+)
 from services.prompt_assembly import PromptAssembly, assemble_prompt, calibration_guidance
 from services.prompt_assembly import restraint_trace as sanitize_restraint_trace
 from services.prompt_budget import PromptBudgetContract, PromptBudgetError
@@ -1564,6 +1568,17 @@ def _apply_persona_containment_result_boundary(
             if kept is None:
                 _record_omission(trace, reason)
             else:
+                # Attribution belongs only to admitted canonical history in this conversation.
+                reference = item.get("speaker_profile_ref")
+                if (
+                    output is retained_recent
+                    and kept["role"] == "assistant"
+                    and item.get("evidence_role") == "canonical"
+                    and item.get("conversation_id") == conversation_id
+                    and speaker_label(reference) is not None
+                    and reference.split(":", 1)[0] == owner_id
+                ):
+                    kept["speaker_profile_ref"] = reference
                 output.append(kept)
 
     observed_metadata = _retained_observed_metadata(
