@@ -203,7 +203,7 @@ def build_recent_history(retrieval_bundle: dict[str, Any]) -> list[dict[str, str
         content = item.get("content", "")
         if role in VALID_ROLES and content:
             label = speaker_label(item.get("speaker_profile_ref")) if role == "assistant" else None
-            attribution = f'[Assistant speaker: "{label}"]\n' if label else ""
+            attribution = f"{label} said:\n" if label else ""
             messages.append({
                 "role": role,
                 "content": f"{attribution}{_memory_hygiene_prefix(item)}{content}",
