@@ -1847,3 +1847,119 @@ async def test_dependency_timing_api_uses_server_setting_not_payload(monkeypatch
     assert response.status_code == 200 and len(calls) == 1
     assert calls[0]["detailed_dependency_timing_enabled"] is enabled
     assert "detailed_dependency_timing_enabled" not in calls[0]["payload"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy_unavailable", [False, True])
+@pytest.mark.parametrize("personal", [False, True])
+@pytest.mark.parametrize("surface,allowed", [
+    ("voice", True), ("telegram_private", True), ("desktop_private", True),
+    ("notification_preview", False), ("car_voice_possible_passenger", False),
+    ("unknown_surface", False), ("alexa", False),
+])
+async def test_voice_answers_keep_context_without_privacy_gate(
+    delivery_flow, monkeypatch, personal, surface, allowed, policy_unavailable,
+):
+    import json
+
+    from test_orchestrate_flow import _privacy_runtime_response
+
+    main, memory, provider, _, release, _, _ = delivery_flow
+    monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
+    if policy_unavailable:
+        main.runtime.privacy_context_error = RuntimeError("policy unavailable")
+        allowed = surface == "voice"
+    else:
+        async def policy(**scope):
+            main.runtime.privacy_context_calls.append(scope)
+            return _privacy_runtime_response(
+                **{key: scope[key] for key in (
+                    "request_id", "owner_id", "conversation_id", "surface",
+                    "runtime_session_id", "runtime_turn_id",
+                )},
+                surface_type=scope["surface_category"],
+                sensitivity_level=scope["sensitivity_level"],
+                sensitive_detail_allowed=allowed, screen_detail_allowed=allowed,
+                redaction_required=not allowed,
+            )
+
+        main.runtime.evaluate_privacy_context = policy
+    context = "My private appointment is Tuesday." if personal else "The moon is rocky."
+    answer = "Your private appointment is Tuesday." if personal else "The moon is rocky."
+    retrieve = memory.retrieve_bundle
+
+    async def retained_context(**scope):
+        bundle = await retrieve(**scope)
+        bundle["bundle"]["recent"][0]["content"] = context
+        bundle["bundle"]["recent"][0]["policy_metadata"] = {
+            "sensitivity": "sensitive" if personal else "normal",
+            "memory_domains": ["personal"],
+        }
+        return bundle
+
+    monkeypatch.setattr(memory, "retrieve_bundle", retained_context)
+    provider.content = answer
+    release.set()
+    payload = _full_chat_payload(
+        surface=surface, client_id="unmute", messages=[{
+            "role": "user",
+            "content": "When is my appointment?" if personal else "Describe the moon.",
+        }],
+    )
+    payload.pop("surface_context")
+    payload.pop("sensitivity")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://testserver") as client:
+        response = await client.post("/v1/chat", headers={"X-API-Key": "orch-test"}, json=payload)
+    assert response.status_code == 200
+    assert len(provider.calls) == 1
+    assert (response.json()["answer"] == answer) is allowed
+    assert (context in json.dumps(provider.calls[0]["messages"])) is allowed
+    trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["privacy_context"]
+    if surface == "voice":
+        assert main.runtime.privacy_context_calls == []
+        assert trace["status"] == "disabled"
+        assert trace["action_taken"] == "none"
+        assert "privacy_prompt_suppression" not in json.dumps(memory.trace_calls)
+    else:
+        assert main.runtime.privacy_context_calls
+    assert memory.added_messages[-1]["content"] == response.json()["answer"]
+    assert all(call["owner_id"] == "owner" for call in memory.retrieve_calls)
+    assert main.settings.cognitive_runtime_privacy_context_enabled is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_key", [None, "wrong-key"])
+async def test_voice_privacy_bypass_preserves_api_auth(delivery_flow, monkeypatch, api_key):
+    main, memory, provider, _, _, _, _ = delivery_flow
+    monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
+                                 base_url="http://testserver") as client:
+        response = await client.post(
+            "/v1/chat", headers={} if api_key is None else {"X-API-Key": api_key},
+            json=_full_chat_payload(surface="voice", client_id="unmute"),
+        )
+    assert response.status_code == 401
+    assert provider.calls == memory.profile_calls == memory.added_messages == []
+
+
+@pytest.mark.asyncio
+async def test_voice_privacy_bypass_preserves_profile_denial(delivery_flow, monkeypatch):
+    main, memory, provider, _, release, _, _ = delivery_flow
+    monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
+    request = httpx.Request("POST", "http://memory/v1/profiles/resolve")
+    denial = httpx.HTTPStatusError(
+        "client profile denied", request=request, response=httpx.Response(403, request=request),
+    )
+    resolve = AsyncMock(side_effect=denial)
+    monkeypatch.setattr(memory, "resolve_profile", resolve)
+    release.set()
+    response = await _delivery_post(
+        main, surface="voice", client_id="unauthorized-client", allow_deferred=False,
+        delivery_wait_ms=None,
+    )
+    assert response.status_code == 500
+    assert response.json()["status"] == "failed"
+    assert resolve.call_args.kwargs["client_id"] == "unauthorized-client"
+    assert provider.calls == []
+    assert not any(item["role"] == "assistant" for item in memory.added_messages)
