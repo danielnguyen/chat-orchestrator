@@ -5210,7 +5210,10 @@ async def test_orchestrate_capability_registry_malformed_response_is_conservativ
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_matched_capability_requires_confirmation_without_execution(tmp_path):
+@pytest.mark.parametrize("surface", ["dev", "voice"])
+async def test_orchestrate_matched_capability_requires_confirmation_without_execution(
+    tmp_path, surface,
+):
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         capability_match_response={
@@ -5226,7 +5229,7 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
                     "operation_kind": "restart",
                     "risk_level": "medium_requires_confirmation",
                     "requires_confirmation": True,
-                    "allowed_surfaces": ["dev"],
+                    "allowed_surfaces": [surface],
                     "allowed_personas": ["technical_architect"],
                     "reversible": True,
                     "dry_run_supported": True,
@@ -5274,7 +5277,9 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
-        payload=_base_payload(messages=[{"role": "user", "content": "Restart media service."}]),
+        payload=_base_payload(
+            surface=surface, messages=[{"role": "user", "content": "Restart media service."}],
+        ),
         memory_store=memory_store,
         litellm=FakeLiteLLM(content="Done."),
         rules_path=str(rules),
@@ -5286,12 +5291,14 @@ async def test_orchestrate_matched_capability_requires_confirmation_without_exec
         request_id="rid-capability-confirm-first",
         runtime=runtime,
         capability_registry_enabled=True,
+        privacy_context_enabled=surface == "voice",
     )
 
     assert "Preview: Would restart the media service." in out["answer"]
     assert "Confirm Restart media service for media server." in out["answer"]
-    assert "No action was taken." in out["answer"]
-    assert "Verification would be required after execution." in out["answer"]
+    if surface == "dev":
+        assert "No action was taken." in out["answer"]
+        assert "Verification would be required after execution." in out["answer"]
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["capability_registry"]["authority"]["requires_confirmation"] is True
     assert trace["capability_registry"]["authority"]["allowed"] is False
