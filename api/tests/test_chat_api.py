@@ -1729,6 +1729,7 @@ async def test_unknown_voice_privacy_cues_without_disclosing_answer(feedback_flo
     provider.content = "PRIVATE-ANSWER-MUST-NOT-BE-SPOKEN"
     response = await _feedback_response(main, surface_context={
         "surface_type": "alexa", "interaction_mode": "voice_mediated", "spoken_output": True,
+        "surface_category": "unknown_surface",
     })
     iterator = response.body_iterator
     try:
@@ -1850,15 +1851,17 @@ async def test_dependency_timing_api_uses_server_setting_not_payload(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("policy_unavailable", [False, True])
-@pytest.mark.parametrize("personal", [False, True])
-@pytest.mark.parametrize("surface,allowed", [
-    ("voice", True), ("telegram_private", True), ("desktop_private", True),
-    ("notification_preview", False), ("car_voice_possible_passenger", False),
-    ("unknown_surface", False), ("alexa", False),
+@pytest.mark.parametrize("runtime_state", ["working", "failing", "unavailable"])
+@pytest.mark.parametrize("classification", ["normal", "sensitive", "highly_sensitive", "unknown"])
+@pytest.mark.parametrize("surface", [
+    "desktop_private", "mobile_private", "telegram_private", "voice_private",
+    "car_voice_possible_passenger", "glasses_public_or_semi_public", "notification_preview",
+    "desktop", "mobile", "telegram", "voice", "car", "glasses", "notification", "alexa",
+    "dev", "vscode", "web", "chat", "compact", "spoken", "g2", "wearable_hud",
+    "unknown_surface", "unrecognized", "", None,
 ])
-async def test_voice_answers_keep_context_without_privacy_gate(
-    delivery_flow, monkeypatch, personal, surface, allowed, policy_unavailable,
+async def test_recognized_surface_answers_keep_authorized_context(
+    delivery_flow, monkeypatch, classification, surface, runtime_state,
 ):
     import json
 
@@ -1866,9 +1869,12 @@ async def test_voice_answers_keep_context_without_privacy_gate(
 
     main, memory, provider, _, release, _, _ = delivery_flow
     monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
-    if policy_unavailable:
-        main.runtime.privacy_context_error = RuntimeError("policy unavailable")
-        allowed = surface == "voice"
+    allowed = surface not in {"unknown_surface", "unrecognized", "", None}
+    runtime = main.runtime
+    if runtime_state == "unavailable":
+        monkeypatch.setattr(main, "runtime", None)
+    elif runtime_state == "failing":
+        runtime.privacy_context_error = RuntimeError("policy unavailable")
     else:
         async def policy(**scope):
             main.runtime.privacy_context_calls.append(scope)
@@ -1879,20 +1885,20 @@ async def test_voice_answers_keep_context_without_privacy_gate(
                 )},
                 surface_type=scope["surface_category"],
                 sensitivity_level=scope["sensitivity_level"],
-                sensitive_detail_allowed=allowed, screen_detail_allowed=allowed,
-                redaction_required=not allowed,
+                sensitive_detail_allowed=False, screen_detail_allowed=False,
+                redaction_required=True,
             )
 
         main.runtime.evaluate_privacy_context = policy
-    context = "My private appointment is Tuesday." if personal else "The moon is rocky."
-    answer = "Your private appointment is Tuesday." if personal else "The moon is rocky."
+    context = "PRIVATE_CONTEXT_SENTINEL: appointment Tuesday."
+    answer = "Your appointment is Tuesday."
     retrieve = memory.retrieve_bundle
 
     async def retained_context(**scope):
         bundle = await retrieve(**scope)
         bundle["bundle"]["recent"][0]["content"] = context
         bundle["bundle"]["recent"][0]["policy_metadata"] = {
-            "sensitivity": "sensitive" if personal else "normal",
+            "sensitivity": classification,
             "memory_domains": ["personal"],
         }
         return bundle
@@ -1903,11 +1909,21 @@ async def test_voice_answers_keep_context_without_privacy_gate(
     payload = _full_chat_payload(
         surface=surface, client_id="unmute", messages=[{
             "role": "user",
-            "content": "When is my appointment?" if personal else "Describe the moon.",
+            "content": "When is my appointment?",
         }],
     )
-    payload.pop("surface_context")
-    payload.pop("sensitivity")
+    payload["surface_context"] = {"sensitivity_level": classification}
+    if surface == "g2":
+        payload["surface_context"].update(
+            surface_type="wearable_hud", interaction_mode="voice_mediated", spoken_output=False,
+            active_task_mode=True, latency_preference="low", verbosity_target="short",
+            allows_expansion=False, output_format="plain_text",
+        )
+    if surface == "voice":
+        payload.pop("surface_context")
+        payload.pop("sensitivity")
+    if surface is None:
+        payload.pop("surface")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
                                  base_url="http://testserver") as client:
         response = await client.post("/v1/chat", headers={"X-API-Key": "orch-test"}, json=payload)
@@ -1916,13 +1932,18 @@ async def test_voice_answers_keep_context_without_privacy_gate(
     assert (response.json()["answer"] == answer) is allowed
     assert (context in json.dumps(provider.calls[0]["messages"])) is allowed
     trace = memory.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["privacy_context"]
-    if surface == "voice":
-        assert main.runtime.privacy_context_calls == []
+    if allowed:
+        assert runtime.privacy_context_calls == []
         assert trace["status"] == "disabled"
         assert trace["action_taken"] == "none"
         assert "privacy_prompt_suppression" not in json.dumps(memory.trace_calls)
+        assert "Privacy context guidance:" not in json.dumps(provider.calls)
     else:
-        assert main.runtime.privacy_context_calls
+        if runtime_state != "unavailable":
+            assert runtime.privacy_context_calls
+        assert trace["action_taken"] == "replaced_with_safe_template"
+        assert response.json()["sources"] == []
+        assert context not in json.dumps(memory.trace_calls)
     assert memory.added_messages[-1]["content"] == response.json()["answer"]
     assert all(call["owner_id"] == "owner" for call in memory.retrieve_calls)
     assert main.settings.cognitive_runtime_privacy_context_enabled is True
@@ -1930,21 +1951,25 @@ async def test_voice_answers_keep_context_without_privacy_gate(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("api_key", [None, "wrong-key"])
-async def test_voice_privacy_bypass_preserves_api_auth(delivery_flow, monkeypatch, api_key):
+@pytest.mark.parametrize("surface", ["voice", "g2", "telegram", "unknown_surface"])
+async def test_surface_privacy_bypass_preserves_api_auth(
+    delivery_flow, monkeypatch, api_key, surface,
+):
     main, memory, provider, _, _, _, _ = delivery_flow
     monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app),
                                  base_url="http://testserver") as client:
         response = await client.post(
             "/v1/chat", headers={} if api_key is None else {"X-API-Key": api_key},
-            json=_full_chat_payload(surface="voice", client_id="unmute"),
+            json=_full_chat_payload(surface=surface, client_id="unmute"),
         )
     assert response.status_code == 401
     assert provider.calls == memory.profile_calls == memory.added_messages == []
 
 
 @pytest.mark.asyncio
-async def test_voice_privacy_bypass_preserves_profile_denial(delivery_flow, monkeypatch):
+@pytest.mark.parametrize("surface", ["voice", "g2", "telegram", "unknown_surface"])
+async def test_surface_privacy_bypass_preserves_profile_denial(delivery_flow, monkeypatch, surface):
     main, memory, provider, _, release, _, _ = delivery_flow
     monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
     request = httpx.Request("POST", "http://memory/v1/profiles/resolve")
@@ -1955,7 +1980,7 @@ async def test_voice_privacy_bypass_preserves_profile_denial(delivery_flow, monk
     monkeypatch.setattr(memory, "resolve_profile", resolve)
     release.set()
     response = await _delivery_post(
-        main, surface="voice", client_id="unauthorized-client", allow_deferred=False,
+        main, surface=surface, client_id="unauthorized-client", allow_deferred=False,
         delivery_wait_ms=None,
     )
     assert response.status_code == 500
@@ -1963,3 +1988,83 @@ async def test_voice_privacy_bypass_preserves_profile_denial(delivery_flow, monk
     assert resolve.call_args.kwargs["client_id"] == "unauthorized-client"
     assert provider.calls == []
     assert not any(item["role"] == "assistant" for item in memory.added_messages)
+
+
+@pytest.mark.parametrize("payload,expected", [
+    ({}, "unknown_surface"),
+    ({"surface": "arbitrary-device"}, "unknown_surface"),
+    ({"surface": {"name": "voice"}}, "unknown_surface"),
+    ({"surface": ["desktop"]}, "unknown_surface"),
+    ({"surface_context": {"surface_type": "voice.*"}}, "unknown_surface"),
+    ({"surface_context": {"surface_category": "unsupported"}}, "unknown_surface"),
+    ({"surface_context": "desktop_private"}, "unknown_surface"),
+    ({"surface": "g2", "surface_context": {"surface_category": "unknown_surface"}},
+     "unknown_surface"),
+    ({"surface": "voice", "surface_context": {"surface_type": "unknown_surface"}},
+     "unknown_surface"),
+    ({"surface": "unknown_surface", "surface_context": {"surface_category": "telegram_private"}},
+     "telegram_private"),
+    ({"surface": "node_red", "surface_context": {"surface_category": "telegram_private"}},
+     "telegram_private"),
+    ({"surface": "node_red", "surface_context": {"surface_type": "mobile_private"}},
+     "mobile_private"),
+    ({"surface_context": {"surface_type": "wearable_hud"}}, "glasses_public_or_semi_public"),
+])
+def test_privacy_surface_precedence_and_invalid_identifiers(payload, expected):
+    from services.privacy_context import derive_privacy_context, resolve_privacy_surface
+
+    assert resolve_privacy_surface(payload) == expected
+    assert derive_privacy_context(payload=payload, retrieval_bundle={}).surface_category == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["g2", "voice", "telegram"])
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_explicit_unknown_remains_restricted_over_known_alias(
+    delivery_flow, monkeypatch, surface, enabled,
+):
+    main, memory, provider, _, release, _, _ = delivery_flow
+    monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", enabled)
+    main.runtime.privacy_context_error = RuntimeError("unavailable")
+    release.set()
+    response = await _delivery_post(
+        main, surface=surface, surface_context={"surface_category": "unknown_surface"},
+        allow_deferred=False, delivery_wait_ms=None,
+    )
+    assert response.status_code == 200
+    assert response.json()["answer"] == (
+        "Details cannot safely be shown on this surface." if enabled else provider.content
+    )
+    assert ("prior history" in str(provider.calls)) is not enabled
+    assert bool(main.runtime.privacy_context_calls) is enabled
+    assert memory.added_messages[-1]["content"] == response.json()["answer"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("surface", ["g2", "voice", "telegram", "unknown_surface"])
+async def test_surface_privacy_is_retained_on_continuation_and_deferred_completion(
+    delivery_flow, monkeypatch, surface,
+):
+    main, memory, provider, _, release, _, _ = delivery_flow
+    monkeypatch.setattr(main.settings, "cognitive_runtime_privacy_context_enabled", True)
+    main.runtime.privacy_context_error = RuntimeError("unavailable")
+    context = {"surface_type": "wearable_hud", "interaction_mode": "voice_mediated",
+               "spoken_output": False} if surface == "g2" else {}
+    options = {"surface": surface, "surface_context": context}
+    release.set()
+    first = await _delivery_post(main, **options, allow_deferred=False, delivery_wait_ms=None)
+    assert first.status_code == 200
+    release.clear()
+    second = await _delivery_post(main, **options, conversation_id=first.json()["conversation_id"])
+    assert second.status_code == 202
+    tasks = tuple(main._owned_chat_tasks)
+    release.set()
+    await asyncio.gather(*tasks)
+    expected = ("Details cannot safely be shown on this surface."
+                if surface == "unknown_surface" else provider.content)
+    assert first.json()["answer"] == memory.added_messages[-1]["content"] == expected
+    assert memory.work["state"] == "completed"
+    assert len(provider.calls) == 2
+    assert all(("prior history" in str(call)) is (surface != "unknown_surface")
+               for call in provider.calls)
+    assert bool(main.runtime.privacy_context_calls) is (surface == "unknown_surface")

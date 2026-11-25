@@ -497,11 +497,11 @@ privacy_response="$(co_chat \
   "$privacy_conversation" \
   "Summarize privacy anchor notice." \
   "private" \
-  "notification_preview")"
+  "unknown_surface")"
 privacy_request_id="$(jq -r '.request_id' <<<"$privacy_response")"
 jq -e '
   .status == "ok"
-  and .answer == "A private update is available. Open a private surface for details."
+  and .answer == "Details cannot safely be shown on this surface."
   and (.sources | length) == 0
 ' <<<"$privacy_response" >/dev/null
 privacy_calls="$(fetch_provider_calls "$privacy_request_id")"
@@ -525,6 +525,24 @@ assert_not_contains "$privacy_trace_text" "$privacy_artifact" "privacy artifact 
 assert_not_contains "$privacy_trace_text" "X-Amz-" "signed query values in restricted trace"
 assert_not_contains "$privacy_trace_text" "minioadmin" "object-store credential in restricted trace"
 assert_not_contains "$privacy_trace_text" "127.0.0.1:14400" "presigned endpoint in restricted trace"
+
+# The same authorized private artifact remains usable on a known notification surface.
+known_response="$(co_chat \
+  "$privacy_owner" "$privacy_client" "$privacy_conversation" \
+  "Summarize privacy anchor notice." "private" "notification_preview")"
+known_request_id="$(jq -r '.request_id' <<<"$known_response")"
+jq -e '.status == "ok" and (.sources | length) == 1
+  and .answer != "Details cannot safely be shown on this surface."
+  and .answer != "A private update is available. Open a private surface for details."' \
+  <<<"$known_response" >/dev/null
+known_calls="$(fetch_provider_calls "$known_request_id")"
+jq -e '(.calls | map(select(.kind == "chat")) | length) == 1
+  and (.calls | map(select(.kind == "chat")) | all(.sentinel_presence.privacy == true))' \
+  <<<"$known_calls" >/dev/null
+known_trace="$(fetch_trace "$known_request_id")"
+jq -e '.retrieval.prompt_assembly.privacy_context.status == "disabled"
+  and .retrieval.prompt_assembly.privacy_context.action_taken == "none"' \
+  <<<"$known_trace" >/dev/null
 
 echo "Artifact composed smoke passed: positive lifecycle, owner/conversation isolation, incomplete artifact omission, prompt-budget survivor filtering, provider fallback reuse, privacy source suppression."
 echo "Topology: CO branch -> BMS main with PR #33 -> PostgreSQL 16 + Qdrant + MinIO bucket -> deterministic local provider/embedding stub."

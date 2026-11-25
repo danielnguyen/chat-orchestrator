@@ -34502,7 +34502,7 @@ async def test_orchestrate_dsa_context_escalates_public_request_before_privacy_e
 
     await orchestrate_chat(
         payload=_base_payload(
-            surface="web",
+            surface="unknown_surface",
             sensitivity="public",
             external_context_enabled=True,
         ),
@@ -34569,7 +34569,7 @@ async def test_orchestrate_world_state_and_relationship_metadata_escalate_before
     }
 
     await orchestrate_chat(
-        payload=_base_payload(surface="web", sensitivity="public"),
+        payload=_base_payload(surface="unknown_surface", sensitivity="public"),
         memory_store=FakeMemoryStore(),
         litellm=FakeLiteLLM(),
         runtime=runtime,
@@ -34597,7 +34597,7 @@ async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         privacy_context_response=_privacy_runtime_response(
-            surface_type="notification_preview",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
             privacy_zone="preview_limited",
             sensitive_detail_allowed=False,
@@ -34611,7 +34611,7 @@ async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
     litellm = FakeLiteLLM()
 
     await orchestrate_chat(
-        payload=_base_payload(surface_context={"surface_category": "notification_preview"}),
+        payload=_base_payload(surface_context={"surface_category": "unknown_surface"}),
         memory_store=FakeMemoryStore(),
         litellm=litellm,
         runtime=runtime,
@@ -34627,7 +34627,7 @@ async def test_orchestrate_privacy_guidance_uses_final_policy_result(tmp_path):
         for message in litellm.calls[0]["messages"]
         if message["role"] == "system"
     ]
-    assert any("notification_preview" in message for message in system_messages)
+    assert any("unknown_surface" in message for message in system_messages)
 
 
 @pytest.mark.asyncio
@@ -34656,6 +34656,7 @@ async def test_orchestrate_privacy_context_explicit_level_cannot_deescalate(tmp_
 
     await orchestrate_chat(
         payload=_base_payload(
+            surface="unknown_surface",
             sensitivity="local_only",
             surface_context={"sensitivity_level": "normal"},
         ),
@@ -34676,7 +34677,7 @@ async def test_orchestrate_privacy_context_explicit_level_cannot_deescalate(tmp_
 @pytest.mark.parametrize(
     ("surface", "surface_context", "expected_surface_category"),
     [
-        ("web", {"surface_type": "voice"}, "unknown_surface"),
+        ("web", {"surface_type": "voice"}, "desktop_private"),
         ("car", None, "car_voice_possible_passenger"),
     ],
 )
@@ -34701,7 +34702,10 @@ async def test_orchestrate_privacy_surface_mapping_is_conservative(
         privacy_context_enabled=True,
     )
 
-    assert runtime.privacy_context_calls[0]["surface_category"] == expected_surface_category
+    assert orchestrate_service.resolve_privacy_surface(
+        _base_payload(surface=surface, surface_context=surface_context)
+    ) == expected_surface_category
+    assert runtime.privacy_context_calls == []
 
 
 @pytest.mark.asyncio
@@ -34742,34 +34746,14 @@ async def test_orchestrate_private_desktop_policy_preserves_answer_and_sources(t
         "privacy_context"
     ]
     assert trace["action_taken"] == "none"
-    assert trace["policy_source"] == "runtime"
+    assert trace["policy_source"] == "disabled"
+    assert runtime.privacy_context_calls == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("surface_type", "expected_answer"),
-    [
-        (
-            "car_voice_possible_passenger",
-            "Relevant private information exists, but details are withheld in the car.",
-        ),
-        (
-            "notification_preview",
-            "A private update is available. Open a private surface for details.",
-        ),
-        (
-            "glasses_public_or_semi_public",
-            "A private update exists. Use a private screen for details.",
-        ),
-        (
-            "voice_private",
-            "Sensitive details are withheld from voice output.",
-        ),
-        (
-            "unknown_surface",
-            "Details cannot safely be shown on this surface.",
-        ),
-    ],
+    [("unknown_surface", "Details cannot safely be shown on this surface.")],
 )
 @pytest.mark.parametrize("calibration_mode", ["strict", "moderate", "exploratory"])
 async def test_orchestrate_privacy_replaces_entire_answer_and_suppresses_sources(
@@ -34852,7 +34836,7 @@ async def test_orchestrate_privacy_fallback_is_non_fatal_and_conservative(tmp_pa
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
-        payload=_base_payload(surface="web", sensitivity="private"),
+        payload=_base_payload(surface="unknown_surface", sensitivity="private"),
         memory_store=memory_store,
         litellm=FakeLiteLLM(content="Sensitive raw output"),
         runtime=runtime,
@@ -34876,7 +34860,7 @@ async def test_orchestrate_privacy_fallback_is_non_fatal_and_conservative(tmp_pa
     "privacy_response",
     [
         _privacy_runtime_response(
-            surface_type="desktop_private",
+            surface_type="unknown_surface",
             sensitive_detail_allowed="true",  # type: ignore[arg-type]
         ),
         _privacy_runtime_response(
@@ -34893,7 +34877,7 @@ async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fall
     memory_store = FakeMemoryStore()
 
     out = await orchestrate_chat(
-        payload=_base_payload(surface="web", sensitivity="private"),
+        payload=_base_payload(surface="unknown_surface", sensitivity="private"),
         memory_store=memory_store,
         litellm=FakeLiteLLM(content="Sensitive raw output"),
         runtime=runtime,
@@ -34920,7 +34904,7 @@ async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fall
         (
             _privacy_runtime_response(
                 request_id="rid-privacy-request-mismatch-other",
-                surface_type="desktop_private",
+                surface_type="unknown_surface",
                 sensitivity_level="sensitive",
             ),
             "rid-privacy-request-mismatch",
@@ -34928,7 +34912,7 @@ async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fall
         (
             _privacy_runtime_response(
                 owner_id="other-owner",
-                surface_type="desktop_private",
+                surface_type="unknown_surface",
                 sensitivity_level="sensitive",
             ),
             "rid-privacy-owner-mismatch",
@@ -34936,7 +34920,7 @@ async def test_orchestrate_invalid_privacy_runtime_result_uses_conservative_fall
         (
             _privacy_runtime_response(
                 conversation_id="other-conversation",
-                surface_type="desktop_private",
+                surface_type="unknown_surface",
                 sensitivity_level="sensitive",
             ),
             "rid-privacy-conversation-mismatch",
@@ -34955,7 +34939,7 @@ async def test_orchestrate_privacy_runtime_identifier_mismatch_uses_conservative
     out = await orchestrate_chat(
         payload=_base_payload(
             surface="vscode",
-            surface_context={"surface_category": "desktop_private"},
+            surface_context={"surface_category": "unknown_surface"},
             sensitivity="private",
         ),
         memory_store=memory_store,
@@ -34969,7 +34953,7 @@ async def test_orchestrate_privacy_runtime_identifier_mismatch_uses_conservative
     )
 
     assert out["sources"] == []
-    assert out["answer"] == "Sensitive details are withheld on this surface."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "privacy_context"
     ]
@@ -34983,12 +34967,12 @@ async def test_orchestrate_privacy_runtime_identifier_mismatch_uses_conservative
     [
         _privacy_runtime_response(
             runtime_session_id="other-session",
-            surface_type="desktop_private",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
         ),
         _privacy_runtime_response(
             runtime_turn_id="other-turn",
-            surface_type="desktop_private",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
         ),
     ],
@@ -35004,7 +34988,7 @@ async def test_orchestrate_privacy_runtime_session_or_turn_mismatch_uses_conserv
     out = await orchestrate_chat(
         payload=_base_payload(
             surface="vscode",
-            surface_context={"surface_category": "desktop_private"},
+            surface_context={"surface_category": "unknown_surface"},
             sensitivity="private",
         ),
         memory_store=memory_store,
@@ -35018,7 +35002,7 @@ async def test_orchestrate_privacy_runtime_session_or_turn_mismatch_uses_conserv
     )
 
     assert out["sources"] == []
-    assert out["answer"] == "Sensitive details are withheld on this surface."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "privacy_context"
     ]
@@ -35042,7 +35026,7 @@ async def test_orchestrate_privacy_runtime_surface_category_mismatch_uses_conser
     out = await orchestrate_chat(
         payload=_base_payload(
             surface="vscode",
-            surface_context={"surface_category": "desktop_private"},
+            surface_context={"surface_category": "unknown_surface"},
             sensitivity="private",
         ),
         memory_store=memory_store,
@@ -35056,7 +35040,7 @@ async def test_orchestrate_privacy_runtime_surface_category_mismatch_uses_conser
     )
 
     assert out["sources"] == []
-    assert out["answer"] == "Sensitive details are withheld on this surface."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "privacy_context"
     ]
@@ -35071,7 +35055,7 @@ async def test_orchestrate_privacy_runtime_deescalated_sensitivity_uses_conserva
     rules, models = _write_router_files(tmp_path)
     runtime = FakeRuntime(
         privacy_context_response=_privacy_runtime_response(
-            surface_type="desktop_private",
+            surface_type="unknown_surface",
             sensitivity_level="normal",
             sensitive_detail_allowed=True,
             screen_detail_allowed=True,
@@ -35082,7 +35066,7 @@ async def test_orchestrate_privacy_runtime_deescalated_sensitivity_uses_conserva
     out = await orchestrate_chat(
         payload=_base_payload(
             surface="vscode",
-            surface_context={"surface_category": "desktop_private"},
+            surface_context={"surface_category": "unknown_surface"},
             sensitivity="private",
         ),
         memory_store=memory_store,
@@ -35096,7 +35080,7 @@ async def test_orchestrate_privacy_runtime_deescalated_sensitivity_uses_conserva
     )
 
     assert out["sources"] == []
-    assert out["answer"] == "Sensitive details are withheld on this surface."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     trace = memory_store.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"][
         "privacy_context"
     ]
@@ -35117,7 +35101,7 @@ async def test_orchestrate_exactly_matching_privacy_runtime_response_is_accepted
             surface="vscode",
             runtime_session_id="rtsession_1",
             runtime_turn_id="rtturn_1",
-            surface_type="desktop_private",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
             sensitive_detail_allowed=True,
             screen_detail_allowed=True,
@@ -35128,7 +35112,7 @@ async def test_orchestrate_exactly_matching_privacy_runtime_response_is_accepted
     out = await orchestrate_chat(
         payload=_base_payload(
             surface="vscode",
-            surface_context={"surface_category": "desktop_private"},
+            surface_context={"surface_category": "unknown_surface"},
             sensitivity="private",
         ),
         memory_store=memory_store,
@@ -35174,7 +35158,7 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
     )
     runtime = FakeRuntime(
         privacy_context_response=_privacy_runtime_response(
-            surface_type="voice_private",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
             sensitive_detail_allowed=False,
             voice_detail_allowed=False,
@@ -35191,7 +35175,7 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
             response_mode="brief",
             brief_depth=1,
             brief_type="general",
-            surface_context={"surface_category": "voice_private"},
+            surface_context={"surface_category": "unknown_surface"},
         ),
         memory_store=memory_store,
         litellm=FakeLiteLLM(fail_first=True, content=""),
@@ -35207,7 +35191,7 @@ async def test_orchestrate_privacy_enforcement_runs_after_response_action_and_pr
         response_action_mode="template_fallback",
     )
 
-    assert out["answer"] == "Sensitive details are withheld from voice output."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     trace_payload = memory_store.trace_calls[0]["payload"]
     assert trace_payload["fallback"] == {"triggered": True, "reason": "provider_error"}
     prompt_trace = trace_payload["retrieval"]["prompt_assembly"]
@@ -35245,7 +35229,7 @@ async def test_orchestrate_privacy_suppresses_recall_prompt_layer_and_fallback(t
     )
     runtime = FakeRuntime(
         privacy_context_response=_privacy_runtime_response(
-            surface_type="voice_private",
+            surface_type="unknown_surface",
             sensitivity_level="sensitive",
             sensitive_detail_allowed=False,
             voice_detail_allowed=False,
@@ -35260,7 +35244,7 @@ async def test_orchestrate_privacy_suppresses_recall_prompt_layer_and_fallback(t
 
     out = await orchestrate_chat(
         payload=_base_payload(
-            surface_context={"surface_category": "voice_private"},
+            surface_context={"surface_category": "unknown_surface"},
             messages=[{"role": "user", "content": "Use the private callback."}],
         ),
         memory_store=memory_store,
@@ -35273,7 +35257,7 @@ async def test_orchestrate_privacy_suppresses_recall_prompt_layer_and_fallback(t
         privacy_context_enabled=True,
     )
 
-    assert out["answer"] == "Sensitive details are withheld from voice output."
+    assert out["answer"] == "Details cannot safely be shown on this surface."
     assert len(litellm.calls) == 2
     assert litellm.calls[0]["messages"] == litellm.calls[1]["messages"]
     provider_messages = json.dumps(litellm.calls, sort_keys=True)
@@ -35712,7 +35696,7 @@ async def test_orchestrate_restricted_privacy_trace_sanitizes_context_references
 
     out = await orchestrate_chat(
         payload=_base_payload(
-            surface="web",
+            surface="unknown_surface",
             external_context_enabled=True,
             external_context={"enabled": True, "source_ids": ["REQUESTED_SOURCE_SENTINEL"]},
         ),
@@ -43804,9 +43788,9 @@ async def test_processing_feedback_policy_barrier_precedes_provider_and_canonica
         assert runtime.presence_calls[0]["proactive_presence_allowed"] is (permission == "allowed")
         order = runtime.call_order
         for predecessor in ("start_turn", "interaction_governance", "restraint", "presence",
-                            "situated_presence", "timing", "privacy_context"):
+                            "situated_presence", "timing"):
             assert order.index(predecessor) < order.index("processing_cue")
-        assert order.index("timing") < order.index("privacy_context")
+        assert runtime.privacy_context_calls == []
         assert order.index("processing_cue") < order.index("answer_generation")
         assert not any(item["role"] == "assistant" for item in memory.added_messages)
     finally:
@@ -43851,6 +43835,7 @@ async def test_processing_feedback_exclusions_never_publish_or_upgrade_authority
     elif defect == "presence":
         runtime.presence_error = RuntimeError("private presence failure")
     elif defect.startswith("privacy"):
+        payload["surface_context"]["surface_category"] = "unknown_surface"
         original = runtime.evaluate_privacy_context
 
         async def restricted(**scope):
@@ -43861,6 +43846,7 @@ async def test_processing_feedback_exclusions_never_publish_or_upgrade_authority
                 response["runtime_turn_id"] = "another-turn"
             elif defect == "privacy_voice":
                 response["result"]["voice_detail_allowed"] = False
+                response["result"]["screen_detail_allowed"] = False
             else:
                 response["result"].update(redaction_required=True, safe_summary_required=True)
             return response
@@ -43976,12 +43962,17 @@ async def test_processing_feedback_cannot_publish_while_privacy_decision_is_pend
     async def privacy(**scope):
         entered.set()
         await release.wait()
-        return await original(**scope)
+        result = await original(**scope)
+        result["result"]["screen_detail_allowed"] = True
+        return result
 
     runtime.evaluate_privacy_context = privacy
     task = asyncio.create_task(_run_timing_turn(
         tmp_path, runtime=runtime, memory=memory, provider=provider,
-        payload=_processing_feedback_payload(), privacy_context_enabled=True,
+        payload=_processing_feedback_payload(
+            surface_context={"surface_category": "unknown_surface", "spoken_output": True,
+                             "interaction_mode": "voice_mediated"},
+        ), privacy_context_enabled=True,
         on_processing_eligible=cues.append,
     ))
     try:
@@ -44222,6 +44213,7 @@ async def test_non_executing_policy_failure_never_authorizes_feedback(
     out, _, provider, _ = await _run_timing_turn(
         tmp_path, runtime=runtime, memory=memory, payload=_processing_feedback_payload(
             surface_context={"surface_type": "alexa", "spoken_output": True,
+                             "surface_category": "unknown_surface",
                              "interaction_mode": "voice_mediated"},
         ),
         non_executing_conversation=True, capability_registry_enabled=True,
@@ -46058,7 +46050,10 @@ async def test_conversation_routing_applies_privacy_before_provider(tmp_path, pr
         "sources": _neutral_schedule_sources(),
     })
     await orchestrate_chat(
-        payload=_base_payload(conversation_id="conv-1", external_context_enabled=True),
+        payload=_base_payload(
+            surface_context={"surface_category": "unknown_surface"},
+            conversation_id="conv-1", external_context_enabled=True,
+        ),
         memory_store=FakeMemoryStore(), litellm=provider, runtime=runtime, dsa=dsa,
         dsa_enabled=True, evidence_acquisition_enabled=True, privacy_context_enabled=True,
         interaction_governance_enabled=True, rules_path=str(rules),
@@ -46184,6 +46179,7 @@ async def test_ordinary_evidence_bypass_preserves_privacy_before_provider(tmp_pa
     runtime.evaluate_privacy_context = privacy_policy
     result = await orchestrate_chat(
         payload=_base_payload(
+            surface_context={"surface_category": "unknown_surface"},
             conversation_id="conv-1",
             messages=[{"role": "user", "content": "Could you check that earlier idea?"}],
         ),
@@ -46458,3 +46454,22 @@ async def test_unresolved_speaker_not_persisted(tmp_path, reference, name, reque
     assert out["status"] == "ok"
     assert all("speaker_profile_ref" not in (m.get("metadata") or {})
                for m in memory.added_messages)
+
+
+@pytest.mark.parametrize("category,template", [
+    ("car_voice_possible_passenger", "car_voice_private_update"),
+    ("notification_preview", "notification_private_update"),
+    ("glasses_public_or_semi_public", "glasses_private_update"),
+    ("voice_private", "voice_private_update"),
+    ("unknown_surface", "unknown_surface_private_update"),
+])
+def test_privacy_boundary_templates_remain_conservative(category, template):
+    from services.privacy_context import apply_privacy_boundary, privacy_fallback_policy
+
+    policy, _ = privacy_fallback_policy(
+        surface_category=category, sensitivity_level="highly_sensitive", fallback_reason="timeout",
+    )
+    result = apply_privacy_boundary(policy=policy, answer="PRIVATE", sources=[{"ref_id": "secret"}])
+    assert result.template_id == template
+    assert result.enforced and result.trace_bundle_suppressed and result.brief_text_suppressed
+    assert result.sources_suppressed_count == 1 and "PRIVATE" not in result.final_answer

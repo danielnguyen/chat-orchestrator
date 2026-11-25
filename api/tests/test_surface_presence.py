@@ -427,7 +427,12 @@ async def test_pending_action_presentation_does_not_confirm_or_dispatch(tmp_path
 
 @pytest.mark.asyncio
 async def test_actual_privacy_withholding_projects_suppression(tmp_path):
-    from test_orchestrate_flow import FakeRuntime, _privacy_runtime_response, _run_timing_turn
+    from test_orchestrate_flow import (
+        FakeRuntime,
+        _base_payload,
+        _privacy_runtime_response,
+        _run_timing_turn,
+    )
 
     runtime = FakeRuntime(privacy_context_response=_privacy_runtime_response(
         surface_type="unknown_surface", privacy_zone="unknown", sensitive_detail_allowed=False,
@@ -435,6 +440,7 @@ async def test_actual_privacy_withholding_projects_suppression(tmp_path):
     ))
     result, runtime, _, memory = await _run_timing_turn(
         tmp_path, runtime=runtime, privacy_context_enabled=True,
+        payload=_base_payload(surface="unknown_surface"),
     )
     trace = memory.trace_calls[0]["payload"]["retrieval"]["prompt_assembly"]
     assert trace["surface_presence"]["presence_state"] == "suppressed"
@@ -627,6 +633,7 @@ async def test_server_owned_private_continuation_redacts_persisted_presence(
         tmp_path, runtime=runtime, memory=Memory(), companion_policy_enabled=True,
         privacy_context_enabled=True, payload=_base_payload(
             conversation_id="conv-1", surface="web",
+            surface_context={"surface_category": "unknown_surface"},
             messages=[{"role": "user", "content": "Tell me more."}],
         ),
     )
@@ -684,6 +691,7 @@ async def test_resolved_privacy_is_not_reused_by_another_request(tmp_path):
     from test_orchestrate_flow import (
         ExactAnswerMemory,
         ExactAnswerRuntime,
+        _base_payload,
         _privacy_runtime_response,
         _run_timing_turn,
     )
@@ -696,12 +704,14 @@ async def test_resolved_privacy_is_not_reused_by_another_request(tmp_path):
     _, _, _, first = await _run_timing_turn(
         tmp_path, runtime=runtime, memory=ExactAnswerMemory(),
         privacy_context_enabled=True, companion_policy_enabled=True,
+        payload=_base_payload(surface="unknown_surface"),
     )
     presence = first.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
     assert presence["presence_state"] == "suppressed" and "companion" not in presence
     _, _, provider, second = await _run_timing_turn(
         tmp_path, runtime=runtime, policy="yield_to_user",
         privacy_context_enabled=True, companion_policy_enabled=True,
+        payload=_base_payload(surface="unknown_surface"),
     )
     assert len(runtime.privacy_context_calls) == 1 and provider.calls == []
     presence = second.trace_calls[-1]["payload"]["retrieval"]["prompt_assembly"]["surface_presence"]
@@ -1356,6 +1366,7 @@ async def test_owned_terminal_observer_preserves_finalization_and_privacy(
     call = _run_timing_turn(tmp_path, runtime=runtime, memory=memory,
         companion_policy_enabled=True, privacy_context_enabled=withheld,
         payload=_base_payload(conversation_id="conv-1", surface="web",
+            surface_context={"surface_category": "unknown_surface"},
             messages=[{"role": "user", "content": "Tell me more."}]),
         on_presence_observation=main._schedule_presence_observation)
     if trace_failure:

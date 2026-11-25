@@ -40,7 +40,21 @@ _PRIVATE_DETAIL_SURFACES = {
     "voice_private",
 }
 _NOTIFICATION_ALIASES = {"notification", "notification_preview"}
-_GLASSES_ALIASES = {"glasses"}
+_GLASSES_ALIASES = {"glasses", "g2", "wearable_hud"}
+# Existing style/response-shape, briefing, capability and HTTP adapter contracts.
+_SURFACE_ALIASES = {
+    "desktop": "desktop_private",
+    "dev": "desktop_private",
+    "vscode": "desktop_private",
+    "web": "desktop_private",
+    "chat": "desktop_private",
+    "mobile": "mobile_private",
+    "telegram": "telegram_private",
+    "compact": "telegram_private",
+    "voice": "voice_private",
+    "alexa": "voice_private",
+    "spoken": "voice_private",
+}
 _SURFACE_RANK = {
     "normal": 0,
     "sensitive": 1,
@@ -189,16 +203,8 @@ def _apply_metadata(
     return next_level, next_domains
 
 
-def derive_privacy_context(
-    *,
-    payload: dict[str, Any],
-    retrieval_bundle: dict[str, Any],
-    external_context_pack: dict[str, Any] | None = None,
-    runtime_identity: dict[str, Any] | None = None,
-    runtime_overlay: dict[str, Any] | None = None,
-    world_state: dict[str, Any] | None = None,
-    relationship_context: dict[str, Any] | None = None,
-) -> DerivedPrivacyContext:
+def resolve_privacy_surface(payload: dict[str, Any]) -> str:
+    """Resolve established surface identities without granting any authorization."""
     surface_context = payload.get("surface_context")
     surface_context = surface_context if isinstance(surface_context, dict) else {}
 
@@ -222,7 +228,26 @@ def derive_privacy_context(
             elif top_level_surface in _GLASSES_ALIASES or surface_type in _GLASSES_ALIASES:
                 surface_category = "glasses_public_or_semi_public"
             else:
-                surface_category = "unknown_surface"
+                surface_category = _SURFACE_ALIASES.get(
+                    top_level_surface, _SURFACE_ALIASES.get(surface_type, "unknown_surface")
+                )
+
+    return surface_category
+
+
+def derive_privacy_context(
+    *,
+    payload: dict[str, Any],
+    retrieval_bundle: dict[str, Any],
+    external_context_pack: dict[str, Any] | None = None,
+    runtime_identity: dict[str, Any] | None = None,
+    runtime_overlay: dict[str, Any] | None = None,
+    world_state: dict[str, Any] | None = None,
+    relationship_context: dict[str, Any] | None = None,
+) -> DerivedPrivacyContext:
+    surface_context = payload.get("surface_context")
+    surface_context = surface_context if isinstance(surface_context, dict) else {}
+    surface_category = resolve_privacy_surface(payload)
 
     base_sensitivity = {
         "public": "normal",

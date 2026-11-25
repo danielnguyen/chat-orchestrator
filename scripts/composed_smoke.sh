@@ -7650,7 +7650,7 @@ run_voice_continuation_scenario() {
   local tag owner client conversation first response request trace session turn diagnostics
   local prior_id prior_turn calls expected_count current_surface first_answer expected_answer state
   local declared_state first_request prior_event prior_messages prior_thread prior_work prior_session prior_input current_id
-  for tag in ${VOICE_CONTINUATION_CASES:-immediate deferred restart cross ordinary newer missing unpublished privacy denied corrupt abandoned fallback budget expandable}; do
+  for tag in ${VOICE_CONTINUATION_CASES:-immediate deferred restart cross ordinary newer missing unpublished privacy known_privacy denied corrupt abandoned fallback budget expandable}; do
     echo "Voice continuation starting: case=$tag"
     owner="owner-voice-continuation-$tag"; client="web:voice-continuation-$tag"
     current_surface=web
@@ -7794,7 +7794,7 @@ PYFIXTURE
       configure_surface_permission "$owner" alexa "$([ "$tag" = cross ] && echo true || echo false)" false false
       client="alexa:voice-continuation-$tag"
     fi
-    if [ "$tag" = privacy ]; then
+    if [ "$tag" = privacy ] || [ "$tag" = known_privacy ]; then
       COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED=true docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
       wait_for_http http://127.0.0.1:14361/healthz
     fi
@@ -7820,8 +7820,9 @@ PYFIXTURE
     response="$(co_post "$(jq -nc --arg owner "$owner" --arg client "$client" --arg surface "$current_surface" --arg conversation "$conversation" --arg tag "$tag" '
       {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:$surface,sensitivity:"private",
        messages:[{role:"user",content:(if $tag=="ordinary" then "What is 2+2?" else "Tell me more." end)}],
-       surface_context:{interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech",
-                       active_task_mode:false,allows_expansion:true}}')")"
+       surface_context:({interaction_mode:"voice_mediated",spoken_output:true,output_format:"speech",
+                       active_task_mode:false,allows_expansion:true}
+       + (if $tag=="privacy" then {surface_category:"unknown_surface"} else {} end))}')")"
     request="$(jq -er .request_id <<<"$response")"
     if [ "$tag" = denied ]; then
       jq -e '.status=="failed" and .selected_model=="not_called" and .sources==[]' <<<"$response" >/dev/null
@@ -7837,6 +7838,10 @@ PYFIXTURE
     fi
     trace="$(fetch_trace "$request")"
     calls="$(fetch_provider_calls "$request")"
+    if [ "$tag" = known_privacy ]; then
+      jq -e '.retrieval.prompt_assembly.privacy_context.status=="disabled"
+        and .retrieval.prompt_assembly.privacy_context.action_taken=="none"' <<<"$trace" >/dev/null
+    fi
     expected_count=1
     case "$tag" in missing|unpublished|privacy|denied|corrupt|abandoned|budget) expected_count=0 ;; fallback) expected_count=2 ;; esac
     observed_calls="$(jq '[.calls[]|select(.kind=="chat")]|length' <<<"$calls")"
@@ -7930,7 +7935,7 @@ PYFIXTURE
       COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PROMPT_OUTPUT_TOKEN_RESERVE="$previous_reserve" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
       wait_for_http http://127.0.0.1:14361/healthz
     fi
-    if [ "$tag" = privacy ]; then
+    if [ "$tag" = privacy ] || [ "$tag" = known_privacy ]; then
       COMPOSED_RESTRAINT_ENABLED=true COMPOSED_PRIVACY_CONTEXT_ENABLED="$previous_privacy" docker compose -f "$COMPOSE" up -d --force-recreate --no-deps orchestrator >/dev/null
       wait_for_http http://127.0.0.1:14361/healthz
     fi

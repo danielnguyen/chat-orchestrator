@@ -1227,3 +1227,43 @@ Compiled companion policy is consumed as an overlay rather than redefined locall
 Data Source Aggregator owns source selection, retrieval, and its source diagnostics. Chat Orchestrator sends a bounded context-pack request and sanitizes the result before prompt assembly.
 
 Model providers receive only the final assembled messages. Chat Orchestrator owns routing, fallback constraints, bounded provider diagnostics, response persistence, and the public API response.
+
+## Recognized surfaces and privacy suppression
+
+With privacy enabled, CO applies optional context suppression, privacy prompting,
+and answer replacement only when `resolve_privacy_surface` resolves
+`unknown_surface`. All seven existing recognized categories retain otherwise
+authorized context and the actual answer, regardless of sensitivity or privacy
+runtime availability. Processing cues also bypass only their privacy prerequisite;
+all other feedback eligibility checks still apply. Disabling privacy retains the
+existing configuration semantics.
+
+The resolver in `api/services/privacy_context.py` is shared by request admission
+and privacy metadata derivation. Existing recognized `surface_category` takes
+precedence, followed by recognized `surface_type`, then the top-level category.
+An explicit `unknown_surface` at those positions cannot be overridden by raw aliases.
+An established category can still accompany an adapter-specific raw surface, as
+with Node-RED's private Telegram requests. Missing, malformed, and unsupported
+identifiers without a recognized category or alias remain unknown.
+
+| Raw identity / alias | Category | Existing source contract |
+| --- | --- | --- |
+| `desktop`, `dev`, `vscode`, `web`, `chat` | `desktop_private` | `capabilities.py`, `briefing.py`, HTTP/runtime tests and replay payloads |
+| `mobile` | `mobile_private` | `briefing.py` |
+| `telegram`, `compact` | `telegram_private` | `style_policy.py`, `briefing.py` |
+| `voice`, `alexa`, `spoken` | `voice_private` | `style_policy.py`, `response_shape.py`, `briefing.py`; voice adapter contract in #261 |
+| `car` | `car_voice_possible_passenger` | Existing privacy resolver and voice formatting |
+| `notification` | `notification_preview` | Existing privacy resolver and briefing formatting |
+| `glasses` | `glasses_public_or_semi_public` | Existing privacy resolver |
+| `g2`, `wearable_hud` | `glasses_public_or_semi_public` | G2 Gateway `src/routes/turn.ts`, referenced by #263; existing G2 composed smoke |
+
+G2's `input_mode=voice_transcribed` maps to CO `interaction_mode=voice_mediated`,
+with `surface=g2`, `surface_type=wearable_hud`, `sensitivity=private`, and
+`spoken_output=false`. Unmute's existing `surface=voice` needs no category override.
+No arbitrary prefix or wildcard is recognized. Recognition grants no memory,
+profile, owner/conversation, provider-routing, or action permission.
+
+The artifact composed smoke checks both unknown-surface suppression and authorized
+notification context using the same private artifact. The existing nonblocking
+composed p95 latency failure is separate from this presentation policy change;
+functional success does not establish performance or live device acceptance.
