@@ -247,6 +247,7 @@ assert_evidence_terminal_http_delta() {
 run_evidence_chat() {
   local owner="$1" client="$2" conversation_id="$3" question="$4"
   local external_context model_override
+  local surface_category="${7:-}"
   model_override="${6:-}"
   external_context="$(jq -c '
     . + {
@@ -261,8 +262,10 @@ run_evidence_chat() {
     --arg conversation "$conversation_id" \
     --arg question "$question" \
     --arg model_override "$model_override" \
+    --arg surface_category "$surface_category" \
     --argjson external_context "$external_context" \
     '{owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:[{role:"user",content:$question}],sensitivity:"private",external_context_enabled:true,external_context:$external_context}
+    + (if $surface_category == "" then {} else {surface_context:{surface_category:$surface_category}} end)
     + if $model_override == "" then {} else {model_override:$model_override} end')"
 }
 
@@ -420,6 +423,7 @@ run_evidence_chat_with_artifacts() {
 run_evidence_messages() {
   local owner="$1" client="$2" conversation_id="$3" messages="$4"
   local external_context="${5:-null}"
+  local surface_category="${6:-}"
   if [ "$external_context" != "null" ]; then
     external_context="$(jq -c '
       . + {
@@ -434,8 +438,10 @@ run_evidence_messages() {
     --arg client "$client" \
     --arg conversation "$conversation_id" \
     --argjson messages "$messages" \
+    --arg surface_category "$surface_category" \
     --argjson external_context "$external_context" '
       {owner_id:$owner,client_id:$client,conversation_id:$conversation,surface:"chat",messages:$messages,sensitivity:"private"}
+      + (if $surface_category == "" then {} else {surface_context:{surface_category:$surface_category}} end)
       + if $external_context == null then {} else {external_context_enabled:true,external_context:$external_context} end
     ')"
 }
@@ -2632,6 +2638,7 @@ assert_jq() {
 assert_pure_history() {
   local owner="$1" client="$2" conversation_id="$3" prior_answer="$4"
   local question="$5" expected_fragment="$6" scenario_label="$7"
+  local surface_category="${8:-}"
   local messages response request_id trace
   local diagnostic_fields lookup_status resolution_status manifest_resolution_status
   local reason_code projection_status projection_reason selected_source_count serialized
@@ -2643,7 +2650,7 @@ assert_pure_history() {
     '[{role:"assistant",content:$answer},{role:"user",content:$question}]')"
   provider_post "/fixture/reset" '{}'
   reset_dsa_audit
-  response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages")"
+  response="$(run_evidence_messages "$owner" "$client" "$conversation_id" "$messages" null "$surface_category")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
   if [[ "$scenario_label" == "history.hybrid" || "$scenario_label" == "history.exhaustive" || "$scenario_label" == "history.unknown" ]]; then
@@ -3360,7 +3367,7 @@ run_evidence_privacy_history_scenario() {
   reset_source_fixture
   restart_orchestrator_with_privacy true
   conversation_id="$(resolve_conversation "$owner" "$client" "history-private")"
-  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external")"
+  response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." "$external" "" "unknown_surface")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -3382,7 +3389,7 @@ run_evidence_privacy_history_scenario() {
   esac
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you check?" "does not include source names or locations" \
-    "history.private"
+    "history.private" "unknown_surface"
   serialized="$(jq -c . <<<"$response")$(jq -c . <<<"$manifest")$(jq -c . <<<"$trace")$(jq -c . <<<"$HISTORY_RESPONSE")$(jq -c . <<<"$HISTORY_TRACE")"
   case "$serialized" in
     *records_primary*|*google_sheets:*|*targeted-sheet*|*fixture_google*|*http://source-fixture*|*The\ migration\ record\ confirms*|*PRIVATE\ SOURCE\ DETAIL*)
@@ -4667,7 +4674,7 @@ run_evidence_scope_reference_scenarios() {
   restart_orchestrator_with_privacy true
   conversation_id="$(resolve_conversation "$owner" "$client" "scope-private")"
   response="$(run_evidence_chat "$owner" "$client" "$conversation_id" "Verify the migration record." \
-    '{"enabled":true,"scope_refs":{"time":"fy2026","version":"release-152","domain":"credential-management","project":"firefox"},"allowed_sensitivity":"medium"}')"
+    '{"enabled":true,"scope_refs":{"time":"fy2026","version":"release-152","domain":"credential-management","project":"firefox"},"allowed_sensitivity":"medium"}' "" "unknown_surface")"
   request_id="$(jq -r '.request_id' <<<"$response")"
   answer="$(jq -r '.answer' <<<"$response")"
   trace="$(fetch_trace "$request_id")"
@@ -4712,7 +4719,7 @@ run_evidence_scope_reference_scenarios() {
   assert_request_persistence_counts "$conversation_id" "$request_id" 0
   assert_pure_history "$owner" "$client" "$conversation_id" "$answer" \
     "What did you check?" "does not include source names or locations" \
-    "scope.privacy.history"
+    "scope.privacy.history" "unknown_surface"
   history="$HISTORY_RESPONSE"
   history_trace="$HISTORY_TRACE"
   serialized="$(jq -c . <<<"$history")$(jq -c '
