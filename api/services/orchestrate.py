@@ -168,6 +168,7 @@ from services.privacy_context import (
     disabled_privacy_trace,
     privacy_fallback_policy,
     privacy_policy_requires_suppression,
+    resolve_privacy_surface,
     restricted_retrieval_trace_summary,
     sanitize_prompt_trace_for_privacy,
     validate_privacy_runtime_response,
@@ -9828,9 +9829,12 @@ async def orchestrate_chat(
         seconds=_CONVERSATION_RETIREMENT_AFTER_SECONDS
     )
     surface = payload.get("surface", "unknown")
-    # The authenticated personal voice interface is owner-authorized to speak details.
-    # Skip both prompt suppression and reply replacement for this fixed adapter surface.
-    privacy_context_enabled = privacy_context_enabled and surface != "voice"
+    # Known surfaces retain otherwise-authorized context and answers. Only unknown
+    # surfaces use the optional privacy suppression path; admission remains independent.
+    known_surface_privacy_bypass = (
+        privacy_context_enabled and resolve_privacy_surface(payload) != "unknown_surface"
+    )
+    privacy_context_enabled = privacy_context_enabled and not known_surface_privacy_bypass
     connector_registry = None if non_executing_conversation or explicit_pause else (
         action_connector_registry
         if action_connector_registry is not None
@@ -13598,17 +13602,19 @@ async def orchestrate_chat(
                         and timing_result.get("degradation_mode") == "none"
                         and timing_result.get("latency_budget_class") == "voice_provider_dispatch"
                         and timing_trace.get("inputs", {}).get("spoken_output") is True
-                        and privacy_context_trace.get("included") is True
-                        and privacy_context_trace.get("policy_source") == "runtime"
-                        and privacy_context_trace.get("runtime_call_status") == "included"
-                        and privacy_context_trace.get("fallback_applied") is False
-                        # A validated restriction on answer details is not a ban
-                        # on this fixed content-free cue. Final privacy stays intact.
-                        and (non_executing_conversation or (
-                            not privacy_prompt_suppressed
-                            and (privacy_context or {}).get("voice_detail_allowed") is True
-                            and privacy_context.get("redaction_required") is False
-                            and privacy_context.get("safe_summary_required") is False
+                        and (known_surface_privacy_bypass or (
+                            privacy_context_trace.get("included") is True
+                            and privacy_context_trace.get("policy_source") == "runtime"
+                            and privacy_context_trace.get("runtime_call_status") == "included"
+                            and privacy_context_trace.get("fallback_applied") is False
+                            # A validated restriction on answer details is not a ban
+                            # on this fixed content-free cue. Final privacy stays intact.
+                            and (non_executing_conversation or (
+                                not privacy_prompt_suppressed
+                                and (privacy_context or {}).get("voice_detail_allowed") is True
+                                and privacy_context.get("redaction_required") is False
+                                and privacy_context.get("safe_summary_required") is False
+                            ))
                         ))
                         and not (interrupt_trace or {}).get("should_interrupt")
                         and work.work is not None and work.work.get("state") == "running"

@@ -170,6 +170,7 @@
             "restraint_enabled": true,
             "privacy_context_enabled": true,
             "privacy_context": "replace_answer",
+            "surface": "unknown_surface",
             "retrieval": "wave3b_mixed_result_boundary",
             "relationship_projection": {
                 "applied": true,
@@ -296,6 +297,7 @@
             "restraint_enabled": true,
             "privacy_context_enabled": true,
             "privacy_context": "replace_answer",
+            "surface": "unknown_surface",
             "retrieval": "wave3b_privacy_side_channels",
             "relationship_projection": {
                 "applied": true,
